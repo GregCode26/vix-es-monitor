@@ -291,11 +291,12 @@ def main():
                     print(f"Captured SPX Opening Price at {time_str}: {current_spx}")
                 
                 # Aggregate volumes by strike
-                volume_by_strike = {} # strike -> {calls, puts, gamma}
+                volume_by_strike = {} # strike -> {calls, puts, gamma, delta, vega}
 
                 # Initialize
                 for s in strikes:
                     volume_by_strike[s] = {"calls": 0, "puts": 0, "gamma": None,
+                                           "delta": None, "vega": None,
                                            "callsOi": 0, "putsOi": 0}
 
                 valid_data_points = 0
@@ -323,18 +324,25 @@ def main():
                     # Il gamma serve al calcolo del GEX reale. Call e put dello
                     # stesso strike lo condividono (parita' put-call), quindi
                     # si prende il primo dei due che arriva valorizzato.
+                    # Delta e vega si raccolgono per il calcolo della vanna.
                     greeks = ticker.modelGreeks
                     if greeks:
                         if volume_by_strike[strike]["gamma"] is None and greeks.gamma is not None and greeks.gamma == greeks.gamma:
                             volume_by_strike[strike]["gamma"] = round(float(greeks.gamma), 8)
+                        if volume_by_strike[strike]["delta"] is None and greeks.delta is not None and greeks.delta == greeks.delta:
+                            volume_by_strike[strike]["delta"] = round(float(greeks.delta), 8)
+                        if volume_by_strike[strike]["vega"] is None and greeks.vega is not None and greeks.vega == greeks.vega:
+                            volume_by_strike[strike]["vega"] = round(float(greeks.vega), 8)
                         if und_price is None and greeks.undPrice and greeks.undPrice == greeks.undPrice:
                             und_price = round(float(greeks.undPrice), 2)
 
                 con_gamma = sum(1 for v in volume_by_strike.values() if v["gamma"] is not None)
+                con_delta = sum(1 for v in volume_by_strike.values() if v["delta"] is not None)
+                con_vega = sum(1 for v in volume_by_strike.values() if v["vega"] is not None)
                 print(f"[{time_str}] Aggregated volumes (C/P separate) for {valid_data_points} active contracts, "
-                      f"gamma su {con_gamma}/{len(volume_by_strike)} strike.")
+                      f"gamma/delta/vega su {con_gamma}/{con_delta}/{con_vega}/{len(volume_by_strike)} strike.")
 
-                # We save a snapshot: time -> array of volumes [strike, calls, puts, gamma]
+                # We save a snapshot: time -> array of volumes [strike, calls, puts, gamma, delta, vega]
                 snapshot = {
                     "time": time_str,
                     "spxPrice": current_spx,
@@ -345,6 +353,7 @@ def main():
                     "undPrice": und_price,
                     "isOpening": is_opening_snapshot,
                     "volumes": [{"strike": k, "calls": v["calls"], "puts": v["puts"], "gamma": v["gamma"],
+                                 "delta": v["delta"], "vega": v["vega"],
                                  "callsOi": v["callsOi"], "putsOi": v["putsOi"]}
                                 for k, v in volume_by_strike.items()]
                 }

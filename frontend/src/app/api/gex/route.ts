@@ -37,6 +37,8 @@ interface StrikeRow {
     callsOi?: number;
     putsOi?: number;
     gamma?: number | null;
+    delta?: number | null;
+    vega?: number | null;
 }
 
 interface Snapshot {
