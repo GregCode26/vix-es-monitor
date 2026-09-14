@@ -307,44 +307,43 @@ export default function HedgingPressurePage() {
         const markLines: Record<string, unknown>[] = [];
 
         // Trova lo strike più vicino allo spot per disegnare la linea
-        let closestStrikeIndex = 0;
+        let closestStrike: string | null = null;
         if (data.spot != null && chartData.profile.length > 0) {
             let minDistance = Math.abs(chartData.profile[0].strike - data.spot);
+            closestStrike = chartData.profile[0].strike.toString();
+
             for (let i = 1; i < chartData.profile.length; i++) {
                 const distance = Math.abs(chartData.profile[i].strike - data.spot);
                 if (distance < minDistance) {
                     minDistance = distance;
-                    closestStrikeIndex = i;
+                    closestStrike = chartData.profile[i].strike.toString();
                 }
             }
 
-            markLines.push({
-                yAxisIndex: closestStrikeIndex,
-                lineStyle: { color: '#06b6d4', type: 'dotted', width: 2.5 },
-                label: {
-                    formatter: `Spot ${data.spot.toFixed(2)}`,
-                    position: 'insideEndRight',
-                    color: '#06b6d4',
-                    distance: 10,
-                },
-            });
-        }
-
-        // ATM
-        if (data.atmStrike != null && chartData.profile.length > 0) {
-            const atmIndex = chartData.profile.findIndex((p) => p.strike === data.atmStrike);
-            if (atmIndex >= 0) {
+            if (closestStrike) {
                 markLines.push({
-                    yAxisIndex: atmIndex,
-                    lineStyle: { color: '#8b5cf6', type: 'dashed', width: 1.5 },
+                    yAxis: closestStrike,
+                    lineStyle: { color: '#06b6d4', type: 'dotted', width: 2.5 },
                     label: {
-                        formatter: `ATM ${data.atmStrike}`,
-                        position: 'insideStartRight',
-                        color: '#8b5cf6',
-                        distance: 10,
+                        formatter: `Spot ${data.spot.toFixed(2)}`,
+                        position: 'end',
+                        color: '#06b6d4',
                     },
                 });
             }
+        }
+
+        // ATM
+        if (data.atmStrike != null) {
+            markLines.push({
+                yAxis: data.atmStrike.toString(),
+                lineStyle: { color: '#8b5cf6', type: 'dashed', width: 1.5 },
+                label: {
+                    formatter: `ATM ${data.atmStrike}`,
+                    position: 'start',
+                    color: '#8b5cf6',
+                },
+            });
         }
 
         return {
