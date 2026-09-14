@@ -398,14 +398,16 @@ export default function HedgingPressurePage() {
                     type: 'bar',
                     data: chartData.posData,
                     itemStyle: { color: '#3b82f6', opacity: 0.85 },
-                    barWidth: 3,
+                    barWidth: 6,
+                    indexAxis: 'y',
                 },
                 {
                     name: 'Bearish Pressure',
                     type: 'bar',
                     data: chartData.negData,
                     itemStyle: { color: '#ef4444', opacity: 0.85 },
-                    barWidth: 3,
+                    barWidth: 6,
+                    indexAxis: 'y',
                 },
             ],
         };
