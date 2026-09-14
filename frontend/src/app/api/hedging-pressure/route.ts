@@ -319,7 +319,7 @@ export async function GET(request: Request) {
             .map((p) => p.strike);
 
         const pressureHistory: PressureHistoryPoint[] = [];
-        if (topStrikes.length > 0 && local.length > 1) {
+        if (topStrikes.length > 0 && local.length > 0) {
             // Calculate pressure at each snapshot for top strikes
             for (const snap of local) {
                 const snapSpot = snap.undPrice ?? snap.spxPrice ?? null;
