@@ -115,7 +115,7 @@ export default function HedgingPressurePage() {
                 negData.push(0);
             } else if (normalized < 0) {
                 posData.push(0);
-                negData.push(-normalized);
+                negData.push(normalized); // Mantieni negativo per echarts
             } else {
                 posData.push(0);
                 negData.push(0);
