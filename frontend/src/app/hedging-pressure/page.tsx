@@ -306,30 +306,45 @@ export default function HedgingPressurePage() {
 
         const markLines: Record<string, unknown>[] = [];
 
-        // Spot
-        if (data.spot != null) {
+        // Trova lo strike più vicino allo spot per disegnare la linea
+        let closestStrikeIndex = 0;
+        if (data.spot != null && chartData.profile.length > 0) {
+            let minDistance = Math.abs(chartData.profile[0].strike - data.spot);
+            for (let i = 1; i < chartData.profile.length; i++) {
+                const distance = Math.abs(chartData.profile[i].strike - data.spot);
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    closestStrikeIndex = i;
+                }
+            }
+
             markLines.push({
-                yAxis: data.spot,
-                lineStyle: { color: '#06b6d4', type: 'dotted', width: 2 },
+                yAxisIndex: closestStrikeIndex,
+                lineStyle: { color: '#06b6d4', type: 'dotted', width: 2.5 },
                 label: {
                     formatter: `Spot ${data.spot.toFixed(2)}`,
-                    position: 'insideEndTop',
+                    position: 'insideEndRight',
                     color: '#06b6d4',
+                    distance: 10,
                 },
             });
         }
 
         // ATM
-        if (data.atmStrike != null) {
-            markLines.push({
-                yAxis: data.atmStrike,
-                lineStyle: { color: '#8b5cf6', type: 'dashed', width: 1.5 },
-                label: {
-                    formatter: `ATM ${data.atmStrike}`,
-                    position: 'insideStartBottom',
-                    color: '#8b5cf6',
-                },
-            });
+        if (data.atmStrike != null && chartData.profile.length > 0) {
+            const atmIndex = chartData.profile.findIndex((p) => p.strike === data.atmStrike);
+            if (atmIndex >= 0) {
+                markLines.push({
+                    yAxisIndex: atmIndex,
+                    lineStyle: { color: '#8b5cf6', type: 'dashed', width: 1.5 },
+                    label: {
+                        formatter: `ATM ${data.atmStrike}`,
+                        position: 'insideStartRight',
+                        color: '#8b5cf6',
+                        distance: 10,
+                    },
+                });
+            }
         }
 
         return {
@@ -405,6 +420,11 @@ export default function HedgingPressurePage() {
                     data: chartData.posData,
                     itemStyle: { color: '#3b82f6', opacity: 0.85 },
                     barWidth: '60%',
+                    markLine: {
+                        symbol: 'none',
+                        data: markLines,
+                        lineStyle: { width: 2 },
+                    },
                 },
                 {
                     name: 'Bearish Pressure',
