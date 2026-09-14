@@ -146,29 +146,36 @@ export default function HedgingPressurePage() {
 
     // Opzione echarts per il grafico time-series (gamma vs vanna)
     const timeseriesOption = useMemo(() => {
-        if (!data || !data.pressureHistory || data.pressureHistory.length === 0) return {};
+        if (!data || !data.pressureHistory || data.pressureHistory.length === 0) {
+            return {
+                backgroundColor: '#0c0d10',
+                title: { text: 'Nessun dato storico disponibile', left: 'center', textStyle: { color: '#94a3b8' } },
+            };
+        }
 
-        const groupedByStrike: Record<number, { time: string[]; gamma: number[]; vanna: number[] }> = {};
+        const groupedByStrike: Record<number, { time: string[]; total: number[] }> = {};
 
         for (const point of data.pressureHistory) {
             if (!groupedByStrike[point.strike]) {
-                groupedByStrike[point.strike] = { time: [], gamma: [], vanna: [] };
+                groupedByStrike[point.strike] = { time: [], total: [] };
             }
             groupedByStrike[point.strike].time.push(point.time);
-            groupedByStrike[point.strike].gamma.push(point.gammaPressure);
-            groupedByStrike[point.strike].vanna.push(point.vannaPressure);
+            groupedByStrike[point.strike].total.push(point.totalPressure);
         }
 
-        const series = Object.entries(groupedByStrike).map(([strike, data]) => ({
-            name: `K${strike}`,
-            type: 'line' as const,
-            data: data.gamma.map((g, i) => ({
-                value: [data.time[i], g],
-                itemStyle: { color: g > 0 ? '#3b82f6' : '#ef4444' },
-            })),
-            smooth: true,
-            symbolSize: 2,
-        }));
+        const series = Object.entries(groupedByStrike)
+            .slice(0, 5) // Top 5 strikes only
+            .map(([strike, d]) => {
+                const lineData = d.time.map((t, i) => [t, d.total[i]]);
+                return {
+                    name: `Strike ${strike}`,
+                    type: 'line' as const,
+                    data: lineData,
+                    smooth: true,
+                    symbolSize: 3,
+                    lineStyle: { width: 2 },
+                };
+            });
 
         return {
             backgroundColor: '#0c0d10',
