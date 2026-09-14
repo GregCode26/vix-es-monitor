@@ -103,20 +103,26 @@ export default function HedgingPressurePage() {
 
         const profile = data.profile;
 
-        // Separa barre positive e negative
-        const posData: number[][] = [];
-        const negData: number[][] = [];
+        // Ordina per strike e costruisci array paralleli
+        const sortedProfile = [...profile].sort((a, b) => a.strike - b.strike);
+        const posData: number[] = [];
+        const negData: number[] = [];
 
-        for (const row of profile) {
+        for (const row of sortedProfile) {
             const normalized = row.normalizedPressure;
             if (normalized > 0) {
-                posData.push([normalized, row.strike]);
+                posData.push(normalized);
+                negData.push(0);
             } else if (normalized < 0) {
-                negData.push([-normalized, row.strike]);
+                posData.push(0);
+                negData.push(-normalized);
+            } else {
+                posData.push(0);
+                negData.push(0);
             }
         }
 
-        return { posData, negData, profile };
+        return { posData, negData, profile: sortedProfile };
     }, [data]);
 
     // Calcola scale e limiti
@@ -381,9 +387,8 @@ export default function HedgingPressurePage() {
                 axisPointer: { type: 'line' },
             },
             yAxis: {
-                type: 'value',
-                min: scale.yMin,
-                max: scale.yMax,
+                type: 'category',
+                data: data.strikes.map((s) => s.toString()),
                 name: 'Strike',
                 nameLocation: 'center',
                 nameGap: 40,
@@ -398,16 +403,14 @@ export default function HedgingPressurePage() {
                     type: 'bar',
                     data: chartData.posData,
                     itemStyle: { color: '#3b82f6', opacity: 0.85 },
-                    barWidth: 6,
-                    indexAxis: 'y',
+                    barWidth: '60%',
                 },
                 {
                     name: 'Bearish Pressure',
                     type: 'bar',
                     data: chartData.negData,
                     itemStyle: { color: '#ef4444', opacity: 0.85 },
-                    barWidth: 6,
-                    indexAxis: 'y',
+                    barWidth: '60%',
                 },
             ],
         };
