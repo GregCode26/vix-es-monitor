@@ -154,6 +154,7 @@ export default function HedgingPressurePage() {
         }
 
         const groupedByStrike: Record<number, { time: string[]; total: number[] }> = {};
+        const allTimes: string[] = [];
 
         for (const point of data.pressureHistory) {
             if (!groupedByStrike[point.strike]) {
@@ -161,14 +162,17 @@ export default function HedgingPressurePage() {
             }
             groupedByStrike[point.strike].time.push(point.time);
             groupedByStrike[point.strike].total.push(point.totalPressure);
+            if (!allTimes.includes(point.time)) {
+                allTimes.push(point.time);
+            }
         }
 
         const series = Object.entries(groupedByStrike)
             .slice(0, 5) // Top 5 strikes only
             .map(([strike, d]) => {
-                const lineData = d.time.map((t, i) => [t, d.total[i]]);
+                const lineData = d.total; // Just pressure values, echarts will align by category index
                 return {
-                    name: `Strike ${strike}`,
+                    name: `K${strike}`,
                     type: 'line' as const,
                     data: lineData,
                     smooth: true,
@@ -177,6 +181,8 @@ export default function HedgingPressurePage() {
                 };
             });
 
+        const legendData = series.map((s) => s.name);
+
         return {
             backgroundColor: '#0c0d10',
             tooltip: {
@@ -184,7 +190,7 @@ export default function HedgingPressurePage() {
                 axisPointer: { type: 'cross' },
             },
             legend: {
-                data: Object.keys(groupedByStrike).map((k) => `K${k}`),
+                data: legendData,
                 textStyle: { color: '#94a3b8', fontSize: 9 },
                 top: 10,
                 right: 10,
@@ -198,12 +204,13 @@ export default function HedgingPressurePage() {
                 bottom: 40,
             },
             xAxis: {
-                type: 'time',
+                type: 'category',
+                data: allTimes,
                 name: 'Time',
                 nameLocation: 'center',
                 nameGap: 30,
                 nameTextStyle: { color: '#e2e8f0', fontSize: 12 },
-                axisLabel: { color: '#94a3b8', formatter: '{HH}:{mm}' },
+                axisLabel: { color: '#94a3b8', fontSize: 9, formatter: (val: string) => val.substring(0, 5) },
                 splitLine: { lineStyle: { color: 'rgba(51, 65, 85, 0.2)' } },
                 axisLine: { lineStyle: { color: '#334155' } },
             },
@@ -378,7 +385,7 @@ export default function HedgingPressurePage() {
                 },
             },
             legend: {
-                data: ['Bullish Pressure', 'Bearish Pressure', 'Zero Line'],
+                data: ['Bullish Pressure', 'Bearish Pressure'],
                 textStyle: { color: '#94a3b8', fontSize: 10 },
                 top: 10,
                 right: 10,
