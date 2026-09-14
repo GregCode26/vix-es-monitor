@@ -59,6 +59,7 @@ export default function HedgingPressurePage() {
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
     const [showDebug, setShowDebug] = useState(false);
+    const [showInfo, setShowInfo] = useState(false);
     const [viewMode, setViewMode] = useState<ViewMode>('profile');
     const lastTime = useRef<string | null>(null);
     const giornoSessione = useRef<string | null>(null);
@@ -451,6 +452,13 @@ export default function HedgingPressurePage() {
                             ))}
                         </div>
                         <button
+                            onClick={() => setShowInfo(!showInfo)}
+                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
+                            title="Learn how to read this indicator"
+                        >
+                            ℹ️ Info
+                        </button>
+                        <button
                             onClick={() => setShowDebug(!showDebug)}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
@@ -584,6 +592,103 @@ export default function HedgingPressurePage() {
                                 </div>
                             </div>
                         )}
+                    </div>
+                )}
+
+                {/* Info Modal */}
+                {showInfo && (
+                    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                        <div className="bg-slate-900 border border-slate-700 rounded-lg max-w-2xl max-h-[80vh] overflow-y-auto">
+                            <div className="p-6">
+                                <div className="flex items-center justify-between mb-4">
+                                    <h2 className="text-2xl font-bold text-blue-400">How to Read Hedging Pressure</h2>
+                                    <button
+                                        onClick={() => setShowInfo(false)}
+                                        className="text-slate-400 hover:text-slate-200 text-2xl"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                <div className="space-y-4 text-slate-300 text-sm">
+                                    <section>
+                                        <h3 className="text-lg font-bold text-cyan-400 mb-2">📊 What is this indicator?</h3>
+                                        <p>
+                                            Hedging Pressure estimates where dealer hedging activity might accelerate or decelerate market movements.
+                                            It combines gamma exposure (GEX) with vanna (volatility-delta interaction) to show potential hedging zones.
+                                        </p>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-lg font-bold text-blue-400 mb-2">📈 Blue Bars (Right Side) = Bullish Pressure</h3>
+                                        <p>
+                                            Dealers are adding upside hedges. When spot rises, they add more hedges to compensate. This pressure
+                                            <strong> supports the upside move</strong> (gamma-dampened, not accelerating).
+                                        </p>
+                                        <p className="text-slate-400 mt-1">Scenario: Positive GEX + spot rising → dealer hedging into weakness</p>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-lg font-bold text-red-400 mb-2">📉 Red Bars (Left Side) = Bearish Pressure</h3>
+                                        <p>
+                                            Dealers are adding downside hedges. When spot falls, they add more hedges to compensate. This pressure
+                                            <strong> can amplify the downside move</strong> (gamma-accelerated).
+                                        </p>
+                                        <p className="text-slate-400 mt-1">Scenario: Negative GEX + spot falling → dealer forced to sell more</p>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-lg font-bold text-amber-400 mb-2">⚡ How to Trade It</h3>
+                                        <ul className="space-y-2 list-disc list-inside">
+                                            <li>
+                                                <strong>Large RED bars:</strong> Potential acceleration zone. If spot reaches it, expect sharp move down.
+                                            </li>
+                                            <li>
+                                                <strong>Large BLUE bars:</strong> Support zone. Upside moves may stall or get squeezed here.
+                                            </li>
+                                            <li>
+                                                <strong>Aligned GAMMA + VANNA:</strong> Check Debug mode. When both point same direction, pressure is strongest.
+                                            </li>
+                                            <li>
+                                                <strong>Bars fading (time series):</strong> Dealers are clearing hedges. Reversal potential increases.
+                                            </li>
+                                        </ul>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-lg font-bold text-purple-400 mb-2">📐 What the components mean</h3>
+                                        <p>
+                                            <strong>Gamma Component:</strong> Price movement × dealer gamma position. Shows hedging pressure from spot movement.
+                                        </p>
+                                        <p className="mt-2">
+                                            <strong>Vanna Component:</strong> Volatility change × dealer vega sensitivity. Shows hedging pressure from IV changes.
+                                        </p>
+                                        <p className="mt-2">
+                                            <strong>Proximity Weight:</strong> Strikes far from spot are weighted down. Only nearby strikes matter immediately.
+                                        </p>
+                                    </section>
+
+                                    <section>
+                                        <h3 className="text-lg font-bold text-slate-400 mb-2">⚠️ Limitations</h3>
+                                        <ul className="space-y-1 list-disc list-inside text-slate-400 text-xs">
+                                            <li>Vanna is estimated, not observed. It uses Black-Scholes approximation.</li>
+                                            <li>Dealer heuristic (calls long, puts short) is standard, not confirmed.</li>
+                                            <li>Works best on liquid strikes near ATM.</li>
+                                            <li>Real hedging may differ from estimated pressure.</li>
+                                        </ul>
+                                    </section>
+                                </div>
+
+                                <div className="mt-6 flex justify-end">
+                                    <button
+                                        onClick={() => setShowInfo(false)}
+                                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors"
+                                    >
+                                        Got it
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 )}
 
