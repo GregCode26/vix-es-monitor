@@ -426,7 +426,7 @@ export default function HedgingPressurePage() {
                 <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-3">
                         <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-violet-400 bg-clip-text text-transparent">
-                            Hedging Pressure & Acceleration
+                            Hedging Pressure e Accelerazione
                         </h1>
                         {data?.time && (
                             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium border bg-blue-500/20 text-blue-400 border-blue-500/30">
@@ -447,34 +447,34 @@ export default function HedgingPressurePage() {
                                             : 'bg-slate-800 hover:bg-slate-700 text-slate-400'
                                     }`}
                                 >
-                                    {mode === 'profile' ? 'Profile' : mode === 'timeseries' ? 'Time Series' : 'Heatmap'}
+                                    {mode === 'profile' ? 'Profilo' : mode === 'timeseries' ? 'Serie Temporali' : 'Mappa Calore'}
                                 </button>
                             ))}
                         </div>
                         <button
                             onClick={() => setShowInfo(!showInfo)}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                            title="Learn how to read this indicator"
+                            title="Come leggere questo indicatore"
                         >
-                            ℹ️ Info
+                            ℹ️ Guida
                         </button>
                         <button
                             onClick={() => setShowDebug(!showDebug)}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
-                            {showDebug ? 'Hide Debug' : 'Debug'}
+                            {showDebug ? 'Nascondi Debug' : 'Debug'}
                         </button>
                         <button
                             onClick={() => router.push('/spx-gamma')}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
-                            GEX Profile
+                            Profilo GEX
                         </button>
                         <button
                             onClick={() => router.push('/market')}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
-                            Market Monitor
+                            Monitor di Mercato
                         </button>
                     </div>
                 </div>
@@ -487,7 +487,7 @@ export default function HedgingPressurePage() {
                             <div className="text-lg font-bold text-cyan-400">{data.spot.toFixed(2)}</div>
                         </div>
                         <div className="bg-slate-800/50 border border-slate-700 p-2 rounded-lg">
-                            <div className="text-[10px] text-slate-500">ATM IV</div>
+                            <div className="text-[10px] text-slate-500">IV ATM</div>
                             <div className="text-lg font-bold text-purple-400">{data.atmIv.toFixed(1)}%</div>
                         </div>
                         <div className={`bg-slate-800/50 border p-2 rounded-lg ${data.spotDelta >= 0 ? 'border-green-700' : 'border-red-700'}`}>
@@ -503,7 +503,7 @@ export default function HedgingPressurePage() {
                             </div>
                         </div>
                         <div className="bg-slate-800/50 border border-slate-700 p-2 rounded-lg">
-                            <div className="text-[10px] text-slate-500">Risk Zones</div>
+                            <div className="text-[10px] text-slate-500">Zone di Rischio</div>
                             <div className="text-lg font-bold text-amber-400">{data.riskZones.length}</div>
                         </div>
                     </div>
@@ -527,11 +527,11 @@ export default function HedgingPressurePage() {
                         ) : (
                             <div className="flex flex-col items-center justify-center h-full gap-3 text-sm text-slate-500">
                                 {error ? (
-                                    <span>Unable to load hedging pressure data.</span>
+                                    <span>Impossibile caricare i dati di hedging pressure.</span>
                                 ) : (
                                     <>
                                         <div className="w-12 h-12 border-4 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
-                                        <span>Loading hedging pressure data...</span>
+                                        <span>Caricamento dati di hedging pressure...</span>
                                     </>
                                 )}
                             </div>
@@ -542,10 +542,10 @@ export default function HedgingPressurePage() {
                 {/* Debug Panel */}
                 {showDebug && data && (
                     <div className="bg-slate-900/50 border border-slate-700 rounded-lg p-4 mb-3">
-                        <h3 className="text-sm font-bold text-blue-400 mb-2">Debug Information</h3>
+                        <h3 className="text-sm font-bold text-blue-400 mb-2">Informazioni di Debug</h3>
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                             <div>
-                                <div className="text-slate-500">Date</div>
+                                <div className="text-slate-500">Data</div>
                                 <div className="font-mono text-slate-300">{data.date}</div>
                             </div>
                             <div>
@@ -553,34 +553,34 @@ export default function HedgingPressurePage() {
                                 <div className="font-mono text-slate-300">{data.spot.toFixed(2)}</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">ATM Strike</div>
+                                <div className="text-slate-500">Strike ATM</div>
                                 <div className="font-mono text-slate-300">{data.atmStrike ?? 'N/A'}</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">ATM IV</div>
+                                <div className="text-slate-500">IV ATM</div>
                                 <div className="font-mono text-slate-300">{data.atmIv.toFixed(2)}%</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">Spot Delta</div>
+                                <div className="text-slate-500">Delta Spot</div>
                                 <div className="font-mono text-slate-300">{data.spotDelta.toFixed(4)}</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">IV Change</div>
+                                <div className="text-slate-500">Cambio IV</div>
                                 <div className="font-mono text-slate-300">{data.ivChange.toFixed(2)} bps</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">Total Strikes</div>
+                                <div className="text-slate-500">Strike Totali</div>
                                 <div className="font-mono text-slate-300">{data.profile.length}</div>
                             </div>
                             <div>
-                                <div className="text-slate-500">Risk Zones Found</div>
+                                <div className="text-slate-500">Zone di Rischio</div>
                                 <div className="font-mono text-slate-300">{data.riskZones.length}</div>
                             </div>
                         </div>
 
                         {data.riskZones.length > 0 && (
                             <div className="mt-3">
-                                <div className="text-slate-400 text-xs mb-2">Risk Zones:</div>
+                                <div className="text-slate-400 text-xs mb-2">Zone di Rischio:</div>
                                 <div className="space-y-1 max-h-32 overflow-y-auto">
                                     {data.riskZones.map((zone) => (
                                         <div key={zone.strike} className="text-[10px] text-slate-400 bg-slate-800/30 p-1.5 rounded">
@@ -601,7 +601,7 @@ export default function HedgingPressurePage() {
                         <div className="bg-slate-900 border border-slate-700 rounded-lg max-w-2xl max-h-[80vh] overflow-y-auto">
                             <div className="p-6">
                                 <div className="flex items-center justify-between mb-4">
-                                    <h2 className="text-2xl font-bold text-blue-400">How to Read Hedging Pressure</h2>
+                                    <h2 className="text-2xl font-bold text-blue-400">Come leggere la Hedging Pressure</h2>
                                     <button
                                         onClick={() => setShowInfo(false)}
                                         className="text-slate-400 hover:text-slate-200 text-2xl"
@@ -612,69 +612,69 @@ export default function HedgingPressurePage() {
 
                                 <div className="space-y-4 text-slate-300 text-sm">
                                     <section>
-                                        <h3 className="text-lg font-bold text-cyan-400 mb-2">📊 What is this indicator?</h3>
+                                        <h3 className="text-lg font-bold text-cyan-400 mb-2">📊 Cos'è questo indicatore?</h3>
                                         <p>
-                                            Hedging Pressure estimates where dealer hedging activity might accelerate or decelerate market movements.
-                                            It combines gamma exposure (GEX) with vanna (volatility-delta interaction) to show potential hedging zones.
+                                            La Hedging Pressure stima dove l'attività di hedging dei dealer può accelerare o decelerare i movimenti di mercato.
+                                            Combina l'esposizione al gamma (GEX) con la vanna (interazione volatilità-delta) per mostrare le zone potenziali di hedging.
                                         </p>
                                     </section>
 
                                     <section>
-                                        <h3 className="text-lg font-bold text-blue-400 mb-2">📈 Blue Bars (Right Side) = Bullish Pressure</h3>
+                                        <h3 className="text-lg font-bold text-blue-400 mb-2">📈 Barre Blu (a destra) = Pressione Rialzista</h3>
                                         <p>
-                                            Dealers are adding upside hedges. When spot rises, they add more hedges to compensate. This pressure
-                                            <strong> supports the upside move</strong> (gamma-dampened, not accelerating).
+                                            I dealer stanno aggiungendo hedges al rialzo. Quando lo spot sale, aggiungono altri hedges per compensare. Questa pressione
+                                            <strong> supporta il movimento rialzista</strong> (ammortizzato da gamma, non auto-amplificante).
                                         </p>
-                                        <p className="text-slate-400 mt-1">Scenario: Positive GEX + spot rising → dealer hedging into weakness</p>
+                                        <p className="text-slate-400 mt-1">Scenario: GEX positivo + spot in salita → dealer aggiungono hedges verso l'alto</p>
                                     </section>
 
                                     <section>
-                                        <h3 className="text-lg font-bold text-red-400 mb-2">📉 Red Bars (Left Side) = Bearish Pressure</h3>
+                                        <h3 className="text-lg font-bold text-red-400 mb-2">📉 Barre Rosse (a sinistra) = Pressione Ribassista</h3>
                                         <p>
-                                            Dealers are adding downside hedges. When spot falls, they add more hedges to compensate. This pressure
-                                            <strong> can amplify the downside move</strong> (gamma-accelerated).
+                                            I dealer stanno aggiungendo hedges al ribasso. Quando lo spot scende, aggiungono altri hedges per compensare. Questa pressione
+                                            <strong> può amplificare il movimento ribassista</strong> (accelerato da gamma negativo).
                                         </p>
-                                        <p className="text-slate-400 mt-1">Scenario: Negative GEX + spot falling → dealer forced to sell more</p>
+                                        <p className="text-slate-400 mt-1">Scenario: GEX negativo + spot in calo → dealer costretti a vendere di più</p>
                                     </section>
 
                                     <section>
-                                        <h3 className="text-lg font-bold text-amber-400 mb-2">⚡ How to Trade It</h3>
+                                        <h3 className="text-lg font-bold text-amber-400 mb-2">⚡ Come tradare con questo indicatore</h3>
                                         <ul className="space-y-2 list-disc list-inside">
                                             <li>
-                                                <strong>Large RED bars:</strong> Potential acceleration zone. If spot reaches it, expect sharp move down.
+                                                <strong>Barre ROSSE grandi:</strong> Zona potenziale di accelerazione. Se lo spot la raggiunge, aspettati un movimento deciso al ribasso.
                                             </li>
                                             <li>
-                                                <strong>Large BLUE bars:</strong> Support zone. Upside moves may stall or get squeezed here.
+                                                <strong>Barre BLU grandi:</strong> Zona di supporto. I rialzi possono stagnare o subire squeeze qui.
                                             </li>
                                             <li>
-                                                <strong>Aligned GAMMA + VANNA:</strong> Check Debug mode. When both point same direction, pressure is strongest.
+                                                <strong>GAMMA + VANNA allineati:</strong> Controlla il Debug mode. Quando entrambi puntano nella stessa direzione, la pressione è massima.
                                             </li>
                                             <li>
-                                                <strong>Bars fading (time series):</strong> Dealers are clearing hedges. Reversal potential increases.
+                                                <strong>Barre in decremento (Time Series):</strong> I dealer stanno liberando hedges. Il potenziale di reversal aumenta.
                                             </li>
                                         </ul>
                                     </section>
 
                                     <section>
-                                        <h3 className="text-lg font-bold text-purple-400 mb-2">📐 What the components mean</h3>
+                                        <h3 className="text-lg font-bold text-purple-400 mb-2">📐 Cosa significano i componenti</h3>
                                         <p>
-                                            <strong>Gamma Component:</strong> Price movement × dealer gamma position. Shows hedging pressure from spot movement.
+                                            <strong>Componente Gamma:</strong> Movimento del prezzo × posizione gamma del dealer. Mostra la pressione di hedging dal movimento dello spot.
                                         </p>
                                         <p className="mt-2">
-                                            <strong>Vanna Component:</strong> Volatility change × dealer vega sensitivity. Shows hedging pressure from IV changes.
+                                            <strong>Componente Vanna:</strong> Cambio di volatilità × sensibilità vega del dealer. Mostra la pressione di hedging dai cambi di IV.
                                         </p>
                                         <p className="mt-2">
-                                            <strong>Proximity Weight:</strong> Strikes far from spot are weighted down. Only nearby strikes matter immediately.
+                                            <strong>Proximity Weight:</strong> Gli strike lontani dallo spot hanno peso ridotto. Solo gli strike vicini contano immediatamente.
                                         </p>
                                     </section>
 
                                     <section>
-                                        <h3 className="text-lg font-bold text-slate-400 mb-2">⚠️ Limitations</h3>
+                                        <h3 className="text-lg font-bold text-slate-400 mb-2">⚠️ Limitazioni</h3>
                                         <ul className="space-y-1 list-disc list-inside text-slate-400 text-xs">
-                                            <li>Vanna is estimated, not observed. It uses Black-Scholes approximation.</li>
-                                            <li>Dealer heuristic (calls long, puts short) is standard, not confirmed.</li>
-                                            <li>Works best on liquid strikes near ATM.</li>
-                                            <li>Real hedging may differ from estimated pressure.</li>
+                                            <li>Vanna è stimata, non osservata. Usa l'approssimazione di Black-Scholes.</li>
+                                            <li>L'euristica del dealer (call long, put short) è standard, non confermata.</li>
+                                            <li>Funziona meglio su strike liquidi vicini all'ATM.</li>
+                                            <li>L'hedging reale può differire dalla pressione stimata.</li>
                                         </ul>
                                     </section>
                                 </div>
@@ -684,7 +684,7 @@ export default function HedgingPressurePage() {
                                         onClick={() => setShowInfo(false)}
                                         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors"
                                     >
-                                        Got it
+                                        Chiudi
                                     </button>
                                 </div>
                             </div>
@@ -694,9 +694,9 @@ export default function HedgingPressurePage() {
 
                 {/* Footer Info */}
                 <p className="mt-2 text-[11px] text-slate-500">
-                    Hedging pressure combines GEX gamma exposure and Vanna volatility hedging across the option chain. Bars extend right (bullish pressure)
-                    or left (bearish pressure) based on estimated dealer hedging activity. Proximity weight emphasizes strikes near ATM. Risk zones highlight
-                    areas where gamma and vanna align, suggesting potential acceleration.
+                    La hedging pressure combina l'esposizione al gamma (GEX) e la copertura di vanna sulla volatilità lungo la catena di opzioni. Le barre si estendono a destra (pressione rialzista)
+                    o a sinistra (pressione ribassista) in base all'attività di hedging stimata del dealer. Il peso di prossimità enfatizza gli strike vicini all'ATM. Le zone di rischio evidenziano
+                    le aree dove gamma e vanna si allineano, suggerendo una potenziale accelerazione.
                 </p>
             </div>
         </div>
