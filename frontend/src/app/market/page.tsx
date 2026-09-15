@@ -1781,6 +1781,7 @@ export default function MarketPage() {
                             <button onClick={() => setActiveTab('market')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'market' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>MARKET</button>
                             <button onClick={() => setActiveTab('gex')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'gex' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>GEX</button>
                             <button onClick={() => router.push('/spx-volumes')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">VOLUMI SPX</button>
+                            <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET MAKER</button>
                         </div>
                         
                         {/* Le due linee del cono */}
