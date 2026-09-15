@@ -507,7 +507,7 @@ export default function HedgingPressurePage() {
                             onClick={() => router.push('/market')}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
-                            Monitor di Mercato
+                            CHART
                         </button>
                     </div>
                 </div>
