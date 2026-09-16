@@ -74,7 +74,7 @@ Next.js API routes (`frontend/src/app/api/*/route.ts`) read this data back out:
 
 - Browser `localStorage`: daily market cache, reference lines + visibility, auth token.
 - Local filesystem: JSON snapshot files (see path caveat above); `.tmp/transactions.csv` for finance entries.
-- Supabase (Postgres): optional, partial — only used by `/api/market` as a read source and by `tws_poller.py` as a write target, and only for a subset of fields. Env vars for it live in `frontend/.env.local` and `execution/.env` (see those files for the current key names — do not print their values).
+- Supabase (Postgres): optional — used by the market/volumes/gex/iv-monitor/finance routes, each with a local file fallback. Env vars for it live in `frontend/.env.local` and `execution/.env` (see those files for the current key names — do not print their values).
 
 On Vercel, only `/tmp` is writable and is wiped on cold start, so file-backed history does not persist there — Supabase (where wired up) is the only durable cloud store today.
 
@@ -86,4 +86,4 @@ On Vercel, only `/tmp` is writable and is wiped on cold start, so file-backed hi
 
 ## Windows-specific notes
 
-Dev happens on Windows. `execution/api/finance/route.ts` spawns `python3`, which is typically not on PATH on Windows (only `python` is) — this is a known, not-yet-fixed issue (see `context/MISMATCHES_AND_RISKS.md`). `Procfile` also references a `market_poller.py` that does not currently exist in `execution/` — it's stale relative to the actual poller filenames (`tws_poller.py`, `tws_volumes_poller.py`).
+Dev happens on Windows. `Procfile` references a `market_poller.py` that does not currently exist in `execution/` — it's stale relative to the actual poller filenames (`tws_poller.py`, `tws_volumes_poller.py`).
