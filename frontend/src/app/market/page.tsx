@@ -1743,7 +1743,7 @@ export default function MarketPage() {
                 <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-6">
                     <div className="flex flex-col gap-1">
                         <div className="flex items-center gap-4">
-                            <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-400 to-orange-400 bg-clip-text text-transparent">
+                            <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-orange-400 bg-clip-text text-transparent">
                                 Market Monitor <span className="text-sm font-light text-slate-500 italic ml-2">ODD LOGIC</span>
                             </h1>
                             <div className="flex items-center gap-2 ml-2">
