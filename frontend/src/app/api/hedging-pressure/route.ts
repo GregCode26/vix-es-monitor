@@ -16,10 +16,24 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { createClient } from '@supabase/supabase-js';
 import { estimateVanna, vannaToHedgingPressure } from '@/lib/vanna';
 import { calculateHedgingPressure, normalizeHedgingPressure, identifyRiskZones } from '@/lib/hedgingPressure';
 
 export const dynamic = 'force-dynamic';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
+
+/**
+ * Snapshot letti da Supabase per ogni richiesta. La pagina chiama ogni 15s,
+ * quindi scaricare l'intera sessione (~3000 righe con tutta la catena) a ogni
+ * giro brucerebbe l'egress. Uno snapshot con la catena pesa ~4,6 KB: 200
+ * (quanti ne entrerebbero in `pressureHistory`) sono 922 KB a richiesta,
+ * ~220 MB l'ora a pagina aperta. 60 snapshot = gli ultimi ~10 minuti.
+ */
+const SNAPSHOT_RECENTI = 60;
 
 interface StrikeRow {
     strike: number;
@@ -91,6 +105,82 @@ function readLocalSnapshots(dateStr: string): Snapshot[] | null {
         }
     }
     return null;
+}
+
+/**
+ * Senza Supabase il deploy su Vercel non ha dati: i JSON locali restano fuori
+ * dal pacchetto di proposito (vedi frontend/.vercelignore).
+ *
+ * Il primo snapshot della giornata arriva senza catena (`volumes: []`) e
+ * serve solo come riferimento di apertura per `spotDelta`.
+ */
+async function readSupabaseSnapshots(dateStr: string): Promise<Snapshot[] | null> {
+    if (!supabase) return null;
+
+    const [primo, recenti] = await Promise.all([
+        supabase
+            .from('volumes_snapshots')
+            .select('time, spx_price, und_price')
+            .eq('date', dateStr)
+            .not('und_price', 'is', null)
+            .order('time', { ascending: true })
+            .limit(1),
+        supabase
+            .from('volumes_snapshots')
+            .select('time, spx_price, und_price, volumes')
+            .eq('date', dateStr)
+            .order('time', { ascending: false })
+            .limit(SNAPSHOT_RECENTI),
+    ]);
+
+    if (primo.error || recenti.error) {
+        console.error('Hedging pressure Supabase error:', primo.error?.message ?? recenti.error?.message);
+        return null;
+    }
+
+    const snapshots: Snapshot[] = (recenti.data ?? []).reverse().map((r) => ({
+        time: r.time,
+        spxPrice: r.spx_price,
+        undPrice: r.und_price,
+        volumes: r.volumes as StrikeRow[],
+    }));
+
+    const apertura = primo.data?.[0];
+    if (apertura && snapshots.length > 0 && apertura.time < snapshots[0].time) {
+        snapshots.unshift({
+            time: apertura.time,
+            spxPrice: apertura.spx_price,
+            undPrice: apertura.und_price,
+            volumes: [],
+        });
+    }
+    return snapshots;
+}
+
+/** Solo l'ultima riga IV: la route non usa lo storico. */
+async function readSupabaseLatestIV(dateStr: string): Promise<IVSnapshot | null> {
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from('iv_snapshots')
+        .select('time, es_price, atm_strike, weighted_put_iv, weighted_call_iv, put_iv_change_pct, call_iv_change_pct')
+        .eq('date', dateStr)
+        .order('time', { ascending: false })
+        .limit(1);
+    if (error) {
+        console.error('Hedging pressure IV Supabase error:', error.message);
+        return null;
+    }
+    const r = data?.[0];
+    if (!r) return null;
+    return {
+        time: r.time,
+        esPrice: r.es_price,
+        atmStrike: r.atm_strike,
+        weightedPutIV: r.weighted_put_iv,
+        weightedCallIV: r.weighted_call_iv,
+        putIVChangePct: r.put_iv_change_pct,
+        callIVChangePct: r.call_iv_change_pct,
+    };
 }
 
 function readLocalIVSnapshots(dateStr: string): IVSnapshot[] | null {
@@ -220,7 +310,8 @@ export async function GET(request: Request) {
         const targetDate = getTodayKey();
 
         // Read volume snapshots (with gamma, delta, vega)
-        const local = readLocalSnapshots(targetDate) ?? [];
+        let local = (await readSupabaseSnapshots(targetDate)) ?? [];
+        if (local.length === 0) local = readLocalSnapshots(targetDate) ?? [];
         if (local.length === 0) {
             return NextResponse.json(
                 { error: 'No volume data available for ' + targetDate },
@@ -246,8 +337,11 @@ export async function GET(request: Request) {
         }
 
         // Read IV data to get current IV and changes
-        const ivSnapshots = readLocalIVSnapshots(targetDate) ?? [];
-        const latestIV = ivSnapshots.length > 0 ? ivSnapshots[ivSnapshots.length - 1] : null;
+        let latestIV = await readSupabaseLatestIV(targetDate);
+        if (!latestIV) {
+            const ivSnapshots = readLocalIVSnapshots(targetDate) ?? [];
+            latestIV = ivSnapshots.length > 0 ? ivSnapshots[ivSnapshots.length - 1] : null;
+        }
         const atmIv: number = getAtmIv(latestIV);
         const ivChange = getIvChange(latestIV);
 
