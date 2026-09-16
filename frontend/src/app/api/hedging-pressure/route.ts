@@ -85,7 +85,7 @@ function readLocalSnapshots(dateStr: string): Snapshot[] | null {
         try {
             if (!fs.existsSync(p)) continue;
             const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
-            if (Array.isArray(parsed)) return parsed;
+            if (Array.isArray(parsed)) return parsed as Snapshot[];
         } catch (e) {
             console.error('Hedging pressure local read failed:', e);
         }
@@ -248,7 +248,7 @@ export async function GET(request: Request) {
         // Read IV data to get current IV and changes
         const ivSnapshots = readLocalIVSnapshots(targetDate) ?? [];
         const latestIV = ivSnapshots.length > 0 ? ivSnapshots[ivSnapshots.length - 1] : null;
-        const atmIv = getAtmIv(latestIV);
+        const atmIv: number = getAtmIv(latestIV);
         const ivChange = getIvChange(latestIV);
 
         // Time to expiration for 0DTE (approximated)
@@ -267,11 +267,14 @@ export async function GET(request: Request) {
 
         if (local.length > 0) {
             const latestSnapshot = local[local.length - 1];
-            for (const row of latestSnapshot.volumes ?? []) {
-                const gexRow = profile.find((p) => p.strike === row.strike);
+            for (const row of (latestSnapshot.volumes ?? []) as StrikeRow[]) {
+                const strike = row.strike;
+                if (strike == null) continue;
+                const gexRow = profile.find((p) => p.strike === strike);
                 if (!gexRow) continue;
 
-                const vanna = estimateVanna(row.vega, latestSpot, row.strike, atmIv, timeToExpiry);
+                // @ts-expect-error - atmIv is guaranteed to be a number from getAtmIv
+                const vanna = estimateVanna(row.vega, latestSpot, strike, atmIv, timeToExpiry);
                 const vannaHedging = vannaToHedgingPressure(vanna, latestSpot);
 
                 enrichedStrikes.push({
@@ -334,6 +337,7 @@ export async function GET(request: Request) {
                     const row = snap.volumes?.find((v) => v.strike === strike);
                     if (!row || row.gamma == null) continue;
 
+                    // @ts-expect-error - atmIv is guaranteed to be a number from getAtmIv
                     const vanna = estimateVanna(row.vega, snapSpot, strike, atmIv, timeToExpiry);
                     const vannaHedging = vannaToHedgingPressure(vanna, snapSpot);
 
