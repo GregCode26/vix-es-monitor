@@ -78,8 +78,11 @@ interface SpxHistoryPoint {
 const FONDO_SCALA_M: Record<'volume' | 'oi', number> = { volume: 150000, oi: 10000 };
 
 /**
- * Sotto questa quota di fondo scala una riga non si disegna. Vale su entrambe
- * le basi, perche' e' una frazione del metro e non un valore in M$.
+ * Sotto questa quota una riga non si disegna. Si misura sul muro piu' grande
+ * della sessione, non sul fondo scala: il fondo scala e' tarato sulla fine
+ * della giornata (150.000 M$ in volume), e il 16/09/2026 alle 16:47 lo strike
+ * piu' grande valeva 4.544 M$ -- quota 0,17 -- quindi non si vedeva nessuna
+ * riga. Spessore e colore restano invece sul metro fisso.
  */
 const SOGLIA_RIGA = 0.18;
 
@@ -422,6 +425,13 @@ export default function GexPage() {
     [gexBasis],
   );
 
+  /** Il muro piu' grande della sessione sulla base corrente: lo aggiorna buildDatasets. */
+  const massimoSessione = useRef(0);
+  const muroVisibile = useCallback(
+    (valore: number) => massimoSessione.current > 0 && Math.sqrt(Math.abs(valore) / massimoSessione.current) >= SOGLIA_RIGA,
+    [],
+  );
+
   /**
    * Il metro con cui si disegna: assoluto, e per tutta la sessione non
    * torna mai indietro. Se si accorciasse quando i livelli calano, la stessa
@@ -578,6 +588,11 @@ export default function GexPage() {
       const valoreDi = (ctx: { chart?: { data?: { datasets?: { data?: { v?: number }[] }[] } }; datasetIndex?: number; p1DataIndex?: number }) =>
         ctx.chart?.data?.datasets?.[ctx.datasetIndex ?? 0]?.data?.[ctx.p1DataIndex ?? 0]?.v ?? 0;
 
+      massimoSessione.current = serieOra.reduce((m, f) => {
+        for (const v of gexBasis === 'oi' ? f.gexOi : f.gex) if (Math.abs(v) > m) m = Math.abs(v);
+        return m;
+      }, 0);
+
       const muri = [];
       for (let i = 0; i < strikeSerie.length; i++) {
         const strike = strikeSerie[i];
@@ -593,7 +608,7 @@ export default function GexPage() {
         }
         // Uno strike che non ha mai contato non merita una linea: sarebbero
         // trentasette dataset di cui venti invisibili.
-        if (punti.length === 0 || quotaMuro(massimo) < SOGLIA_RIGA) continue;
+        if (punti.length === 0 || !muroVisibile(massimo)) continue;
 
         muri.push({
           type: 'line' as const,
@@ -616,13 +631,13 @@ export default function GexPage() {
               // Sotto la soglia il muro non c'e' ancora: la linea non si
               // interrompe, semplicemente non si vede, e si accende quando
               // il livello comincia a contare.
-              if (q < SOGLIA_RIGA) return 'rgba(0, 0, 0, 0)';
+              if (!muroVisibile(v)) return 'rgba(0, 0, 0, 0)';
               const opacita = 0.15 + q * 0.8;
               return v > 0 ? `rgba(34, 197, 94, ${opacita})` : `rgba(239, 68, 68, ${opacita})`;
             },
             borderWidth: (ctx: Parameters<typeof valoreDi>[0]) => {
-              const q = quotaMuro(valoreDi(ctx));
-              return q < SOGLIA_RIGA ? 0 : 1 + q * 13;
+              const v = valoreDi(ctx);
+              return muroVisibile(v) ? 1 + quotaMuro(v) * 13 : 0;
             },
           },
         });
@@ -658,7 +673,7 @@ export default function GexPage() {
       borderWidth: 1, barThickness: 8, indexAxis: 'y' as const,
     };
     return [priceDataset, posGexDataset, negGexDataset];
-  }, [viewMode, gexBasis, quotaMuro]);
+  }, [viewMode, gexBasis, quotaMuro, muroVisibile]);
 
   const handleTimeWindowChange = useCallback((w: number | 'all') => {
     setTimeWindow(w);
