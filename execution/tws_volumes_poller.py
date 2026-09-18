@@ -80,6 +80,83 @@ def append_to_session_file(date_key, snapshot):
     except Exception as e:
         print(f"Error writing to file {file_path}: {e}")
 
+class MarketTide:
+    """Premio e volume netti della giornata, lato ask meno lato bid.
+
+    E' il "Market Tide" di Unusual Whales, ma su quello che questo poller vede:
+    la catena SPX 0DTE degli strike sottoscritti, non tutto il mercato.
+
+    IBKR non manda ogni trade con il suo lato. Manda il volume cumulato del
+    contratto, l'ultimo prezzo e il book: quando il volume sale, i contratti
+    in piu' si attribuiscono confrontando l'ultimo prezzo con bid e ask di
+    quel momento. Vicino all'ask conta come comprato, vicino al bid come
+    venduto, a meta' non conta. E' un'approssimazione: i tick di opzioni sono
+    campionati, e fra due aggiornamenti possono passare piu' trade.
+    """
+
+    VICINO_ASK = 0.6  # quota dello spread da bid verso ask
+    VICINO_BID = 0.4
+
+    def __init__(self):
+        self.ultimo_volume = {}  # conId -> volume cumulato visto
+        self.ncp = 0.0  # net call premium, $
+        self.npp = 0.0  # net put premium, $
+        self.ncv = 0    # net call volume, contratti
+        self.npv = 0    # net put volume, contratti
+
+    def riprendi(self, snapshots):
+        """Riparte dai totali dell'ultimo snapshot: un riavvio a meta' sessione
+        non deve azzerare la giornata. I contratti scambiati mentre il poller
+        era giu' restano fuori, perche' il loro lato non si puo' piu' sapere."""
+        for snap in reversed(snapshots):
+            tide = snap.get("tide")
+            if tide:
+                self.ncp = float(tide.get("ncp", 0))
+                self.npp = float(tide.get("npp", 0))
+                self.ncv = int(tide.get("ncv", 0))
+                self.npv = int(tide.get("npv", 0))
+                print(f"Market Tide ripreso dalle {snap.get('time')}: NCP {self.ncp:,.0f}, NPP {self.npp:,.0f}")
+                return
+
+    @staticmethod
+    def _valido(x):
+        return x is not None and x == x and x > 0
+
+    def su_tickers(self, tickers):
+        for t in tickers:
+            c = t.contract
+            if c is None or c.secType != 'OPT':
+                continue
+            vol = t.volume
+            if vol is None or vol != vol:
+                continue
+            precedente = self.ultimo_volume.get(c.conId)
+            self.ultimo_volume[c.conId] = vol
+            # Il primo volume visto e' la base: quello che c'era prima non ha lato.
+            if precedente is None or vol <= precedente:
+                continue
+            nuovi = vol - precedente
+            prezzo, bid, ask = t.last, t.bid, t.ask
+            if not (self._valido(prezzo) and self._valido(bid) and self._valido(ask)) or ask <= bid:
+                continue
+            quota = (prezzo - bid) / (ask - bid)
+            if quota >= self.VICINO_ASK:
+                lato = 1
+            elif quota <= self.VICINO_BID:
+                lato = -1
+            else:
+                continue
+            premio = nuovi * prezzo * 100 * lato
+            if c.right == 'C':
+                self.ncp += premio
+                self.ncv += int(nuovi) * lato
+            else:
+                self.npp += premio
+                self.npv += int(nuovi) * lato
+
+    def fotografia(self):
+        return {"ncp": round(self.ncp), "npp": round(self.npp), "ncv": self.ncv, "npv": self.npv}
+
 _supabase_client = None
 
 def push_snapshot_to_supabase(date_key, snapshot):
@@ -238,6 +315,17 @@ def main():
         ticker = ib.reqMktData(c, '100,101,106', False, False)
         option_tickers.append({"strike": c.strike, "right": c.right, "ticker": ticker})
 
+    # Il tide parte dai totali gia' salvati oggi, poi ascolta ogni aggiornamento
+    # dei ticker: fra uno snapshot e l'altro (10 s) il volume cambia piu' volte,
+    # e il lato va letto quando cambia, non dieci secondi dopo.
+    tide = MarketTide()
+    oggi = get_today_key()
+    if _session_cache["date"] != oggi:
+        _session_cache["date"] = oggi
+        _session_cache["snapshots"] = read_session_file(oggi)
+    tide.riprendi(_session_cache["snapshots"])
+    ib.pendingTickersEvent += tide.su_tickers
+
     print("Subscribed. Starting poller loop...")
 
     # Wait for initial data
@@ -355,7 +443,10 @@ def main():
                     "volumes": [{"strike": k, "calls": v["calls"], "puts": v["puts"], "gamma": v["gamma"],
                                  "delta": v["delta"], "vega": v["vega"],
                                  "callsOi": v["callsOi"], "putsOi": v["putsOi"]}
-                                for k, v in volume_by_strike.items()]
+                                for k, v in volume_by_strike.items()],
+                    # Solo nel file locale: push_snapshot_to_supabase sceglie
+                    # le colonne una per una e questa non c'e'.
+                    "tide": tide.fotografia(),
                 }
                 
                 append_to_session_file(today_key, snapshot)
