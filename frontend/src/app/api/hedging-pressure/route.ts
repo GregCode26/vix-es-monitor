@@ -27,13 +27,15 @@ const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 /**
- * Snapshot letti da Supabase per ogni richiesta. La pagina chiama ogni 15s,
- * quindi scaricare l'intera sessione (~3000 righe con tutta la catena) a ogni
- * giro brucerebbe l'egress. Uno snapshot con la catena pesa ~4,6 KB: 200
- * (quanti ne entrerebbero in `pressureHistory`) sono 922 KB a richiesta,
- * ~220 MB l'ora a pagina aperta. 60 snapshot = gli ultimi ~10 minuti.
+ * Snapshot letti da Supabase per ogni richiesta.
+ *
+ * Uno snapshot con tutta la catena pesa ~5,5 KB, e la pagina chiama ogni 15
+ * secondi: 60 snapshot erano 330 KB a richiesta, ~79 MB l'ora di egress con
+ * la sola pagina aperta. Il profilo ne usa uno solo, quello di adesso; gli
+ * altri servivano a `pressureHistory`, che ora se la costruisce la pagina
+ * accumulando quello che riceve. Sei bastano a coprire un giro saltato.
  */
-const SNAPSHOT_RECENTI = 60;
+const SNAPSHOT_RECENTI = 6;
 
 interface StrikeRow {
     strike: number;

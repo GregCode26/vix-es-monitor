@@ -38,6 +38,8 @@ interface HedgingPressureResponse {
 }
 
 const REFRESH_MS = 15000;
+/** Punti di storico tenuti in memoria: 5 strike a ogni giro, ~2 ore di sessione. */
+const MAX_STORICO = 2500;
 
 type ViewMode = 'profile' | 'timeseries' | 'heatmap';
 
@@ -63,6 +65,15 @@ export default function HedgingPressurePage() {
     const [viewMode, setViewMode] = useState<ViewMode>('profile');
     const lastTime = useRef<string | null>(null);
     const giornoSessione = useRef<string | null>(null);
+    /**
+     * Lo storico della pressione, accumulato qui.
+     *
+     * La route ne manda solo l'ultimo minuto -- leggerne dieci da Supabase a
+     * ogni giro costava ~79 MB l'ora -- quindi la serie nel tempo la tiene la
+     * pagina, unendo quello che arriva. La chiave e' ora+strike: i giri si
+     * sovrappongono e lo stesso punto arriva piu' volte.
+     */
+    const [storico, setStorico] = useState<PressureHistoryPoint[]>([]);
 
     const fetchHedgingPressure = useCallback(async () => {
         try {
@@ -71,12 +82,13 @@ export default function HedgingPressurePage() {
                 const body = await res.json().catch(() => null);
                 throw new Error(body?.error || 'Caricamento fallito');
             }
-            const json = (await res.json()) as HedgingPressureResponse;
+            const json = (await res.json()) as HedgingPressureResponseWithHistory;
 
             // Cambio di giornata: si riparte da zero
             if (json.date && giornoSessione.current && json.date !== giornoSessione.current) {
                 giornoSessione.current = json.date;
                 lastTime.current = null;
+                setStorico([]);
                 setData(null);
                 setError(null);
                 return;
@@ -84,6 +96,12 @@ export default function HedgingPressurePage() {
             if (json.date) giornoSessione.current = json.date;
 
             setData(json);
+            setStorico((prec) => {
+                const visti = new Set(prec.map((p) => `${p.time}|${p.strike}`));
+                const nuovi = (json.pressureHistory ?? []).filter((p) => !visti.has(`${p.time}|${p.strike}`));
+                if (nuovi.length === 0) return prec;
+                return [...prec, ...nuovi].slice(-MAX_STORICO);
+            });
             setError(null);
             setLoading(false);
         } catch (e: unknown) {
@@ -146,7 +164,7 @@ export default function HedgingPressurePage() {
 
     // Opzione echarts per il grafico time-series (gamma vs vanna)
     const timeseriesOption = useMemo(() => {
-        if (!data || !data.pressureHistory || data.pressureHistory.length === 0) {
+        if (storico.length === 0) {
             return {
                 backgroundColor: '#0c0d10',
                 title: { text: 'Nessun dato storico disponibile', left: 'center', textStyle: { color: '#94a3b8' } },
@@ -156,7 +174,7 @@ export default function HedgingPressurePage() {
         const groupedByStrike: Record<number, { time: string[]; total: number[] }> = {};
         const allTimes: string[] = [];
 
-        for (const point of data.pressureHistory) {
+        for (const point of storico) {
             if (!groupedByStrike[point.strike]) {
                 groupedByStrike[point.strike] = { time: [], total: [] };
             }
@@ -227,20 +245,20 @@ export default function HedgingPressurePage() {
             },
             series,
         };
-    }, [data]);
+    }, [storico]);
 
     // Opzione echarts per heatmap (pressione per strike nel tempo)
     const heatmapOption = useMemo(() => {
-        if (!data || !data.pressureHistory || data.pressureHistory.length === 0) return {};
+        if (storico.length === 0) return {};
 
         // Group by strike and create heatmap data
         const heatmapData: [number, number, number][] = []; // [time_index, strike, pressure]
         const timeIndex: Record<string, number> = {};
         const uniqueTimes: string[] = [];
-        const uniqueStrikes = Array.from(new Set(data.pressureHistory.map((p) => p.strike))).sort((a, b) => a - b);
+        const uniqueStrikes = Array.from(new Set(storico.map((p) => p.strike))).sort((a, b) => a - b);
 
         // Build time index
-        for (const point of data.pressureHistory) {
+        for (const point of storico) {
             if (!(point.time in timeIndex)) {
                 timeIndex[point.time] = uniqueTimes.length;
                 uniqueTimes.push(point.time);
@@ -248,7 +266,7 @@ export default function HedgingPressurePage() {
         }
 
         // Build heatmap data
-        for (const point of data.pressureHistory) {
+        for (const point of storico) {
             const timeIdx = timeIndex[point.time];
             const strikeIdx = uniqueStrikes.indexOf(point.strike);
             heatmapData.push([timeIdx, strikeIdx, Math.round(point.totalPressure * 10) / 10]);
@@ -312,7 +330,7 @@ export default function HedgingPressurePage() {
                 },
             ],
         };
-    }, [data]);
+    }, [storico]);
 
     // Opzione echarts per il grafico profile (barre)
     const option = useMemo(() => {

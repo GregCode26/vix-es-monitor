@@ -221,6 +221,12 @@ export default function GexPage() {
   const latestSpxHistory = useRef<SpxHistoryPoint[]>([]);
   const latestSerie = useRef<SerieFrame[]>([]);
   const latestStrikes = useRef<number[]>([]);
+  /** Lo storico del prezzo e' gia' stato scaricato per questa giornata. */
+  const storicoPrezzo = useRef(false);
+  /** I livelli delle 15:35 sono arrivati: non serve piu' rileggere lo storico. */
+  const rangeOb = useRef(false);
+  /** Ultimo tentativo di rileggere lo storico per avere i range OB. */
+  const ultimoRange = useRef(0);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -317,12 +323,53 @@ export default function GexPage() {
         setError(e.message || 'Error');
       }
     };
+    /**
+     * Aggiunge in coda l'ultimo punto, senza ripassare dalla giornata intera.
+     *
+     * `/api/market?history=true` rilegge tutte le righe di market_data del
+     * giorno: a fine sessione sono ~5.500 righe, ~2,2 MB, e chiamarlo ogni 30
+     * secondi voleva dire ~264 MB l'ora di egress Supabase con questa pagina
+     * aperta -- un terzo del piano free in una seduta. La riga singola ne pesa
+     * 400.
+     */
+    const fetchUltimoPrezzo = async () => {
+      try {
+        const res = await fetch('/api/market', { cache: 'no-store' });
+        if (!res.ok) return;
+        const json = await res.json();
+        const ora: string | null = json.sourceTime ?? null;
+        if (!ora || (json.spx == null && json.esf == null)) return;
+        if (secondiEt(ora) < INIZIO_SESSIONE_SEC) return;
+        setSpxHistory((prec) => {
+          const ultimo = prec[prec.length - 1];
+          // Ora piu' vecchia dell'ultima: e' cambiato il giorno, si ricomincia.
+          if (ultimo && ora <= ultimo.time) {
+            if (ora < ultimo.time) storicoPrezzo.current = false;
+            return prec;
+          }
+          return [...prec, { time: ora, spxPrice: json.spx ?? json.esf, spx: json.spx, esf: json.esf }];
+        });
+      } catch (e) {
+        console.error('Failed to load SPX price:', e);
+      }
+    };
+
     const fetchSpxData = async () => {
+      // I range del server arrivano solo con lo storico, e quelli delle 15:35
+      // non esistono prima di quell'ora: finche' mancano si riprova, ma ogni
+      // dieci minuti, non ogni trenta secondi.
+      const servonoRange = !rangeOb.current;
+      if (storicoPrezzo.current && (!servonoRange || Date.now() - ultimoRange.current < 10 * 60 * 1000)) {
+        await fetchUltimoPrezzo();
+        return;
+      }
+      ultimoRange.current = Date.now();
       try {
         const res = await fetch('/api/market?history=true', { cache: 'no-store' });
         if (res.ok) {
           const json = await res.json();
           if (json.history?.length > 0) {
+            storicoPrezzo.current = true;
             // Nessuna conversione: /api/market scrive gia' l'ora italiana, la
             // stessa del gamma. Qui prima si toglievano sei ore a mano per
             // portare la linea del prezzo a New York -- ed erano sei fisse,
@@ -335,7 +382,10 @@ export default function GexPage() {
             // La finestra parte dalle 13:30, quando comincia a raccogliere il
             // poller dei volumi: cosi' l'asse copre lo stesso tratto del
             // gamma invece di allargarsi su ore in cui non c'e' nient'altro.
-            if (json.range) setRangeServer(chiaviRange(json.range));
+            if (json.range) {
+              if (json.range.ob) rangeOb.current = true;
+              setRangeServer(chiaviRange(json.range));
+            }
             setSpxHistory(
               json.history
                 .filter((p: { time?: string; spx?: number | null; esf?: number | null }) => {
