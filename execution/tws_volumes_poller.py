@@ -159,6 +159,13 @@ class MarketTide:
 
 _supabase_client = None
 
+# Quando Supabase ha risposto che la colonna `tide` non esiste
+# (sql/006_volumes_snapshots_tide.sql non ancora eseguito): per dieci minuti la
+# si lascia fuori invece di perdere lo snapshot, poi si riprova, cosi' dopo la
+# migrazione riparte da sola senza riavviare il poller.
+_colonna_tide_manca_dal = None
+_RIPROVA_COLONNA_TIDE_SEC = 600
+
 def push_snapshot_to_supabase(date_key, snapshot):
     """Inserisce il singolo snapshot appena prodotto (~1,8 KB).
 
@@ -173,14 +180,30 @@ def push_snapshot_to_supabase(date_key, snapshot):
     try:
         if _supabase_client is None:
             _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        _supabase_client.table("volumes_snapshots").upsert({
+        global _colonna_tide_manca_dal
+        riga = {
             "date": date_key,
             "time": snapshot["time"],
             "spx_price": snapshot["spxPrice"],
             "und_price": snapshot.get("undPrice"),
             "is_opening": snapshot["isOpening"],
             "volumes": snapshot["volumes"],
-        }, on_conflict="date,time", returning="minimal").execute()
+            "tide": snapshot.get("tide"),
+        }
+        if _colonna_tide_manca_dal is not None and time.time() - _colonna_tide_manca_dal < _RIPROVA_COLONNA_TIDE_SEC:
+            riga.pop("tide", None)
+        try:
+            _supabase_client.table("volumes_snapshots").upsert(
+                riga, on_conflict="date,time", returning="minimal").execute()
+        except Exception as e:
+            if "tide" not in str(e) or "tide" not in riga:
+                raise
+            _colonna_tide_manca_dal = time.time()
+            print("Colonna tide assente su Supabase: il Market Tide resta solo nel file locale "
+                  "finche' non si esegue sql/006_volumes_snapshots_tide.sql.", file=sys.stderr)
+            riga.pop("tide", None)
+            _supabase_client.table("volumes_snapshots").upsert(
+                riga, on_conflict="date,time", returning="minimal").execute()
     except Exception as e:
         print(f"Error pushing snapshot to Supabase: {e}", file=sys.stderr)
 
