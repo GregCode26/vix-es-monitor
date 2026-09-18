@@ -240,6 +240,14 @@ interface RangeCalcInput {
     putAsk: string;
 }
 
+/**
+ * Campanella di apertura e momento dello scatto Opening Bell, in ora di Roma,
+ * nello stesso formato 'HH:MM:SS' di `DataPoint.time`: cosi' il confronto e'
+ * un confronto fra stringhe e non serve ricostruire una data.
+ */
+const APERTURA_USA = '15:30:00';
+const OB_SNAPSHOT = '15:35:00';
+
 // --- Helpers ---
 function getTodayKey() {
     const now = new Date();
@@ -279,6 +287,19 @@ export default function MarketPage() {
      * queste seguono il prezzo per tutta la sessione.
      */
     const [mostraStraddle, setMostraStraddle] = useState(true);
+    /**
+     * L'indice SPX sulla scala destra, quella di ES. Solo da mercato aperto:
+     * prima delle 15:30 l'indice non stampa e il poller ripiega sull'ultimo
+     * prezzo o sulla chiusura di ieri, cioe' una riga piatta che non e' un
+     * prezzo di oggi.
+     */
+    const [mostraSpx, setMostraSpx] = useState(true);
+    /**
+     * Gli stessi livelli R1/R2/R3 dell'Opening Bell, ma in termini SPX: il
+     * calcolo parte dallo SPX e ci somma il basis per portarli su ES, qui il
+     * basis non si somma. Vanno con la linea verde, non con quella di ES.
+     */
+    const [mostraRangeSpxOb, setMostraRangeSpxOb] = useState(true);
   const [activeTab, setActiveTab] = useState<'market'|'gex'>('market');
 
     const [pluginsReady, setPluginsReady] = useState(false);
@@ -369,6 +390,10 @@ export default function MarketPage() {
             if (savedDiv !== null) setShowDivergences(savedDiv === 'true');
             const savedStr = localStorage.getItem('marketShowStraddle');
             if (savedStr !== null) setMostraStraddle(savedStr === 'true');
+            const savedSpx = localStorage.getItem('marketShowSpx');
+            if (savedSpx !== null) setMostraSpx(savedSpx === 'true');
+            const savedSpxOb = localStorage.getItem('marketShowRangeSpxOb');
+            if (savedSpxOb !== null) setMostraRangeSpxOb(savedSpxOb === 'true');
         }
     }, [router]);
 
@@ -380,6 +405,15 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowStraddle', String(mostraStraddle));
     }, [mostraStraddle]);
+
+
+    useEffect(() => {
+        localStorage.setItem('marketShowSpx', String(mostraSpx));
+    }, [mostraSpx]);
+
+    useEffect(() => {
+        localStorage.setItem('marketShowRangeSpxOb', String(mostraRangeSpxOb));
+    }, [mostraRangeSpxOb]);
 
 
 
@@ -592,6 +626,40 @@ export default function MarketPage() {
         }
     }, []);
 
+    // ---- Range Calculator computation ----
+    const calcRange = useCallback((input: RangeCalcInput) => {
+        const spx = parseFloat(input.spx);
+        const es = parseFloat(input.es);
+        const callBid = parseFloat(input.callBid);
+        const callAsk = parseFloat(input.callAsk);
+        const putBid = parseFloat(input.putBid);
+        const putAsk = parseFloat(input.putAsk);
+
+        if ([spx, es, callBid, callAsk, putBid, putAsk].some(isNaN)) return null;
+
+        const basis = es - spx;
+        const callMid = (callBid + callAsk) / 2;
+        const putMid = (putBid + putAsk) / 2;
+        const straddle = callMid + putMid;
+        const sqrt3 = Math.sqrt(3);
+
+        return {
+            basis: Math.round(basis * 100) / 100,
+            callMid: Math.round(callMid * 100) / 100,
+            putMid: Math.round(putMid * 100) / 100,
+            straddle: Math.round(straddle * 100) / 100,
+            r1Up: Math.round((spx + straddle + basis) * 100) / 100,
+            r1Down: Math.round((spx - straddle + basis) * 100) / 100,
+            r2Up: Math.round((spx + straddle / sqrt3 + basis) * 100) / 100,
+            r2Down: Math.round((spx - straddle / sqrt3 + basis) * 100) / 100,
+            r3Up: Math.round((spx + straddle * sqrt3 + basis) * 100) / 100,
+            r3Down: Math.round((spx - straddle * sqrt3 + basis) * 100) / 100,
+        };
+    }, []);
+
+    const morningResults = useMemo(() => calcRange(rangeCalcMorning), [rangeCalcMorning, calcRange]);
+    const obResults = useMemo(() => calcRange(rangeCalcOb), [rangeCalcOb, calcRange]);
+
     // ---- Imperative chart update (preserves zoom) ----
     useEffect(() => {
         const chart = chartRef.current;
@@ -600,6 +668,15 @@ export default function MarketPage() {
         chart.data.datasets[0].data = dataPoints.map((d) => d.esf);
         chart.data.datasets[1].data = dataPoints.map((d) => d.vix);
         chart.data.datasets[4].data = dataPoints.map((d) => d.vwap ?? null);
+
+        // SPX: solo da mercato aperto. Prima delle 15:30 il valore che arriva
+        // non e' l'indice che quota, quindi meglio niente linea che una linea
+        // finta.
+        if (chart.data.datasets[5]) {
+            chart.data.datasets[5].data = dataPoints.map(
+                (d) => (d.time >= APERTURA_USA ? (d.spx ?? null) : null));
+            chart.data.datasets[5].hidden = !mostraSpx;
+        }
         
         // Ported from logica.zip: Add Cone datasets
         if (chart.data.datasets.length > 3) {
@@ -646,6 +723,47 @@ export default function MarketPage() {
         });
 
 
+
+        // Gli stessi sei livelli dell'Opening Bell in termini SPX. Non sono
+        // un secondo calcolo: `calcRange` parte dallo SPX e aggiunge il basis
+        // per esprimerli su ES, qui il basis si toglie. Partono dalle 15:35,
+        // l'ora dello scatto da cui sono ricavati: prima di allora non
+        // esistevano.
+        if (mostraRangeSpxOb && obResults) {
+            const daIdx = dataPoints.findIndex((d) => d.time >= OB_SNAPSHOT);
+            if (daIdx >= 0) {
+                const spxConfigs = [
+                    { key: 'r1Down', color: '#ef4444', label: 'R1↓ SPX' },
+                    { key: 'r2Down', color: '#f97316', label: 'R2↓ SPX' },
+                    { key: 'r3Down', color: '#facc15', label: 'R3↓ SPX' },
+                    { key: 'r1Up', color: '#3b82f6', label: 'R1↑ SPX' },
+                    { key: 'r2Up', color: '#06b6d4', label: 'R2↑ SPX' },
+                    { key: 'r3Up', color: '#10b981', label: 'R3↑ SPX' },
+                ] as const;
+                spxConfigs.forEach(({ key, color, label }) => {
+                    const val = obResults[key] - obResults.basis;
+                    newAnnotations[`${key}ObSpx`] = {
+                        type: 'line',
+                        xScaleID: 'x',
+                        xMin: dataPoints[daIdx].time,
+                        xMax: dataPoints[dataPoints.length - 1].time,
+                        yMin: val, yMax: val,
+                        yScaleID: 'y-right',
+                        borderColor: color,
+                        borderWidth: 1.5,
+                        borderDash: [2, 2],
+                        label: {
+                            display: true,
+                            content: label,
+                            position: 'start',
+                            backgroundColor: 'rgba(15, 23, 42, 0.75)',
+                            color,
+                            font: { size: 9, weight: 'bold' },
+                        },
+                    };
+                });
+            }
+        }
 
         // Divergence boxes
         if (showDivergences) {
@@ -704,7 +822,13 @@ export default function MarketPage() {
             //    [centroVix*(1-p), centroVix*(1+p)]. A quel punto un
             //    movimento dell'1% occupa lo stesso spazio sui due assi, e il
             //    rapporto visivo fra le linee e' quello vero.
-            const esfValues = visiblePoints.map(d => d.esf).filter((v): v is number => v !== null);
+            // Con la linea SPX accesa l'asse destro deve contenere due prezzi
+            // distanti quanto il basis, che a indice 6.600 vale mezzo punto
+            // percentuale: tarandolo sul solo ES la linea verde finirebbe
+            // sotto il bordo.
+            const esfValues = visiblePoints
+                .flatMap(d => [d.esf, mostraSpx && d.time >= APERTURA_USA ? (d.spx ?? null) : null])
+                .filter((v): v is number => v !== null && v !== undefined);
             const vixValuesAuto = visiblePoints.map(d => d.vix).filter((v): v is number => v !== null);
             const semiRelativa = (v: number[]) => {
                 if (v.length === 0) return null;
@@ -725,9 +849,15 @@ export default function MarketPage() {
             // schiacciava ES in una banda sottile. Oltre il doppio della
             // finestra si lascia fuori: per vederla basta allargare lo zoom.
             if (es) {
+                const livelliSpx = mostraRangeSpxOb && obResults
+                    ? [obResults.r1Up, obResults.r2Up, obResults.r3Up,
+                       obResults.r1Down, obResults.r2Down, obResults.r3Down]
+                        .map((v) => v - obResults.basis)
+                    : [];
                 const distanzeRef = Object.entries(refLines)
                     .filter(([k]) => (refLineVisibility as unknown as Record<string, boolean | undefined>)[k] !== false)
                     .map(([, v]) => parseFloat(v))
+                    .concat(livelliSpx)
                     .filter((v) => !isNaN(v))
                     .map((v) => Math.abs(v - es.centro) / es.centro);
                 const vicine = distanzeRef.filter((d) => d <= p * 2);
@@ -775,7 +905,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults]);
 
     // ---- Plugins (zoom) ----
     useEffect(() => {
@@ -833,39 +963,6 @@ export default function MarketPage() {
         localStorage.setItem(`rangeCalc_ob_${todayKey}`, JSON.stringify(rangeCalcOb));
     }, [rangeCalcOb]);
 
-    // ---- Range Calculator computation ----
-    const calcRange = useCallback((input: RangeCalcInput) => {
-        const spx = parseFloat(input.spx);
-        const es = parseFloat(input.es);
-        const callBid = parseFloat(input.callBid);
-        const callAsk = parseFloat(input.callAsk);
-        const putBid = parseFloat(input.putBid);
-        const putAsk = parseFloat(input.putAsk);
-
-        if ([spx, es, callBid, callAsk, putBid, putAsk].some(isNaN)) return null;
-
-        const basis = es - spx;
-        const callMid = (callBid + callAsk) / 2;
-        const putMid = (putBid + putAsk) / 2;
-        const straddle = callMid + putMid;
-        const sqrt3 = Math.sqrt(3);
-
-        return {
-            basis: Math.round(basis * 100) / 100,
-            callMid: Math.round(callMid * 100) / 100,
-            putMid: Math.round(putMid * 100) / 100,
-            straddle: Math.round(straddle * 100) / 100,
-            r1Up: Math.round((spx + straddle + basis) * 100) / 100,
-            r1Down: Math.round((spx - straddle + basis) * 100) / 100,
-            r2Up: Math.round((spx + straddle / sqrt3 + basis) * 100) / 100,
-            r2Down: Math.round((spx - straddle / sqrt3 + basis) * 100) / 100,
-            r3Up: Math.round((spx + straddle * sqrt3 + basis) * 100) / 100,
-            r3Down: Math.round((spx - straddle * sqrt3 + basis) * 100) / 100,
-        };
-    }, []);
-
-    const morningResults = useMemo(() => calcRange(rangeCalcMorning), [rangeCalcMorning, calcRange]);
-    const obResults = useMemo(() => calcRange(rangeCalcOb), [rangeCalcOb, calcRange]);
 
     const applyToChart = useCallback((session: 'morning' | 'ob') => {
         const results = session === 'morning' ? morningResults : obResults;
@@ -1607,6 +1704,20 @@ export default function MarketPage() {
                 yAxisID: 'y-right',
                 fill: false,
             },
+            {
+                // Sulla scala di ES, non su una sua: SPX ed ES sono lo stesso
+                // sottostante a meno del basis, e vederli distanti quanto il
+                // basis li rende e' il motivo per cui la linea sta qui.
+                label: 'SPX (cash)',
+                data: [] as (number | null)[],
+                borderColor: '#22c55e',
+                borderWidth: 2,
+                pointRadius: 0,
+                pointHoverRadius: 4,
+                tension: 0.1,
+                yAxisID: 'y-right',
+                fill: false,
+            },
         ],
     }), []);
 
@@ -1782,6 +1893,7 @@ export default function MarketPage() {
                             <button onClick={() => setActiveTab('gex')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'gex' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>GEX</button>
                             <button onClick={() => router.push('/spx-volumes')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">VOLUMI SPX</button>
                             <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET MAKER</button>
+                            <button onClick={() => router.push('/market-tide')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET TIDE</button>
                         </div>
                         
                         {/* Le due linee del cono */}
@@ -1793,6 +1905,28 @@ export default function MarketPage() {
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraStraddle ? '◉' : '◌'} Straddle
+                        </button>
+
+                        {/* L'indice SPX, da mercato aperto, sulla scala di ES */}
+                        <button
+                            onClick={() => setMostraSpx((v) => !v)}
+                            title={mostraSpx ? "Nascondi la linea SPX (dalle 15:30)" : "Mostra la linea SPX dalle 15:30, sulla scala destra"}
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraSpx
+                                ? 'bg-green-600/30 text-green-300 border-green-500/50 hover:bg-green-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraSpx ? '◉' : '◌'} SPX
+                        </button>
+
+                        {/* I sei livelli dell'Opening Bell in termini SPX */}
+                        <button
+                            onClick={() => setMostraRangeSpxOb((v) => !v)}
+                            title={mostraRangeSpxOb ? "Nascondi i range SPX dell'Opening Bell" : "Mostra i range SPX dell'Opening Bell, dalle 15:35"}
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraRangeSpxOb
+                                ? 'bg-emerald-600/30 text-emerald-300 border-emerald-500/50 hover:bg-emerald-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraRangeSpxOb ? '◉' : '◌'} Range SPX OB
                         </button>
 
                         {/* I dodici livelli R1/R2/R3, che sono un'altra cosa */}

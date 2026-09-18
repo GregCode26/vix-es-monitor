@@ -255,6 +255,32 @@ def _quote(ticker, side):
     return round(float(v), 2)
 
 
+def _iv_atm(*tickers):
+    """IV ATM in punti percentuali: media delle impliedVol IBKR disponibili.
+
+    Arriva con i modelGreeks, che TWS manda per le opzioni senza generic tick
+    dedicati. Valori fuori da (0, 5) -- cioe' oltre il 500% -- sono modelli
+    che non hanno convergito, non volatilita'.
+    """
+    valori = []
+    for t in tickers:
+        g = getattr(t, 'modelGreeks', None) if t is not None else None
+        iv = getattr(g, 'impliedVol', None) if g is not None else None
+        if iv is not None and iv == iv and 0 < iv < 5:
+            valori.append(float(iv))
+    if not valori:
+        return None
+    return round(sum(valori) / len(valori) * 100, 2)
+
+
+# Istante in cui Supabase ha risposto che la colonna es_atm_iv non esiste
+# (sql/005_market_data_es_atm_iv.sql non ancora eseguito): per dieci minuti la
+# si lascia fuori, invece di perdere l'intera riga a ogni push, poi si riprova
+# -- cosi' dopo la migrazione torna da sola, senza riavviare il poller.
+_colonna_iv_manca_dal = None
+_RIPROVA_COLONNA_IV_SEC = 600
+
+
 def push_to_supabase(point):
     if not SUPABASE_URL or not SUPABASE_KEY or SUPABASE_URL == "YOUR_SUPABASE_URL":
         return
@@ -276,10 +302,22 @@ def push_to_supabase(point):
                          ("esCallBid", "es_call_bid"), ("esCallAsk", "es_call_ask"),
                          ("esPutBid", "es_put_bid"), ("esPutAsk", "es_put_ask"),
                          ("esAtmStrike", "es_atm_strike"), ("spxAtmStrike", "spx_atm_strike"),
-                         ("spxRef", "spx_ref")):
+                         ("spxRef", "spx_ref"), ("esAtmIv", "es_atm_iv")):
             if point.get(src) is not None:
                 data[col] = point[src]
-        supabase.table("market_data").insert(data, returning="minimal").execute()
+        global _colonna_iv_manca_dal
+        if _colonna_iv_manca_dal is not None and time.time() - _colonna_iv_manca_dal < _RIPROVA_COLONNA_IV_SEC:
+            data.pop("es_atm_iv", None)
+        try:
+            supabase.table("market_data").insert(data, returning="minimal").execute()
+        except Exception as e:
+            if "es_atm_iv" not in str(e) or "es_atm_iv" not in data:
+                raise
+            _colonna_iv_manca_dal = time.time()
+            print("Colonna es_atm_iv assente su Supabase: la IV ATM resta solo nel file locale "
+                  "finche' non si esegue sql/005_market_data_es_atm_iv.sql.", file=sys.stderr)
+            data.pop("es_atm_iv", None)
+            supabase.table("market_data").insert(data, returning="minimal").execute()
     except Exception as e:
         print(f"Error pushing to Supabase: {e}", file=sys.stderr)
 
@@ -562,6 +600,9 @@ def main():
                     "esPutBid": _quote(es_put_ticker, 'bid'),
                     "esPutAsk": _quote(es_put_ticker, 'ask'),
                     "esAtmStrike": es_atm_strike,
+                    # IV ATM della chain ES 0DTE: la stessa call e put del
+                    # Range Calc, quindi c'e' anche di notte, quando SPX no.
+                    "esAtmIv": _iv_atm(es_call_ticker, es_put_ticker),
                     "spxAtmStrike": spx_atm_strike,
                     "spxRef": spx_ref,
                     "vwap": esf_vwap,

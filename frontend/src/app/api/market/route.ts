@@ -8,6 +8,15 @@ const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder
 const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'placeholder';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+/**
+ * Quando si e' scoperto che market_data non ha la colonna es_atm_iv (vedi
+ * sql/005). Vale dieci minuti, poi si riprova: dopo la migrazione la colonna
+ * torna da sola, senza riavviare il server.
+ */
+let colonnaIvMancaDal: number | null = null;
+const RIPROVA_COLONNA_IV_MS = 10 * 60 * 1000;
+const colonnaIvManca = () => colonnaIvMancaDal !== null && Date.now() - colonnaIvMancaDal < RIPROVA_COLONNA_IV_MS;
+
 export const dynamic = 'force-dynamic';
 
 // La colonna `spx` fa parte dello schema di market_data: la migrazione a
@@ -137,7 +146,18 @@ export async function GET(request: Request) {
 
         // Le colonne delle quote sono snake_case su Postgres ma la pagina le
         // legge in camelCase, come le scrive il poller nel file locale.
-        const QUOTE_COLUMNS = 'call_bid, call_ask, put_bid, put_ask, es_call_bid, es_call_ask, es_put_bid, es_put_ask, es_atm_strike, spx_atm_strike, spx_ref';
+        const QUOTE_COLUMNS = 'call_bid, call_ask, put_bid, put_ask, es_call_bid, es_call_ask, es_put_bid, es_put_ask, es_atm_strike, spx_atm_strike, spx_ref, es_atm_iv';
+
+        // Finche' sql/005_market_data_es_atm_iv.sql non e' stato eseguito la
+        // colonna non c'e', e PostgREST rifiuta l'intera select: senza questo
+        // lo storico cadeva tutto sul file locale, e su Vercel restava vuoto.
+        const colonne = (c: string) => (colonnaIvManca() ? c.replace(/,\s*es_atm_iv/, '') : c);
+        const segnaSeMancaIv = (message: string | undefined) => {
+            if (colonnaIvManca() || !message?.includes('es_atm_iv')) return false;
+            colonnaIvMancaDal = Date.now();
+            console.warn('market_data.es_atm_iv assente: eseguire sql/005_market_data_es_atm_iv.sql');
+            return true;
+        };
 
         const withCamelQuotes = (row: any) => ({
             ...row,
@@ -152,6 +172,7 @@ export async function GET(request: Request) {
             esAtmStrike: row.esAtmStrike ?? row.es_atm_strike ?? null,
             spxAtmStrike: row.spxAtmStrike ?? row.spx_atm_strike ?? null,
             spxRef: row.spxRef ?? row.spx_ref ?? null,
+            esAtmIv: row.esAtmIv ?? row.es_atm_iv ?? null,
             vwap: typeof row.vwap === 'number' ? row.vwap : null,
         });
 
@@ -169,10 +190,14 @@ export async function GET(request: Request) {
             for (let from = 0; from < MAX; from += PAGE) {
                 const { data, error } = await supabase
                     .from('market_data')
-                    .select(columns)
+                    .select(colonne(columns))
                     .eq('date', dateStr)
                     .order('created_at', { ascending: true })
                     .range(from, from + PAGE - 1);
+                if (error && segnaSeMancaIv(error.message)) {
+                    from -= PAGE; // stessa pagina, senza la colonna
+                    continue;
+                }
                 if (error) {
                     console.error('Supabase page fetch failed:', error.message);
                     break;
@@ -235,12 +260,16 @@ export async function GET(request: Request) {
 
             if (isSupabaseConfigured) {
                 try {
-                    const { data, error } = await supabase
+                    const ultima = () => supabase
                         .from('market_data')
-                        .select(`time, vix, esf, spx, created_at, vwap, ${QUOTE_COLUMNS}`)
+                        .select(colonne(`time, vix, esf, spx, created_at, vwap, ${QUOTE_COLUMNS}`))
                         .eq('date', today)
                         .order('created_at', { ascending: false })
                         .limit(1);
+                    // La select e' costruita a runtime: il tipo delle righe non si ricava.
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    let { data, error }: { data: any[] | null; error: { message: string } | null } = await ultima();
+                    if (error && segnaSeMancaIv(error.message)) ({ data, error } = await ultima());
 
                     if (!error && data && data.length > 0) {
                         vixPrice = data[0].vix;
@@ -290,6 +319,7 @@ export async function GET(request: Request) {
                 esAtmStrike: quotes.esAtmStrike ?? null,
                 spxAtmStrike: quotes.spxAtmStrike ?? null,
                 spxRef: quotes.spxRef ?? null,
+                esAtmIv: quotes.esAtmIv ?? null,
             }, { status: 200 });
         }
     } catch (error: any) {
