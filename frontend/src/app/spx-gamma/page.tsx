@@ -100,7 +100,10 @@ function zeroGamma(rows: ProfileRow[], chiave: 'gex' | 'gexOi'): number | null {
     let precCum = 0;
     for (const r of rows) {
         const nuovo = cum + r[chiave];
-        if (precStrike !== null && ((precCum <= 0 && nuovo > 0) || (precCum >= 0 && nuovo < 0))) {
+        // `precCum !== 0`: finche' la somma e' zero non ha ancora un segno, e
+        // uno strike in fondo alla catena che vale esattamente zero seguito dal
+        // primo valore non nullo passava per un'inversione.
+        if (precStrike !== null && precCum !== 0 && ((precCum < 0 && nuovo >= 0) || (precCum > 0 && nuovo <= 0))) {
             const salto = nuovo - precCum;
             if (salto === 0) return r.strike;
             const frazione = -precCum / salto;
@@ -226,7 +229,10 @@ export default function SpxGammaPage() {
 
     const pallini = useMemo(() => {
         const adesso = Date.now();
-        const punti: number[][] = [];
+        // Piu' vecchio, piu' spento: senza, i tre pallini erano identici e non
+        // si capiva quale fosse quello di un minuto fa.
+        const opacita: Record<number, number> = { 1: 1, 5: 0.6, 10: 0.3 };
+        const punti: { value: number[]; itemStyle: { opacity: number } }[] = [];
         for (const minuti of MINUTI_STORICO) {
             const limite = adesso - minuti * 60000;
             let scelto: VoceStorico | null = null;
@@ -238,7 +244,7 @@ export default function SpxGammaPage() {
                 if (!strikeSeguiti.has(r.strike)) continue;
                 const valore = base === 'vol' ? r.gex : r.gexOi;
                 if (valore === 0) continue;
-                punti.push([inMiliardi(Math.abs(valore)), r.strike]);
+                punti.push({ value: [inMiliardi(Math.abs(valore)), r.strike], itemStyle: { opacity: opacita[minuti] ?? 1 } });
             }
         }
         return punti;
@@ -318,47 +324,59 @@ export default function SpxGammaPage() {
             });
         }
 
+        /**
+         * Barre orizzontali, disegnate a mano.
+         *
+         * Erano `type: 'bar'`, ma ECharts decide il verso di una barra
+         * dall'asse di categoria, e qui entrambi gli assi sono numerici: senza
+         * categoria la barra cresce sempre dal basso lungo x. Ogni coppia
+         * [gex, strike] diventava cosi' una riga verticale piantata alla x del
+         * gamma e alta fino allo strike -- una foresta di stecchi sparsi
+         * sull'asse del tempo, senza nessun rapporto con il profilo.
+         *
+         * `scostamento` separa OI e volume quando si vedono entrambe.
+         */
+        const barraOrizzontale = (nome: string, dati: number[][], colore: string, opacita: number, scostamento: number) => ({
+            name: nome,
+            type: 'custom',
+            xAxisIndex: 0,
+            yAxisIndex: 0,
+            data: dati,
+            encode: { x: 0, y: 1 },
+            itemStyle: { color: colore, opacity: opacita },
+            renderItem: (
+                _params: unknown,
+                api: {
+                    value: (i: number) => number;
+                    coord: (v: number[]) => number[];
+                    size: (v: number[]) => number[];
+                    style: () => Record<string, unknown>;
+                },
+            ) => {
+                const [x0, y] = api.coord([0, api.value(1)]);
+                const [x1] = api.coord([api.value(0), api.value(1)]);
+                // Due terzi della distanza fra due strike (passo 5), mai sotto i 2px.
+                const passo = Math.abs(api.size([0, 5])[1]);
+                const spessore = Math.max(2, passo * (base === 'entrambe' ? 0.33 : 0.66));
+                return {
+                    type: 'rect',
+                    shape: { x: x0, y: y - spessore / 2 + scostamento * spessore * 0.5, width: Math.max(0, x1 - x0), height: spessore },
+                    style: api.style(),
+                };
+            },
+        });
+
         const serieBarre = [
             ...(base !== 'vol'
                 ? [
-                    {
-                        name: 'Pos GEX (OI)',
-                        type: 'bar',
-                        xAxisIndex: 0,
-                        data: barre.posOi,
-                        itemStyle: { color: '#4ade80', opacity: 0.8 },
-                        barWidth: 3,
-                    },
-                    {
-                        name: 'Neg GEX (OI)',
-                        type: 'bar',
-                        xAxisIndex: 0,
-                        data: barre.negOi,
-                        itemStyle: { color: '#f87171', opacity: 0.8 },
-                        barWidth: 3,
-                    },
+                    barraOrizzontale('Pos GEX (OI)', barre.posOi, '#4ade80', 0.8, base === 'entrambe' ? -1 : 0),
+                    barraOrizzontale('Neg GEX (OI)', barre.negOi, '#f87171', 0.8, base === 'entrambe' ? -1 : 0),
                 ]
                 : []),
             ...(base !== 'oi'
                 ? [
-                    {
-                        name: 'Pos GEX (Volume)',
-                        type: 'bar',
-                        xAxisIndex: 0,
-                        data: barre.posVol,
-                        itemStyle: { color: '#86efac', opacity: 0.9 },
-                        barWidth: base === 'entrambe' ? 1.5 : 3,
-                        barGap: '-75%',
-                    },
-                    {
-                        name: 'Neg GEX (Volume)',
-                        type: 'bar',
-                        xAxisIndex: 0,
-                        data: barre.negVol,
-                        itemStyle: { color: '#fca5a5', opacity: 0.9 },
-                        barWidth: base === 'entrambe' ? 1.5 : 3,
-                        barGap: '-75%',
-                    },
+                    barraOrizzontale('Pos GEX (Volume)', barre.posVol, '#86efac', 0.9, base === 'entrambe' ? 1 : 0),
+                    barraOrizzontale('Neg GEX (Volume)', barre.negVol, '#fca5a5', 0.9, base === 'entrambe' ? 1 : 0),
                 ]
                 : []),
         ];

@@ -115,6 +115,19 @@ const SPOT_STEP_SEC = 30;
  */
 const SERIE_STEP_SEC = 120;
 
+/**
+ * Dopo quanto uno strike che non arriva piu' esce dal profilo.
+ *
+ * Il poller segue 37 strike attorno all'ATM, scelti a ogni avvio di sessione:
+ * un riavvio a meta' giornata con il prezzo altrove ne abbandona alcuni e ne
+ * prende altri. Quelli abbandonati restavano nel profilo per sempre, con il
+ * gamma e il volume dell'ultima volta che erano stati visti -- il 17/09/2026
+ * alle 18:24 il profilo aveva 51 strike su 37 seguiti. Con `since` invece
+ * sparivano, quindi la stessa pagina ne mostrava 51 al primo caricamento e 37
+ * dal giro dopo.
+ */
+const STRIKE_SCADUTO_SEC = 300;
+
 function toSeconds(hhmmss: string): number {
     const [h, m, s] = hhmmss.split(':').map(Number);
     return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
@@ -202,6 +215,11 @@ function elaboraSnapshot(
     const points: GexPoint[] = [];
     const precedenti = new Map<number, Netti>(base ?? []);
     const profilo = new Map<number, ProfileRow>();
+    /** Secondo dell'ultimo snapshot che ha portato il gamma di ogni strike. */
+    const vistoIl = new Map<number, number>();
+    /** Il profilo senza gli strike che non arrivano da piu' di STRIKE_SCADUTO_SEC. */
+    const freschi = (adessoSec: number) =>
+        [...profilo.values()].filter((r) => adessoSec - (vistoIl.get(r.strike) ?? -Infinity) <= STRIKE_SCADUTO_SEC);
     const spotSerie: SpotPoint[] = [];
     let ultimoSpotSec = -Infinity;
     let ultimoValido: SpotPoint | null = null;
@@ -251,6 +269,7 @@ function elaboraSnapshot(
                 gex: strikeGex(row.gamma, vol, spot),
                 gexOi: strikeGex(row.gamma, oi, spot),
             });
+            vistoIl.set(row.strike, snapSec);
 
             const prec = precedenti.get(row.strike);
             precedenti.set(row.strike, { vol, oi });
@@ -271,10 +290,10 @@ function elaboraSnapshot(
         }
 
         if (conStorico && snapSec >= inizioCoda) {
-            coda.push({ sec: snapSec, time: orario, rows: [...profilo.values()] });
+            coda.push({ sec: snapSec, time: orario, rows: freschi(snapSec) });
         }
         if (conStorico && snapSec - ultimaSerieSec >= SERIE_STEP_SEC) {
-            fotografie.push({ time: orario, mappa: new Map(profilo) });
+            fotografie.push({ time: orario, mappa: new Map(freschi(snapSec).map((r) => [r.strike, r])) });
             ultimaSerieSec = snapSec;
         }
         ultimoValido = { time: orario, price: spot };
@@ -304,13 +323,15 @@ function elaboraSnapshot(
         }
     }
 
-    const profiloFinale = [...profilo.values()].sort((a, b) => a.strike - b.strike);
-    const strikes = profiloFinale.map((r) => r.strike);
+    const profiloFinale = freschi(ultimoSec).sort((a, b) => a.strike - b.strike);
+    // Gli strike della serie sono invece tutti quelli visti in giornata: la
+    // storia di uno abbandonato resta vera fino a quando e' stato seguito.
+    const strikes = [...profilo.keys()].sort((a, b) => a - b);
 
     // L'ultima fotografia deve essere lo stato di adesso, non quella di due
     // minuti fa: e' il bordo destro del grafico.
     if (conStorico && ultimoValido && fotografie[fotografie.length - 1]?.time !== ultimoValido.time) {
-        fotografie.push({ time: ultimoValido.time, mappa: new Map(profilo) });
+        fotografie.push({ time: ultimoValido.time, mappa: new Map(profiloFinale.map((r) => [r.strike, r])) });
     }
 
     // Gli strike si fissano solo qui: uno comparso a meta' sessione manca
