@@ -19,6 +19,7 @@ import annotationPlugin from 'chartjs-plugin-annotation';
 import 'chartjs-adapter-date-fns';
 import { Line } from 'react-chartjs-2';
 import { leggiRefLines, salvaRefLines, leggiVisibilita, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import AiSignalPanel from '@/components/AiSignalPanel';
 
 ChartJS.register(
     CategoryScale,
@@ -294,6 +295,7 @@ export default function MarketPage() {
      * prezzo di oggi.
      */
     const [mostraSpx, setMostraSpx] = useState(true);
+    const [mostraAi, setMostraAi] = useState(false);
     /**
      * Gli stessi livelli R1/R2/R3 dell'Opening Bell, ma in termini SPX: il
      * calcolo parte dallo SPX e ci somma il basis per portarli su ES, qui il
@@ -1896,6 +1898,17 @@ export default function MarketPage() {
                             <button onClick={() => router.push('/market-tide')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET TIDE</button>
                         </div>
                         
+                        {/* Bias su ES da Claude, a titolo di studio */}
+                        <button
+                            onClick={() => setMostraAi((v) => !v)}
+                            title="Segnale AI su ES (studio)"
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraAi
+                                ? 'bg-purple-600/30 text-purple-300 border-purple-500/50 hover:bg-purple-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraAi ? '◉' : '◌'} AI Signal
+                        </button>
+
                         {/* Le due linee del cono */}
                         <button
                             onClick={() => setMostraStraddle((v) => !v)}
@@ -2262,6 +2275,7 @@ export default function MarketPage() {
                         <GexPage />
                       </div>
                     )}
+                {mostraAi && <AiSignalPanel onClose={() => setMostraAi(false)} />}
                 {/* Footer */}
                 <div className="mt-4 text-center text-slate-600 text-xs">
                     Data refreshed every 5 seconds • Active window: 00:00–23:00 CET • Source: IBKR TWS
