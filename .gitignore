@@ -7,7 +7,9 @@ node_modules/
 .tmp/
 dist/
 build/
-data/
+# Solo le cartelle dei dati dei poller: `data/` senza la barra iniziale
+# prendeva anche frontend/src/data (codice), e su Vercel il build falliva.
+/data/
 frontend/data/
 tmp/
 *.json
