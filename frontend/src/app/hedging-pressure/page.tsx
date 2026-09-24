@@ -522,6 +522,13 @@ export default function HedgingPressurePage() {
                             Profilo GEX
                         </button>
                         <button
+                            onClick={() => router.push('/bookmap')}
+                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
+                            title="CVD, liquidita' e ordini limit di ES da Bookmap (solo locale)"
+                        >
+                            Bookmap
+                        </button>
+                        <button
                             onClick={() => router.push('/market')}
                             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
                         >
