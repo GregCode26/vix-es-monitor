@@ -1,0 +1,84 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  flex: 1;
+  background: #0a0e27;
+  border: none;
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.header {
+  padding: 8px 12px;
+  background: #0a0e27;
+  border-bottom: 1px solid #1a1f35;
+  font-family: "Courier New", monospace;
+  font-size: 12px;
+  font-weight: bold;
+  color: #00ffff;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chartContainer {
+  flex: 1;
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.chartContainer canvas {
+  max-width: 100%;
+  max-height: 100%;
+  image-rendering: crisp-edges;
+  display: block;
+}
+
+.debugPanel {
+  padding: 8px 12px;
+  background: #0f1233;
+  border-top: 1px solid #1a1f35;
+  font-family: "Courier New", monospace;
+  font-size: 10px;
+  color: #888888;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.debugTitle {
+  color: #00ffff;
+  font-weight: bold;
+  margin-bottom: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.debugGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  line-height: 1.4;
+}
+
+.debugRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px;
+}
+
+.debugRow span:first-child {
+  color: #666666;
+  flex: 1;
+}
+
+.value {
+  color: #00ffff;
+  font-weight: bold;
+  text-align: right;
+  min-width: 60px;
+}

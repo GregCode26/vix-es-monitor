@@ -1,0 +1,155 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 4, 14, 0.82);
+  backdrop-filter: blur(2px);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.finestra {
+  box-sizing: border-box;
+  width: min(880px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  background: #0a0e27;
+  border: 1px solid #2a3150;
+  border-radius: 4px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+  font-family: "Courier New", monospace;
+  color: #b0b8cc;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.intestazione {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  background: #0a0e27;
+  border-bottom: 1px solid #1a1f35;
+}
+
+.titolo {
+  color: #00ffff;
+  font-weight: bold;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chiudi {
+  background: transparent;
+  border: 1px solid #2a3150;
+  border-radius: 2px;
+  color: #b0b8cc;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: bold;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.chiudi:hover {
+  border-color: #00ffff;
+  color: #00ffff;
+}
+
+.corpo {
+  padding: 4px 20px 24px;
+}
+
+.sezione {
+  margin-top: 22px;
+}
+
+.sezione h3 {
+  margin: 0 0 8px;
+  color: #00ffff;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid #1a1f35;
+  padding-bottom: 5px;
+}
+
+.sezione p {
+  margin: 8px 0;
+}
+
+.sezione ul {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.sezione li {
+  margin: 5px 0;
+}
+
+.formula {
+  display: block;
+  background: #0f1233;
+  border-left: 2px solid #2a3150;
+  padding: 10px 12px;
+  margin: 10px 0;
+  white-space: pre-wrap;
+  color: #d8dee9;
+  font-size: 11px;
+}
+
+.chiave {
+  color: #00ffff;
+  font-weight: bold;
+}
+
+.su {
+  color: #00ff00;
+  font-weight: bold;
+}
+
+.giu {
+  color: #ff3333;
+  font-weight: bold;
+}
+
+.neutro {
+  color: #ffaa00;
+  font-weight: bold;
+}
+
+.nota {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: #140f1f;
+  border-left: 2px solid #6b4d2a;
+  color: #a08a6a;
+  font-size: 11px;
+}
+
+.tabella {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 11px;
+}
+
+.tabella th,
+.tabella td {
+  border: 1px solid #1a1f35;
+  padding: 5px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.tabella th {
+  color: #888888;
+  text-transform: uppercase;
+  font-size: 10px;
+}

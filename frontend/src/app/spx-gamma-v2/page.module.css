@@ -1,0 +1,63 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  background: #0a0e27;
+  color: #b0b8cc;
+  font-family: "Courier New", monospace;
+  overflow: hidden;
+}
+
+.mainLayout {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  gap: 2px;
+  padding: 4px;
+}
+
+.leftColumn {
+  flex: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 300px;
+  overflow: hidden;
+}
+
+.priceChartContainer {
+  flex: 2;
+  min-height: 200px;
+  border: 1px solid #1a1f35;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.rightColumn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 200px;
+  overflow: hidden;
+  padding: 2px;
+}
+
+.gexChartContainer {
+  flex: 1;
+  min-height: 120px;
+  border: 1px solid #1a1f35;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 14px;
+  color: #888888;
+}

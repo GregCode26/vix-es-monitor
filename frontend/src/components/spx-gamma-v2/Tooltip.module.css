@@ -1,0 +1,51 @@
+.tooltip {
+  position: fixed;
+  background: rgba(10, 14, 39, 0.95);
+  border: 1px solid #3a3f55;
+  border-radius: 4px;
+  padding: 12px;
+  font-family: "Courier New", monospace;
+  font-size: 11px;
+  color: #b0b8cc;
+  max-width: 300px;
+  z-index: 1000;
+  backdrop-filter: blur(2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.section {
+  margin: 6px 0;
+}
+
+.time {
+  color: #00ffff;
+  font-weight: bold;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+}
+
+.label {
+  color: #888888;
+  font-weight: bold;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.value {
+  color: #00ffff;
+  font-weight: bold;
+  text-align: right;
+}
+
+.divider {
+  height: 1px;
+  background: #1a1f35;
+  margin: 6px 0;
+}

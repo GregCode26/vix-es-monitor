@@ -1,0 +1,19 @@
+.volflowChartPanel {
+  box-sizing: border-box;
+  width: 100%;
+  flex: 1;
+  min-height: 150px;
+  background: #0a0e27;
+  border: 1px solid #1a1f35;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
+
+/* Senza questo il canvas puo' spingere il contenitore oltre la propria altezza. */
+.volflowChartPanel canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+}
