@@ -7,7 +7,8 @@ scegliendo questo file) e poi si attiva sul grafico di ES.
 
 Ogni secondo manda un campione a POST /api/bookmap del dashboard locale:
 
-    {"date", "t", "alias", "price", "bid", "ask", "buy", "sell", "bidLiq", "askLiq", "levels", "book"}
+    {"date", "t", "alias", "price", "bid", "ask", "buy", "sell", "bidLiq", "askLiq", "levels", "book",
+     "addB", "remB", "addA", "remA"}
 
 `buy`/`sell` sono i contratti aggrediti in quel secondo, non il cumulato: il
 CVD lo somma la route sull'intera giornata, cosi' riavviare l'add-on o
@@ -17,6 +18,12 @@ Bookmap a meta' sessione non lo riporta a zero.
 "a": [...]}), entro LIVELLI_BOOK tick dal migliore e solo da MIN_CONTRATTI_BOOK in
 su: la pagina li disegna come le linee orizzontali della heatmap di Bookmap.
 Il filtro serve al peso: tutti i livelli sarebbero ~1 KB al secondo in piu'.
+
+`addB`/`remB` (e `addA`/`remA` per gli ask) sono i contratti limit aggiunti e
+tolti in quel secondo entro LIVELLI_FLUSSO livelli dal migliore, contati a ogni
+aggiornamento del book: se la size di un livello sale e' aggiunta, se scende e'
+tolta. Tolta comprende anche l'eseguito (un ordine riempito sparisce dal book
+come uno cancellato): la pagina, se si vuole, gli sottrae `buy`/`sell`.
 
 I callback di Bookmap (trade e depth arrivano a migliaia al secondo su ES)
 non devono mai aspettare la rete: qui si mette il campione in una coda e lo
@@ -40,11 +47,16 @@ LIVELLI_DEFAULT = 10
 MAX_IN_CODA = 3600
 LIVELLI_BOOK = 30
 MIN_CONTRATTI_BOOK = 20
+LIVELLI_FLUSSO = 5
+# Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
+# contratti aggiunti in un colpo. Per questi secondi non si conta.
+AVVIO_SENZA_FLUSSO_SEC = 3
 
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
 livelli = {}        # alias -> quanti livelli per lato sommare nella liquidita'
-flusso = {}         # alias -> {"buy", "sell"} del secondo in corso
+flusso = {}         # alias -> {"buy", "sell", "addB", "remB", "addA", "remA"} del secondo in corso
+conta_da = {}       # alias -> da quando (epoch) contare aggiunte e rimozioni
 ultimo_secondo = {}  # alias -> secondo (epoch) dell'ultimo campione emesso
 
 coda = queue.Queue()
@@ -61,7 +73,8 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     libri[alias] = bm.create_order_book()
     strumenti[alias] = {"pips": pips, "granularita": size_granularity}
     livelli[alias] = LIVELLI_DEFAULT
-    flusso[alias] = {"buy": 0.0, "sell": 0.0}
+    flusso[alias] = azzerato()
+    conta_da[alias] = time.time() + AVVIO_SENZA_FLUSSO_SEC
     ultimo_secondo[alias] = int(time.time())
 
     req_id += 1
@@ -73,15 +86,38 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
 
 
 def handle_unsubscribe_instrument(addon, alias):
-    for d in (libri, strumenti, livelli, flusso, ultimo_secondo):
+    for d in (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo):
         d.pop(alias, None)
     print(f"Staccato {alias}", flush=True)
 
 
+def azzerato():
+    return {"buy": 0.0, "sell": 0.0, "addB": 0.0, "remB": 0.0, "addA": 0.0, "remA": 0.0}
+
+
 def handle_depth_info(addon, alias, is_bid, price, size):
     libro = libri.get(alias)
-    if libro is not None:
-        bm.on_depth(libro, is_bid, price, size)
+    if libro is None:
+        return
+    lato = libro["bids"] if is_bid else libro["asks"]
+    prima = lato.get(price, 0)
+    # Il migliore di prima dell'aggiornamento: un ordine che migliora il prezzo
+    # (distanza negativa) e' comunque tra i primi livelli e si conta.
+    migliori = bm.get_bbo(libro)
+    bm.on_depth(libro, is_bid, price, size)
+
+    migliore = migliori[0 if is_bid else 1] if migliori else None
+    if migliore is None or size == prima or time.time() < conta_da[alias]:
+        return
+    distanza = migliore[0] - price if is_bid else price - migliore[0]
+    if distanza >= LIVELLI_FLUSSO:
+        return
+    variazione = (size - prima) / strumenti[alias]["granularita"]
+    f = flusso[alias]
+    if variazione > 0:
+        f["addB" if is_bid else "addA"] += variazione
+    else:
+        f["remB" if is_bid else "remA"] -= variazione
 
 
 def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start, is_execution_end,
@@ -148,9 +184,12 @@ def on_interval(addon, alias):
             "b": livelli_book(libro["bids"], migliori_bid[0] if migliori_bid else None, -1, info),
             "a": livelli_book(libro["asks"], migliori_ask[0] if migliori_ask else None, 1, info),
         },
+        "addB": round(f["addB"]),
+        "remB": round(f["remB"]),
+        "addA": round(f["addA"]),
+        "remA": round(f["remA"]),
     }
-    f["buy"] = 0.0
-    f["sell"] = 0.0
+    flusso[alias] = azzerato()
 
     if coda.qsize() < MAX_IN_CODA:
         coda.put(campione)

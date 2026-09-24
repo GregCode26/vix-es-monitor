@@ -36,6 +36,10 @@ interface Campione {
     askLiq: number;
     levels: number;
     book?: Book;
+    addB?: number;
+    remB?: number;
+    addA?: number;
+    remA?: number;
 }
 
 /** Ordini limit per livello: [prezzo, contratti], solo i livelli sopra la soglia dell'add-on. */
@@ -49,6 +53,8 @@ export interface BookmapPoint {
     price: number | null;
     bid: number | null;
     ask: number | null;
+    buy: number;
+    sell: number;
     delta: number;
     cvd: number;
     bidLiq: number;
@@ -56,6 +62,15 @@ export interface BookmapPoint {
     levels: number;
     alias: string;
     book: Book | null;
+    /**
+     * Contratti limit aggiunti/tolti in quel secondo nei primi 5 livelli di
+     * ciascun lato (tolti = cancellati + eseguiti). Null nei campioni di prima
+     * che l'add-on li contasse.
+     */
+    addB: number | null;
+    remB: number | null;
+    addA: number | null;
+    remA: number | null;
 }
 
 interface Giornata {
@@ -102,6 +117,8 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         price: c.price ?? null,
         bid: c.bid ?? null,
         ask: c.ask ?? null,
+        buy: Number(c.buy) || 0,
+        sell: Number(c.sell) || 0,
         delta: Math.round(delta * 100) / 100,
         cvd: Math.round(g.cvd * 100) / 100,
         bidLiq: Number(c.bidLiq) || 0,
@@ -110,9 +127,17 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         alias: c.alias,
         // I campioni scritti prima che l'add-on mandasse il book non ce l'hanno.
         book: c.book && Array.isArray(c.book.b) && Array.isArray(c.book.a) ? c.book : null,
+        addB: numeroONull(c.addB),
+        remB: numeroONull(c.remB),
+        addA: numeroONull(c.addA),
+        remA: numeroONull(c.remA),
     };
     g.points.push(p);
     return p;
+}
+
+function numeroONull(v: unknown): number | null {
+    return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
 function giornata(date: string): Giornata {

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Chart as ChartJS, registerables, type Scale } from 'chart.js';
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
+import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
 
 ChartJS.register(...registerables);
 
@@ -12,12 +13,19 @@ interface BookmapPoint {
   price: number | null;
   bid: number | null;
   ask: number | null;
+  buy: number;
+  sell: number;
   delta: number;
   cvd: number;
   bidLiq: number;
   askLiq: number;
   levels: number;
   alias: string;
+  /** Contratti limit aggiunti/tolti nel secondo, primi 5 livelli per lato; null prima dell'add-on che li conta. */
+  addB: number | null;
+  remB: number | null;
+  addA: number | null;
+  remA: number | null;
   /** Ordini limit per livello, [prezzo, contratti]; null nei campioni di prima che l'add-on li mandasse. */
   book: { b: [number, number][]; a: [number, number][] } | null;
 }
@@ -47,12 +55,130 @@ const GIALLO = '#facc15';
 const VIOLA = '#a855f7';
 
 type Finestra = '15' | '60' | '180';
-/** Da quanti contratti in su un livello del book diventa una linea; '0' = linee spente. */
-type Soglia = '0' | '50' | '100' | '250' | '500';
+/**
+ * I dodici livelli R1/R2/R3 del Range Calc di /market, gia' in prezzi ES:
+ * stessi colori e stesso tratto del grafico principale (mattina tratteggiata,
+ * Opening Bell continua). Qui non si calcolano, si leggono.
+ */
+const RANGE_ES = (['', 'Ob'] as const).flatMap((suffisso) =>
+  ([
+    ['r1Down', '#ef4444', 'R1↓'],
+    ['r2Down', '#f97316', 'R2↓'],
+    ['r3Down', '#facc15', 'R3↓'],
+    ['r1Up', '#3b82f6', 'R1↑'],
+    ['r2Up', '#06b6d4', 'R2↑'],
+    ['r3Up', '#10b981', 'R3↑'],
+  ] as const).map(([chiave, colore, etichetta]) => ({
+    key: `${chiave}${suffisso}`,
+    colore,
+    etichetta: `${etichetta}${suffisso ? ' OB' : ''}`,
+    tratteggio: suffisso ? [] : [6, 3],
+  })),
+);
+
+/** Da quanti contratti in su un livello del book diventa una linea: il cursore va da SOGLIA_MIN a SOGLIA_MAX. */
+const SOGLIA_MIN = 50;
+const SOGLIA_MAX = 200;
 /** Tick di ES: lo spessore di una linea e' un livello di prezzo. */
 const TICK = 0.25;
 /** Due campioni del book piu' distanti di cosi' (secondi) spezzano la linea. */
 const BUCO_MAX_SEC = 3;
+
+/** Media mobile della liquidita': '1' = nessuna media, il dato secondo per secondo. */
+type MediaLiq = '1' | '10' | '30' | '60';
+
+/** Media sugli ultimi `finestraSec` secondi; i NaN non contano e restano buchi. */
+function mediaMobile(xs: number[], valori: number[], finestraSec: number): number[] {
+  if (finestraSec <= 1) return valori;
+  const out: number[] = [];
+  let j = 0;
+  let somma = 0;
+  let n = 0;
+  for (let i = 0; i < valori.length; i++) {
+    if (Number.isFinite(valori[i])) {
+      somma += valori[i];
+      n++;
+    }
+    while (xs[j] <= xs[i] - finestraSec) {
+      if (Number.isFinite(valori[j])) {
+        somma -= valori[j];
+        n--;
+      }
+      j++;
+    }
+    out.push(n > 0 && Number.isFinite(valori[i]) ? somma / n : NaN);
+  }
+  return out;
+}
+
+/** Su quanti secondi si sommano aggiunte e rimozioni: secondo per secondo e' solo rumore. */
+type FinestraFlusso = '10' | '30' | '60';
+/** Tolti = cancellati + eseguiti (quello che sparisce dal book), oppure solo i cancellati. */
+type Tolti = 'cancellati' | 'tutti';
+/**
+ * Come si guarda il flusso. Le quattro linee grezze sono della stessa
+ * grandezza e si sovrappongono: da sole non dicono chi prevale.
+ * - pressione: (bid aggiunti − tolti) − (ask aggiunti − tolti), un solo segnale
+ * - lato: il netto dei bid e quello degli ask, ognuno attorno allo zero
+ * - dettaglio: le quattro somme grezze
+ */
+type VistaFlusso = 'pressione' | 'lato' | 'dettaglio';
+
+/** Netto per lato e pressione, dalle somme mobili. */
+function nettiFlusso(fl: SerieFlusso) {
+  const bid = fl.addB.map((v, i) => v - fl.remB[i]);
+  const ask = fl.addA.map((v, i) => v - fl.remA[i]);
+  return { bid, ask, pressione: bid.map((v, i) => v - ask[i]) };
+}
+
+interface SerieFlusso {
+  addB: number[];
+  remB: number[];
+  addA: number[];
+  remA: number[];
+}
+
+/**
+ * Somme mobili sugli ultimi `finestraSec` secondi dei contratti limit aggiunti
+ * e tolti nei primi livelli. Con `soloCancellati` ai tolti si sottrae
+ * l'eseguito: un venditore aggressivo consuma i bid (`sell`), un compratore
+ * gli ask (`buy`). Si sottrae sulla finestra e non secondo per secondo, perche'
+ * trade e aggiornamento del book possono cadere in due secondi diversi.
+ */
+function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, soloCancellati: boolean): SerieFlusso {
+  const out: SerieFlusso = { addB: [], remB: [], addA: [], remA: [] };
+  const ok = (p: BookmapPoint) => p.addB != null && p.remB != null && p.addA != null && p.remA != null;
+  let j = 0;
+  let aB = 0, rB = 0, aA = 0, rA = 0, compra = 0, vende = 0, n = 0;
+  const somma = (p: BookmapPoint, segno: 1 | -1) => {
+    aB += segno * p.addB!;
+    rB += segno * p.remB!;
+    aA += segno * p.addA!;
+    rA += segno * p.remA!;
+    compra += segno * p.buy;
+    vende += segno * p.sell;
+    n += segno;
+  };
+  for (let i = 0; i < pts.length; i++) {
+    if (ok(pts[i])) somma(pts[i], 1);
+    while (xs[j] <= xs[i] - finestraSec) {
+      if (ok(pts[j])) somma(pts[j], -1);
+      j++;
+    }
+    if (!ok(pts[i]) || n === 0) {
+      out.addB.push(NaN);
+      out.remB.push(NaN);
+      out.addA.push(NaN);
+      out.remA.push(NaN);
+      continue;
+    }
+    out.addB.push(aB);
+    out.addA.push(aA);
+    out.remB.push(soloCancellati ? Math.max(0, rB - vende) : rB);
+    out.remA.push(soloCancellati ? Math.max(0, rA - compra) : rA);
+  }
+  return out;
+}
 
 /**
  * Le linee degli ordini limit: per ogni livello sopra soglia, i secondi
@@ -102,8 +228,9 @@ interface Blocco {
   x: boolean;
   sopra: boolean;
   sotto: boolean;
+  flusso: boolean;
 }
-const LIBERO: Blocco = { x: false, sopra: false, sotto: false };
+const LIBERO: Blocco = { x: false, sopra: false, sotto: false, flusso: false };
 
 function secondi(hhmmss: string) {
   const [h, m, s] = hhmmss.split(':').map(Number);
@@ -185,13 +312,23 @@ export default function BookmapPage() {
   const [pronti, setPronti] = useState(false);
   const [blocco, setBlocco] = useState<Blocco>(LIBERO);
   const [mostraCvd, setMostraCvd] = useState(true);
-  const [soglia, setSoglia] = useState<Soglia>('50');
+  const [soglia, setSoglia] = useState(SOGLIA_MIN);
+  const [mostraOrdini, setMostraOrdini] = useState(true);
+  const [mostraRange, setMostraRange] = useState(true);
+  const [quantiRange, setQuantiRange] = useState(0);
   const [spessore, setSpessore] = useState(1);
+  const [finestraFlusso, setFinestraFlusso] = useState<FinestraFlusso>('30');
+  const [mediaLiq, setMediaLiq] = useState<MediaLiq>('30');
+  const [mostraBidAsk, setMostraBidAsk] = useState(false);
+  const [tolti, setTolti] = useState<Tolti>('cancellati');
+  const [vistaFlusso, setVistaFlusso] = useState<VistaFlusso>('pressione');
 
   const prezzoRef = useRef<HTMLCanvasElement | null>(null);
   const liquiditaRef = useRef<HTMLCanvasElement | null>(null);
   const chartPrezzo = useRef<ChartJS | null>(null);
   const chartLiquidita = useRef<ChartJS | null>(null);
+  const flussoRef = useRef<HTMLCanvasElement | null>(null);
+  const chartFlusso = useRef<ChartJS | null>(null);
   const ultimoTempo = useRef<string | null>(null);
   const giorno = useRef<string | null>(null);
   // Letti dai callback del plugin di zoom, che nascono una volta sola con i grafici.
@@ -199,8 +336,17 @@ export default function BookmapPage() {
   const finestraRef = useRef<Finestra>('60');
   const bloccoRef = useRef<Blocco>(LIBERO);
   const mostraCvdRef = useRef(true);
-  const sogliaRef = useRef<Soglia>('50');
+  const sogliaRef = useRef(SOGLIA_MIN);
+  const mostraOrdiniRef = useRef(true);
+  const mostraRangeRef = useRef(true);
+  /** Livelli R1/R2/R3 da disegnare, gia' filtrati per la visibilita' scelta in /market. */
+  const rangeRef = useRef<{ valore: number; colore: string; etichetta: string; tratteggio: number[] }[]>([]);
   const spessoreRef = useRef(1);
+  const finestraFlussoRef = useRef<FinestraFlusso>('30');
+  const mediaLiqRef = useRef<MediaLiq>('30');
+  const mostraBidAskRef = useRef(false);
+  const toltiRef = useRef<Tolti>('cancellati');
+  const vistaFlussoRef = useRef<VistaFlusso>('pressione');
   const segmentiRef = useRef<Segmento[]>([]);
   /** Posizione del mirino: l'orario vale per tutti e due i grafici, l'altezza solo per quello sotto il mouse. */
   const mirinoRef = useRef<{ sec: number; y: number; sorgente: ChartJS } | null>(null);
@@ -262,23 +408,49 @@ export default function BookmapPage() {
   const applica = useCallback(() => {
     const cp = chartPrezzo.current;
     const cl = chartLiquidita.current;
-    if (!cp || !cl) return;
+    const cf = chartFlusso.current;
+    if (!cp || !cl || !cf) return;
     const pts = pointsRef.current;
     const b = bloccoRef.current;
 
     const xs = pts.map((p) => secondi(p.time));
     cp.data.datasets[0].data = pts.map((p, i) => ({ x: xs[i], y: p.price ?? NaN }));
     cp.data.datasets[1].data = pts.map((p, i) => ({ x: xs[i], y: p.cvd }));
-    cl.data.datasets[0].data = pts.map((p, i) => ({ x: xs[i], y: p.bidLiq }));
-    cl.data.datasets[1].data = pts.map((p, i) => ({ x: xs[i], y: p.askLiq }));
-    cl.data.datasets[2].data = pts.map((p, i) => ({ x: xs[i], y: sbilancio(p) ?? NaN }));
+    // Lo sbilancio si calcola sulle medie, non si fa la media dello sbilancio:
+    // cosi' pesa di piu' quando il book e' pieno.
+    const w = Number(mediaLiqRef.current);
+    const bidM = mediaMobile(xs, pts.map((p) => p.bidLiq), w);
+    const askM = mediaMobile(xs, pts.map((p) => p.askLiq), w);
+    const sbilM = bidM.map((bv, i) => (bv + askM[i] > 0 ? ((bv - askM[i]) / (bv + askM[i])) * 100 : NaN));
+    cl.data.datasets[0].data = xs.map((x, i) => ({ x, y: sbilM[i] }));
+    cl.data.datasets[1].data = xs.map((x, i) => ({ x, y: bidM[i] }));
+    cl.data.datasets[2].data = xs.map((x, i) => ({ x, y: askM[i] }));
+    const bidAsk = mostraBidAskRef.current;
+    cl.data.datasets[1].hidden = !bidAsk;
+    cl.data.datasets[2].hidden = !bidAsk;
+    const asseLiq = cl.options.scales!.yLiq!;
+    asseLiq.ticks!.display = bidAsk;
+    const fl = flussoMobile(pts, xs, Number(finestraFlussoRef.current), toltiRef.current === 'cancellati');
+    cf.data.datasets[0].data = xs.map((x, i) => ({ x, y: fl.addB[i] }));
+    cf.data.datasets[1].data = xs.map((x, i) => ({ x, y: fl.remB[i] }));
+    cf.data.datasets[2].data = xs.map((x, i) => ({ x, y: fl.addA[i] }));
+    cf.data.datasets[3].data = xs.map((x, i) => ({ x, y: fl.remA[i] }));
+    const netti = nettiFlusso(fl);
+    cf.data.datasets[4].data = xs.map((x, i) => ({ x, y: netti.pressione[i] }));
+    cf.data.datasets[5].data = xs.map((x, i) => ({ x, y: netti.bid[i] }));
+    cf.data.datasets[6].data = xs.map((x, i) => ({ x, y: netti.ask[i] }));
+    const vista = vistaFlussoRef.current;
+    [0, 1, 2, 3].forEach((k) => (cf.data.datasets[k].hidden = vista !== 'dettaglio'));
+    cf.data.datasets[4].hidden = vista !== 'pressione';
+    cf.data.datasets[5].hidden = vista !== 'lato';
+    cf.data.datasets[6].hidden = vista !== 'lato';
 
     let da: number;
     let a: number;
     if (!b.x && xs.length > 0) {
       a = xs[xs.length - 1] + MARGINE_DESTRO_SEC;
       da = a - Number(finestraRef.current) * 60;
-      for (const c of [cp, cl]) {
+      for (const c of [cp, cl, cf]) {
         const x = c.options.scales!.x!;
         x.min = da;
         x.max = a;
@@ -291,8 +463,7 @@ export default function BookmapPage() {
     const visibili = pts.filter((_, i) => xs[i] >= da && xs[i] <= a);
     // CVD spento: linea nascosta, asse destro vuoto ma largo uguale, cosi' i
     // due grafici restano allineati sul tempo.
-    const s = Number(sogliaRef.current);
-    segmentiRef.current = s > 0 ? segmentiBook(pts, xs, s) : [];
+    segmentiRef.current = mostraOrdiniRef.current ? segmentiBook(pts, xs, sogliaRef.current) : [];
 
     const cvdAcceso = mostraCvdRef.current;
     cp.data.datasets[1].hidden = !cvdAcceso;
@@ -302,7 +473,21 @@ export default function BookmapPage() {
 
     if (!b.sopra) {
       const sp = cp.options.scales!;
-      const rp = estremi(visibili.map((p) => p.price ?? NaN));
+      const prezzi = visibili.map((p) => p.price ?? NaN);
+      // Con i range accesi la scala arriva fino al livello piu' vicino sopra e
+      // sotto il prezzo: se si fermasse al prezzo non se ne vedrebbe quasi mai
+      // uno, se li prendesse tutti e dodici il prezzo diventerebbe una riga.
+      const finiti = prezzi.filter((v) => Number.isFinite(v));
+      if (mostraRangeRef.current && finiti.length > 0) {
+        const basso = Math.min(...finiti);
+        const alto = Math.max(...finiti);
+        const livelli = rangeRef.current.map((l) => l.valore);
+        const sopra = livelli.filter((v) => v > alto);
+        const sotto = livelli.filter((v) => v < basso);
+        if (sopra.length > 0) prezzi.push(Math.min(...sopra));
+        if (sotto.length > 0) prezzi.push(Math.max(...sotto));
+      }
+      const rp = estremi(prezzi);
       const rc = estremi(visibili.map((p) => p.cvd));
       sp.yPrezzo!.min = rp?.min;
       sp.yPrezzo!.max = rp?.max;
@@ -311,14 +496,46 @@ export default function BookmapPage() {
     }
     if (!b.sotto) {
       const sl = cl.options.scales!;
-      const rl = estremi(visibili.flatMap((p) => [p.bidLiq, p.askLiq]), 0.1);
-      sl.yLiq!.min = 0;
+      const valoriLiq: number[] = [];
+      let massimoSbil = 0;
+      xs.forEach((x, i) => {
+        if (x < da || x > a) return;
+        valoriLiq.push(bidM[i], askM[i]);
+        if (Number.isFinite(sbilM[i])) massimoSbil = Math.max(massimoSbil, Math.abs(sbilM[i]));
+      });
+      const rl = estremi(valoriLiq, 0.1);
+      sl.yLiq!.min = rl?.min;
       sl.yLiq!.max = rl?.max;
-      sl.ySbil!.min = -100;
-      sl.ySbil!.max = 100;
+      // Simmetrico attorno allo zero, stretto su quello che si vede: con -100/+100
+      // fissi uno sbilancio del 20% era una riga piatta.
+      const semi = Math.max(5, Math.ceil((massimoSbil * 1.15) / 5) * 5);
+      sl.ySbil!.min = -semi;
+      sl.ySbil!.max = semi;
+    }
+    if (!b.flusso) {
+      const vista = vistaFlussoRef.current;
+      const valori: number[] = [];
+      xs.forEach((x, i) => {
+        if (x < da || x > a) return;
+        if (vista === 'dettaglio') valori.push(fl.addB[i], fl.remB[i], fl.addA[i], fl.remA[i]);
+        else if (vista === 'lato') valori.push(netti.bid[i], netti.ask[i]);
+        else valori.push(netti.pressione[i]);
+      });
+      const asse = cf.options.scales!.yFlusso!;
+      if (vista === 'dettaglio') {
+        asse.min = 0;
+        asse.max = estremi(valori, 0.1)?.max;
+      } else {
+        // I netti vivono attorno allo zero: scala simmetrica, cosi' lo zero sta in mezzo.
+        const massimo = valori.reduce((m, v) => (Number.isFinite(v) ? Math.max(m, Math.abs(v)) : m), 0);
+        const semi = Math.max(10, Math.ceil(massimo * 1.15));
+        asse.min = -semi;
+        asse.max = semi;
+      }
     }
     cp.update('none');
     cl.update('none');
+    cf.update('none');
   }, []);
 
   const impostaBlocco = useCallback((b: Blocco) => {
@@ -329,7 +546,7 @@ export default function BookmapPage() {
   /** Torna a seguire i dati: via lo zoom, assi di nuovo calcolati dalla pagina. */
   const tornaLive = useCallback(() => {
     impostaBlocco(LIBERO);
-    for (const c of [chartPrezzo.current, chartLiquidita.current]) {
+    for (const c of [chartPrezzo.current, chartLiquidita.current, chartFlusso.current]) {
       (c as (ChartJS & { resetZoom?: (mode?: string) => void }) | null)?.resetZoom?.('none');
     }
     applica();
@@ -344,18 +561,22 @@ export default function BookmapPage() {
 
     (async () => {
       const zoomPlugin = (await import('chartjs-plugin-zoom')).default;
-      if (annullato || !prezzoRef.current || !liquiditaRef.current) return;
+      if (annullato || !prezzoRef.current || !liquiditaRef.current || !flussoRef.current) return;
       ChartJS.register(zoomPlugin);
 
-      const quale = (chart: ChartJS): 'sopra' | 'sotto' => (chart === chartPrezzo.current ? 'sopra' : 'sotto');
+      const quale = (chart: ChartJS): Exclude<keyof Blocco, 'x'> =>
+        chart === chartPrezzo.current ? 'sopra' : chart === chartLiquidita.current ? 'sotto' : 'flusso';
+      const altri = (chart: ChartJS) =>
+        [chartPrezzo.current, chartLiquidita.current, chartFlusso.current].filter((c): c is ChartJS => !!c && c !== chart);
 
-      /** Il tempo e' uno solo: quello che si fa su un grafico vale anche per l'altro. */
+      /** Il tempo e' uno solo: quello che si fa su un grafico vale anche per gli altri. */
       const allinea = (chart: ChartJS) => {
-        const altro = chart === chartPrezzo.current ? chartLiquidita.current : chartPrezzo.current;
         const x = chart.scales.x;
-        if (altro && x) {
-          altro.options.scales!.x!.min = x.min;
-          altro.options.scales!.x!.max = x.max;
+        if (x) {
+          for (const altro of altri(chart)) {
+            altro.options.scales!.x!.min = x.min;
+            altro.options.scales!.x!.max = x.max;
+          }
         }
         applica();
       };
@@ -402,8 +623,6 @@ export default function BookmapPage() {
       };
       const tooltip = { enabled: false };
 
-      const altroChart = (chart: ChartJS) => (chart === chartPrezzo.current ? chartLiquidita.current : chartPrezzo.current);
-
       /**
        * Mirino a croce al posto del riquadro dei valori, come in /market: linea
        * verticale su entrambi i grafici allo stesso orario, orizzontale solo
@@ -417,7 +636,7 @@ export default function BookmapPage() {
           const sx = chart.scales.x;
           const sy = chart.scales.yPrezzo;
           if (segmenti.length === 0 || !sx || !sy) return;
-          const s = Number(sogliaRef.current);
+          const s = sogliaRef.current;
           const { ctx, chartArea: a } = chart;
           // Un tick di altezza (almeno 1,5 px), per il moltiplicatore scelto nella pagina.
           const alto = Math.max(1.5, Math.abs(sy.getPixelForValue(0) - sy.getPixelForValue(TICK)) * 0.8) * spessoreRef.current;
@@ -440,6 +659,40 @@ export default function BookmapPage() {
         },
       };
 
+      /** I range ES del grafico principale: linee orizzontali con l'etichetta a destra. */
+      const range = {
+        id: 'range',
+        afterDatasetsDraw: (chart: ChartJS) => {
+          const livelli = rangeRef.current;
+          const sy = chart.scales.yPrezzo;
+          if (!mostraRangeRef.current || livelli.length === 0 || !sy) return;
+          const { ctx, chartArea: a } = chart;
+          ctx.save();
+          ctx.font = 'bold 10px Arial';
+          ctx.textBaseline = 'middle';
+          ctx.textAlign = 'right';
+          for (const l of livelli) {
+            const y = sy.getPixelForValue(l.valore);
+            if (y < a.top || y > a.bottom) continue;
+            ctx.beginPath();
+            ctx.setLineDash(l.tratteggio);
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = l.colore;
+            ctx.moveTo(a.left, y);
+            ctx.lineTo(a.right, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            const testo = `${l.etichetta} ${l.valore.toFixed(2)}`;
+            const w = ctx.measureText(testo).width + 8;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+            ctx.fillRect(a.right - w - 4, y - 8, w, 16);
+            ctx.fillStyle = l.colore;
+            ctx.fillText(testo, a.right - 8, y);
+          }
+          ctx.restore();
+        },
+      };
+
       const mirino = {
         id: 'mirino',
         afterEvent: (chart: ChartJS, args: { event: { type: string; x: number | null; y: number | null }; changed?: boolean }) => {
@@ -455,7 +708,7 @@ export default function BookmapPage() {
             return;
           }
           args.changed = true;
-          altroChart(chart)?.draw();
+          for (const altro of altri(chart)) altro.draw();
         },
         afterDraw: (chart: ChartJS) => {
           const m = mirinoRef.current;
@@ -490,13 +743,13 @@ export default function BookmapPage() {
           };
 
           // L'orario sotto l'asse X, che si vede solo nel grafico in basso.
-          if (chart === chartLiquidita.current) etichetta(orario(m.sec), px, a.bottom + 10);
+          if (chart === chartFlusso.current) etichetta(orario(m.sec), px, a.bottom + 10);
 
           if (m.sorgente === chart) {
             for (const scala of Object.values(chart.scales)) {
-              if (scala.axis !== 'y') continue;
+              if (scala.axis !== 'y' || scala.id === 'yVuoto') continue;
               const v = scala.getValueForPixel(m.y);
-              if (v == null || (scala.id === 'yCvd' && !mostraCvdRef.current)) continue;
+              if (v == null || (scala.id === 'yCvd' && !mostraCvdRef.current) || (scala.id === 'yLiq' && !mostraBidAskRef.current)) continue;
               const testo =
                 scala.id === 'yPrezzo' ? v.toFixed(2) : scala.id === 'ySbil' ? `${Math.round(v)}%` : compatto(v);
               etichetta(testo, (scala.left + scala.right) / 2, m.y, scala.right - scala.left);
@@ -508,7 +761,7 @@ export default function BookmapPage() {
 
       chartPrezzo.current = new ChartJS(prezzoRef.current, {
         type: 'line',
-        plugins: [ordini, mirino],
+        plugins: [ordini, range, mirino],
         data: {
           datasets: [
             { label: 'ES', data: [], yAxisID: 'yPrezzo', borderColor: GIALLO, borderWidth: 1.4, pointRadius: 0, tension: 0 },
@@ -538,9 +791,70 @@ export default function BookmapPage() {
         plugins: [mirino],
         data: {
           datasets: [
-            { label: 'Bid', data: [], yAxisID: 'yLiq', borderColor: VERDE, backgroundColor: 'rgba(52, 211, 153, 0.08)', fill: 'origin', borderWidth: 1.6, pointRadius: 0, tension: 0 },
-            { label: 'Ask', data: [], yAxisID: 'yLiq', borderColor: ROSSO, backgroundColor: 'rgba(244, 63, 94, 0.08)', fill: 'origin', borderWidth: 1.6, pointRadius: 0, tension: 0 },
-            { label: 'Sbilancio %', data: [], yAxisID: 'ySbil', borderColor: 'rgba(203, 213, 225, 0.55)', borderWidth: 1, borderDash: [4, 3], pointRadius: 0, tension: 0 },
+            // Il segnale: sopra lo zero verde (piu' bid), sotto rosso (piu' ask).
+            {
+              label: 'Sbilancio %',
+              data: [],
+              yAxisID: 'ySbil',
+              borderWidth: 1.8,
+              pointRadius: 0,
+              tension: 0.2,
+              fill: { target: 'origin', above: 'rgba(52, 211, 153, 0.28)', below: 'rgba(244, 63, 94, 0.28)' },
+              segment: { borderColor: (ctx) => ((ctx.p1.parsed.y ?? 0) >= 0 ? VERDE : ROSSO) },
+            },
+            // Di contorno, sbiadite e spente di partenza: sovrapposte erano illeggibili.
+            { label: 'Bid', data: [], yAxisID: 'yLiq', borderColor: 'rgba(52, 211, 153, 0.5)', borderWidth: 1, pointRadius: 0, tension: 0.2 },
+            { label: 'Ask', data: [], yAxisID: 'yLiq', borderColor: 'rgba(244, 63, 94, 0.5)', borderWidth: 1, pointRadius: 0, tension: 0.2 },
+          ],
+        },
+        options: {
+          animation: false,
+          maintainAspectRatio: false,
+          interaction: { mode: 'nearest', axis: 'x', intersect: false },
+          plugins: { legend: { display: false }, tooltip, zoom },
+          scales: {
+            x: { ...asseX, ticks: { ...asseX.ticks, display: false } },
+            ySbil: {
+              position: 'left',
+              afterFit: fissaLarghezza,
+              min: -100,
+              max: 100,
+              // La riga dello zero marcata: e' il confine tra bid e ask.
+              grid: { color: (ctx) => (ctx.tick.value === 0 ? 'rgba(255, 255, 255, 0.35)' : 'rgba(255, 255, 255, 0.05)') },
+              ticks: { color: '#94a3b8', callback: (v) => `${Math.round(Number(v))}%` },
+            },
+            yLiq: {
+              position: 'right',
+              afterFit: fissaLarghezza,
+              grid: { display: false },
+              ticks: { color: '#94a3b8', display: false, callback: (v) => compatto(Number(v)) },
+            },
+          },
+        },
+      });
+
+      chartFlusso.current = new ChartJS(flussoRef.current, {
+        type: 'line',
+        plugins: [mirino],
+        data: {
+          datasets: [
+            { label: 'Bid aggiunti', data: [], yAxisID: 'yFlusso', borderColor: VERDE, borderWidth: 1.6, pointRadius: 0, tension: 0 },
+            { label: 'Bid tolti', data: [], yAxisID: 'yFlusso', borderColor: VERDE, borderWidth: 1.4, borderDash: [5, 3], pointRadius: 0, tension: 0 },
+            { label: 'Ask aggiunti', data: [], yAxisID: 'yFlusso', borderColor: ROSSO, borderWidth: 1.6, pointRadius: 0, tension: 0 },
+            { label: 'Ask tolti', data: [], yAxisID: 'yFlusso', borderColor: ROSSO, borderWidth: 1.4, borderDash: [5, 3], pointRadius: 0, tension: 0 },
+            // Pressione: sopra lo zero verde (bid che si accumulano / ask ritirati), sotto rosso.
+            {
+              label: 'Pressione',
+              data: [],
+              yAxisID: 'yFlusso',
+              borderWidth: 1.8,
+              pointRadius: 0,
+              tension: 0.2,
+              fill: { target: 'origin', above: 'rgba(52, 211, 153, 0.28)', below: 'rgba(244, 63, 94, 0.28)' },
+              segment: { borderColor: (ctx) => ((ctx.p1.parsed.y ?? 0) >= 0 ? VERDE : ROSSO) },
+            },
+            { label: 'Bid netto', data: [], yAxisID: 'yFlusso', borderColor: VERDE, borderWidth: 1.8, pointRadius: 0, tension: 0.2 },
+            { label: 'Ask netto', data: [], yAxisID: 'yFlusso', borderColor: ROSSO, borderWidth: 1.8, pointRadius: 0, tension: 0.2 },
           ],
         },
         options: {
@@ -550,27 +864,22 @@ export default function BookmapPage() {
           plugins: { legend: { display: false }, tooltip, zoom },
           scales: {
             x: asseX,
-            yLiq: {
+            yFlusso: {
               position: 'left',
               afterFit: fissaLarghezza,
-              grid: { color: 'rgba(255, 255, 255, 0.05)' },
+              grid: { color: (ctx) => (ctx.tick.value === 0 ? 'rgba(255, 255, 255, 0.35)' : 'rgba(255, 255, 255, 0.05)') },
               ticks: { color: '#94a3b8', callback: (v) => compatto(Number(v)) },
             },
-            ySbil: {
-              position: 'right',
-              afterFit: fissaLarghezza,
-              min: -100,
-              max: 100,
-              grid: { display: false },
-              ticks: { color: '#94a3b8', callback: (v) => `${Math.round(Number(v))}%` },
-            },
+            // Vuoto: c'e' solo perche' l'area del grafico finisca dove finiscono le altre due.
+            yVuoto: { position: 'right', afterFit: fissaLarghezza, grid: { display: false }, ticks: { display: false } },
           },
         },
       });
 
-      // Doppio clic su uno dei due grafici = torna a seguire i dati.
+      // Doppio clic su uno dei grafici = torna a seguire i dati.
       prezzoRef.current.ondblclick = tornaLive;
       liquiditaRef.current.ondblclick = tornaLive;
+      flussoRef.current.ondblclick = tornaLive;
       setPronti(true);
     })();
 
@@ -578,8 +887,10 @@ export default function BookmapPage() {
       annullato = true;
       chartPrezzo.current?.destroy();
       chartLiquidita.current?.destroy();
+      chartFlusso.current?.destroy();
       chartPrezzo.current = null;
       chartLiquidita.current = null;
+      chartFlusso.current = null;
       setPronti(false);
     };
   }, [autorizzato, applica, impostaBlocco, tornaLive]);
@@ -625,9 +936,150 @@ export default function BookmapPage() {
     chartPrezzo.current?.draw();
   };
 
-  const cambiaSoglia = (v: Soglia) => {
+  useEffect(() => {
+    try {
+      const salvata = Number(localStorage.getItem('bookmap_soglia'));
+      if (salvata >= SOGLIA_MIN && salvata <= SOGLIA_MAX) {
+        sogliaRef.current = salvata;
+        setSoglia(salvata);
+      }
+      if (localStorage.getItem('bookmap_ordini') === 'off') {
+        mostraOrdiniRef.current = false;
+        setMostraOrdini(false);
+      }
+    } catch {
+      // niente preferenza salvata
+    }
+  }, []);
+
+  /** Solo le linee cambiano: si rifanno i segmenti e si ridisegna, senza ricalcolare il resto a ogni scatto del cursore. */
+  const rifaiOrdini = () => {
+    const pts = pointsRef.current;
+    segmentiRef.current = mostraOrdiniRef.current
+      ? segmentiBook(pts, pts.map((p) => secondi(p.time)), sogliaRef.current)
+      : [];
+    chartPrezzo.current?.draw();
+  };
+
+  // I livelli li scrive /market, anche dopo che questa pagina e' aperta: si
+  // rileggono quando cambiano in un'altra scheda e quando si torna qui (come /gex).
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('bookmap_range') === 'off') {
+        mostraRangeRef.current = false;
+        setMostraRange(false);
+      }
+    } catch {
+      // niente preferenza salvata
+    }
+    const rileggi = () => {
+      const valori = leggiRefLines() ?? {};
+      const vis = leggiVisibilita() ?? {};
+      rangeRef.current = RANGE_ES.flatMap((r) => {
+        const v = parseFloat(valori[r.key] ?? '');
+        return Number.isFinite(v) && vis[r.key] !== false
+          ? [{ valore: v, colore: r.colore, etichetta: r.etichetta, tratteggio: r.tratteggio }]
+          : [];
+      });
+      setQuantiRange(rangeRef.current.length);
+      applica();
+    };
+    rileggi();
+    const suStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === REF_LINES_KEY || e.key === REF_LINES_VIS_KEY) rileggi();
+    };
+    const suRitorno = () => {
+      if (!document.hidden) rileggi();
+    };
+    window.addEventListener('storage', suStorage);
+    document.addEventListener('visibilitychange', suRitorno);
+    window.addEventListener('focus', rileggi);
+    return () => {
+      window.removeEventListener('storage', suStorage);
+      document.removeEventListener('visibilitychange', suRitorno);
+      window.removeEventListener('focus', rileggi);
+    };
+  }, [applica]);
+
+  const cambiaRange = () => {
+    const acceso = !mostraRangeRef.current;
+    mostraRangeRef.current = acceso;
+    setMostraRange(acceso);
+    try {
+      localStorage.setItem('bookmap_range', acceso ? 'on' : 'off');
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
+    applica();
+  };
+
+  const cambiaSoglia = (v: number) => {
     sogliaRef.current = v;
     setSoglia(v);
+    try {
+      localStorage.setItem('bookmap_soglia', String(v));
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
+    rifaiOrdini();
+  };
+
+  const cambiaOrdini = () => {
+    const acceso = !mostraOrdiniRef.current;
+    mostraOrdiniRef.current = acceso;
+    setMostraOrdini(acceso);
+    try {
+      localStorage.setItem('bookmap_ordini', acceso ? 'on' : 'off');
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
+    rifaiOrdini();
+  };
+
+  const cambiaMediaLiq = (v: MediaLiq) => {
+    mediaLiqRef.current = v;
+    setMediaLiq(v);
+    applica();
+  };
+
+  const cambiaBidAsk = () => {
+    mostraBidAskRef.current = !mostraBidAskRef.current;
+    setMostraBidAsk(mostraBidAskRef.current);
+    applica();
+  };
+
+  const cambiaFinestraFlusso = (v: FinestraFlusso) => {
+    finestraFlussoRef.current = v;
+    setFinestraFlusso(v);
+    applica();
+  };
+
+  const cambiaVistaFlusso = (v: VistaFlusso) => {
+    vistaFlussoRef.current = v;
+    setVistaFlusso(v);
+    try {
+      localStorage.setItem('bookmap_vista_flusso', v);
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
+    applica();
+  };
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem('bookmap_vista_flusso');
+      if (v === 'pressione' || v === 'lato' || v === 'dettaglio') {
+        vistaFlussoRef.current = v;
+        setVistaFlusso(v);
+      }
+    } catch {
+      // niente preferenza salvata
+    }
+  }, []);
+
+  const cambiaTolti = (v: Tolti) => {
+    toltiRef.current = v;
+    setTolti(v);
     applica();
   };
 
@@ -655,7 +1107,20 @@ export default function BookmapPage() {
   const ritardo = corrente ? oraLocale - secondi(corrente.time) : null;
   const fermo = ritardo == null || ritardo > FERMO_DOPO_SEC;
   const sbil = corrente ? sbilancio(corrente) : null;
-  const bloccato = blocco.x || blocco.sopra || blocco.sotto;
+  const bloccato = blocco.x || blocco.sopra || blocco.sotto || blocco.flusso;
+  // I valori di adesso: basta la coda, la somma guarda al massimo un minuto indietro.
+  const coda = points.slice(-70);
+  const flussoOra = flussoMobile(coda, coda.map((p) => secondi(p.time)), Number(finestraFlusso), tolti === 'cancellati');
+  const ultimoFlusso = (k: keyof SerieFlusso) => {
+    const v = flussoOra[k][flussoOra[k].length - 1];
+    return v == null || Number.isNaN(v) ? null : v;
+  };
+  const conFlusso = corrente?.addB != null;
+  const nettiOra = nettiFlusso(flussoOra);
+  const ultimoNetto = (k: 'bid' | 'ask' | 'pressione') => {
+    const v = nettiOra[k][nettiOra[k].length - 1];
+    return v == null || Number.isNaN(v) ? null : v;
+  };
 
   if (!autorizzato) return null;
 
@@ -704,13 +1169,32 @@ export default function BookmapPage() {
               opzioni={[['15', '15 min'], ['60', '1 ora'], ['180', '3 ore']]}
               onChange={cambiaFinestra}
             />
-            <Selettore
-              titolo="Ordini limit"
-              valore={soglia}
-              opzioni={[['0', 'Off'], ['50', '≥50'], ['100', '≥100'], ['250', '≥250'], ['500', '≥500']]}
-              onChange={cambiaSoglia}
-            />
-            <label className={`flex items-center gap-2 ${soglia === '0' ? 'opacity-40' : ''}`}>
+            <div className="flex items-center gap-2">
+              <span className="text-slate-500">Ordini limit</span>
+              <button
+                onClick={cambiaOrdini}
+                className={`px-2 py-0.5 rounded-lg font-bold border ${
+                  mostraOrdini ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+                title={mostraOrdini ? 'Nascondi le linee degli ordini limit' : 'Mostra le linee degli ordini limit'}
+              >
+                {mostraOrdini ? 'ON' : 'OFF'}
+              </button>
+              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title="Da quanti contratti in su un livello diventa una linea">
+                <input
+                  type="range"
+                  min={SOGLIA_MIN}
+                  max={SOGLIA_MAX}
+                  step={10}
+                  value={soglia}
+                  disabled={!mostraOrdini}
+                  onChange={(e) => cambiaSoglia(Number(e.target.value))}
+                  className="w-32 accent-slate-400"
+                />
+                <span className="text-white font-bold tabular-nums w-10">≥{soglia}</span>
+              </label>
+            </div>
+            <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`}>
               <span className="text-slate-500">Spessore</span>
               <input
                 type="range"
@@ -718,12 +1202,29 @@ export default function BookmapPage() {
                 max={5}
                 step={0.5}
                 value={spessore}
-                disabled={soglia === '0'}
+                disabled={!mostraOrdini}
                 onChange={(e) => cambiaSpessore(Number(e.target.value))}
                 className="w-24 accent-slate-400"
               />
               <span className="text-white font-bold tabular-nums w-8">{spessore}×</span>
             </label>
+            <button
+              onClick={cambiaRange}
+              disabled={quantiRange === 0}
+              className={`px-3 py-1 rounded-lg font-bold flex items-center gap-2 border ${
+                mostraRange && quantiRange > 0 ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+              }`}
+              title={
+                quantiRange === 0
+                  ? "Nessun range di oggi: calcolalo o applicalo nel grafico principale (/market)"
+                  : mostraRange
+                    ? 'Nascondi i range ES del grafico principale'
+                    : 'Mostra i range ES del grafico principale'
+              }
+            >
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: mostraRange && quantiRange > 0 ? '#3b82f6' : '#475569' }} />
+              Range {quantiRange === 0 ? '—' : mostraRange ? 'ON' : 'OFF'}
+            </button>
             <button
               onClick={cambiaCvd}
               className={`px-3 py-1 rounded-lg font-bold flex items-center gap-2 border ${
@@ -775,13 +1276,125 @@ export default function BookmapPage() {
             <canvas ref={prezzoRef} className="cursor-crosshair" />
           </div>
 
-          <div className="text-[11px] uppercase tracking-wide text-slate-500 mt-4 mb-1">Liquidita&apos; del book (contratti) e sbilancio bid/ask</div>
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-4 mb-1">
+            <div className="text-[11px] uppercase tracking-wide text-slate-500">
+              Sbilancio della liquidita&apos; · {corrente?.levels ?? 10} livelli per lato · sopra zero piu&apos; bid, sotto piu&apos; ask
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+              <Selettore
+                titolo="Media"
+                valore={mediaLiq}
+                opzioni={[['1', 'Off'], ['10', '10 s'], ['30', '30 s'], ['60', '60 s']]}
+                onChange={cambiaMediaLiq}
+              />
+              <button
+                onClick={cambiaBidAsk}
+                className={`px-2 py-0.5 rounded-lg font-bold border ${
+                  mostraBidAsk ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+                title="Le due linee della liquidita' bid e ask, sull'asse destro"
+              >
+                Bid/Ask {mostraBidAsk ? 'ON' : 'OFF'}
+              </button>
+            </div>
+          </div>
           <div className="relative h-[220px] md:h-[260px]">
             <canvas ref={liquiditaRef} className="cursor-crosshair" />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-4 mb-1">
+            <div className="text-[11px] uppercase tracking-wide text-slate-500">
+              {vistaFlusso === 'pressione'
+                ? "Pressione degli ordini limit · sopra zero bid che si accumulano o ask ritirati, sotto il contrario"
+                : vistaFlusso === 'lato'
+                  ? "Netto per lato (aggiunti − tolti) · sopra zero il lato si riempie, sotto si svuota"
+                  : 'Ordini limit aggiunti e tolti'}
+              {' '}· primi 5 livelli · ultimi {finestraFlusso} s
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+              <span className="flex items-center gap-3 tabular-nums font-semibold">
+                {vistaFlusso === 'pressione' && <Netto testo="Pressione" valore={ultimoNetto('pressione')} />}
+                {vistaFlusso === 'lato' && (
+                  <>
+                    <Legenda colore={VERDE} testo="Bid netto" valore={ultimoNetto('bid')} segno />
+                    <Legenda colore={ROSSO} testo="Ask netto" valore={ultimoNetto('ask')} segno />
+                  </>
+                )}
+                {vistaFlusso === 'dettaglio' && (
+                  <>
+                    <Legenda colore={VERDE} testo="Bid +" valore={ultimoFlusso('addB')} />
+                    <Legenda colore={VERDE} tratteggio testo="Bid −" valore={ultimoFlusso('remB')} />
+                    <Legenda colore={ROSSO} testo="Ask +" valore={ultimoFlusso('addA')} />
+                    <Legenda colore={ROSSO} tratteggio testo="Ask −" valore={ultimoFlusso('remA')} />
+                  </>
+                )}
+              </span>
+              <Selettore
+                titolo="Vista"
+                valore={vistaFlusso}
+                opzioni={[['pressione', 'Pressione'], ['lato', 'Per lato'], ['dettaglio', 'Dettaglio']]}
+                onChange={cambiaVistaFlusso}
+              />
+              <Selettore
+                titolo="Somma"
+                valore={finestraFlusso}
+                opzioni={[['10', '10 s'], ['30', '30 s'], ['60', '60 s']]}
+                onChange={cambiaFinestraFlusso}
+              />
+              <Selettore
+                titolo="Tolti"
+                valore={tolti}
+                opzioni={[['cancellati', 'Solo cancellati'], ['tutti', 'Cancellati + eseguiti']]}
+                onChange={cambiaTolti}
+              />
+            </div>
+          </div>
+          {caricato && points.length > 0 && !conFlusso && (
+            <div className="mb-1 text-xs text-amber-200/80">
+              Nessun dato: l&apos;add-on in Bookmap e&apos; ancora la versione di prima. Ricostruiscilo dal code editor e riattivalo.
+            </div>
+          )}
+          <div className="relative h-[200px] md:h-[240px]">
+            <canvas ref={flussoRef} className="cursor-crosshair" />
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function Legenda({
+  colore,
+  testo,
+  valore,
+  tratteggio = false,
+  segno = false,
+}: {
+  colore: string;
+  testo: string;
+  valore: number | null;
+  tratteggio?: boolean;
+  segno?: boolean;
+}) {
+  return (
+    <span className="flex items-center gap-1.5 text-slate-400">
+      <span className={`inline-block w-4 border-t-2 ${tratteggio ? 'border-dashed' : ''}`} style={{ borderColor: colore }} />
+      {testo} <span className="text-white">{segno && valore != null && valore > 0 ? '+' : ''}{compatto(valore)}</span>
+    </span>
+  );
+}
+
+/** Il valore della pressione, colorato come la curva: verde sopra zero, rosso sotto. */
+function Netto({ testo, valore }: { testo: string; valore: number | null }) {
+  const colore = valore == null ? undefined : valore >= 0 ? VERDE : ROSSO;
+  return (
+    <span className="flex items-center gap-1.5 text-slate-400">
+      {testo}{' '}
+      <span style={{ color: colore }} className={valore == null ? 'text-white' : ''}>
+        {valore != null && valore > 0 ? '+' : ''}
+        {compatto(valore)}
+      </span>
+    </span>
   );
 }
 
