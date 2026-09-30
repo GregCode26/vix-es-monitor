@@ -8,7 +8,7 @@ scegliendo questo file) e poi si attiva sul grafico di ES.
 Ogni secondo manda un campione a POST /api/bookmap del dashboard locale:
 
     {"date", "t", "alias", "price", "bid", "ask", "buy", "sell", "bidLiq", "askLiq", "levels", "book",
-     "addB", "remB", "addA", "remA"}
+     "addB", "remB", "addA", "remA", "ofi", "cB", "cA", "q1B", "q1A", "qm", "sp1"}
 
 `buy`/`sell` sono i contratti aggrediti in quel secondo, non il cumulato: il
 CVD lo somma la route sull'intera giornata, cosi' riavviare l'add-on o
@@ -24,6 +24,27 @@ tolti in quel secondo entro LIVELLI_FLUSSO livelli dal migliore, contati a ogni
 aggiornamento del book: se la size di un livello sale e' aggiunta, se scende e'
 tolta. Tolta comprende anche l'eseguito (un ordine riempito sparisce dal book
 come uno cancellato): la pagina, se si vuole, gli sottrae `buy`/`sell`.
+
+`ofi` e' l'Order Flow Imbalance livello per livello (Cont, Kukanov e Stoikov
+2014 per il primo livello, Xu, Gould e Howison per i livelli successivi, il
+"MLOFI"), sommato sul secondo: LIVELLI_OFI numeri in contratti, il primo e'
+il migliore. Non guarda quanta liquidita' c'e' ma come cambia tra due
+fotografie consecutive del book (ogni 0,1 s): per il livello m del bid
+
+    e = q_ora * [P_ora >= P_prima] - q_prima * [P_ora <= P_prima]
+
+e il contrario per l'ask. Positivo = pressione in acquisto (bid che si
+riempiono o salgono, ask che si svuotano o salgono). Comprende inserimenti,
+cancellazioni ed esecuzioni: i tre eventi del book. Un ordine messo e tolto
+tra due fotografie non conta, che per un ordine fugace e' quello che si vuole.
+
+`cB`/`cA` sono il baricentro della liquidita' di ciascun lato, in tick dal
+mid, sugli stessi livelli: un lato che "si allontana" dal prezzo (l'asimmetria
+del modello di Avellaneda e Stoikov) lo sposta in fuori. `q1B`/`q1A` sono i
+contratti in media sul migliore, `qm` la media per livello sui due lati (serve
+a normalizzare l'OFI), `sp1` la quota di fotografie con lo spread a un tick:
+vicino a 1 e' un mercato "large tick", con code spesse e spread schiacciato.
+Tutti medie delle fotografie del secondo.
 
 I callback di Bookmap (trade e depth arrivano a migliaia al secondo su ES)
 non devono mai aspettare la rete: qui si mette il campione in una coda e lo
@@ -48,6 +69,7 @@ MAX_IN_CODA = 3600
 LIVELLI_BOOK = 30
 MIN_CONTRATTI_BOOK = 20
 LIVELLI_FLUSSO = 5
+LIVELLI_OFI = 15
 # Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
 # contratti aggiunti in un colpo. Per questi secondi non si conta.
 AVVIO_SENZA_FLUSSO_SEC = 3
@@ -58,6 +80,8 @@ livelli = {}        # alias -> quanti livelli per lato sommare nella liquidita'
 flusso = {}         # alias -> {"buy", "sell", "addB", "remB", "addA", "remA"} del secondo in corso
 conta_da = {}       # alias -> da quando (epoch) contare aggiunte e rimozioni
 ultimo_secondo = {}  # alias -> secondo (epoch) dell'ultimo campione emesso
+foto_prima = {}     # alias -> ultima fotografia dei primi LIVELLI_OFI livelli, per l'OFI
+statistiche = {}    # alias -> OFI per livello e medie del secondo in corso
 
 coda = queue.Queue()
 req_id = 0
@@ -76,6 +100,8 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     flusso[alias] = azzerato()
     conta_da[alias] = time.time() + AVVIO_SENZA_FLUSSO_SEC
     ultimo_secondo[alias] = int(time.time())
+    foto_prima[alias] = None
+    statistiche[alias] = statistiche_azzerate()
 
     req_id += 1
     bm.subscribe_to_depth(addon, alias, req_id)
@@ -86,13 +112,84 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
 
 
 def handle_unsubscribe_instrument(addon, alias):
-    for d in (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo):
+    for d in (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche):
         d.pop(alias, None)
     print(f"Staccato {alias}", flush=True)
 
 
 def azzerato():
     return {"buy": 0.0, "sell": 0.0, "addB": 0.0, "remB": 0.0, "addA": 0.0, "remA": 0.0}
+
+
+def statistiche_azzerate():
+    return {"ofi": [0.0] * LIVELLI_OFI, "n": 0, "cB": 0.0, "nB": 0, "cA": 0.0, "nA": 0,
+            "q1B": 0.0, "q1A": 0.0, "qm": 0.0, "sp1": 0}
+
+
+def fotografia(libro, info):
+    """(miglior bid, code bid, miglior ask, code ask), prezzi in tick e code in contratti; None senza i due lati."""
+    migliori_bid, migliori_ask = bm.get_bbo(libro)
+    if not migliori_bid or not migliori_ask:
+        return None
+    bb, ba = migliori_bid[0], migliori_ask[0]
+    g = info["granularita"]
+    qb = [libro["bids"].get(bb - m, 0) / g for m in range(LIVELLI_OFI)]
+    qa = [libro["asks"].get(ba + m, 0) / g for m in range(LIVELLI_OFI)]
+    return bb, qb, ba, qa
+
+
+def aggiorna_statistiche(alias, foto):
+    """OFI tra la fotografia precedente e questa, e le medie del secondo (baricentri, code, spread)."""
+    s = statistiche[alias]
+    prima = foto_prima[alias]
+    foto_prima[alias] = foto
+    if foto is None:
+        return
+    bb, qb, ba, qa = foto
+    # All'avvio Bookmap riversa l'intero book: sembrerebbe un OFI enorme.
+    if prima is not None and time.time() >= conta_da[alias]:
+        bb0, qb0, ba0, qa0 = prima
+        for m in range(LIVELLI_OFI):
+            e = 0.0
+            if bb >= bb0:
+                e += qb[m]
+            if bb <= bb0:
+                e -= qb0[m]
+            if ba <= ba0:
+                e -= qa[m]
+            if ba >= ba0:
+                e += qa0[m]
+            s["ofi"][m] += e
+
+    # Distanza dal mid in tick: livello m del bid = m + spread/2.
+    meta = (ba - bb) / 2
+    tot_b = sum(qb)
+    tot_a = sum(qa)
+    if tot_b > 0:
+        s["cB"] += sum(q * (m + meta) for m, q in enumerate(qb)) / tot_b
+        s["nB"] += 1
+    if tot_a > 0:
+        s["cA"] += sum(q * (m + meta) for m, q in enumerate(qa)) / tot_a
+        s["nA"] += 1
+    s["q1B"] += qb[0]
+    s["q1A"] += qa[0]
+    s["qm"] += (tot_b + tot_a) / (2 * LIVELLI_OFI)
+    s["sp1"] += 1 if ba - bb == 1 else 0
+    s["n"] += 1
+
+
+def riassunto_statistiche(s):
+    """I campi del campione; None dove nel secondo non c'e' stata nessuna fotografia valida."""
+    n = s["n"]
+    return {
+        "ofi": [round(v) for v in s["ofi"]] if n else None,
+        "cB": round(s["cB"] / s["nB"], 2) if s["nB"] else None,
+        "cA": round(s["cA"] / s["nA"], 2) if s["nA"] else None,
+        "q1B": round(s["q1B"] / n, 1) if n else None,
+        "q1A": round(s["q1A"] / n, 1) if n else None,
+        "qm": round(s["qm"] / n, 1) if n else None,
+        "sp1": round(s["sp1"] / n, 2) if n else None,
+    }
 
 
 def handle_depth_info(addon, alias, is_bid, price, size):
@@ -150,16 +247,17 @@ def livelli_book(lato, migliore, verso, info):
 
 
 def on_interval(addon, alias):
-    """Bookmap lo chiama ogni 0,1 s: si emette un campione a ogni cambio di secondo."""
+    """Bookmap lo chiama ogni 0,1 s: si fotografa il book ogni volta, si emette un campione a ogni cambio di secondo."""
     libro = libri.get(alias)
     if libro is None:
         return
+    info = strumenti[alias]
+    aggiorna_statistiche(alias, fotografia(libro, info))
     adesso = int(time.time())
     if adesso == ultimo_secondo[alias]:
         return
     ultimo_secondo[alias] = adesso
 
-    info = strumenti[alias]
     migliori_bid, migliori_ask = bm.get_bbo(libro)
     bid = migliori_bid[0] * info["pips"] if migliori_bid else None
     ask = migliori_ask[0] * info["pips"] if migliori_ask else None
@@ -188,8 +286,10 @@ def on_interval(addon, alias):
         "remB": round(f["remB"]),
         "addA": round(f["addA"]),
         "remA": round(f["remA"]),
+        **riassunto_statistiche(statistiche[alias]),
     }
     flusso[alias] = azzerato()
+    statistiche[alias] = statistiche_azzerate()
 
     if coda.qsize() < MAX_IN_CODA:
         coda.put(campione)

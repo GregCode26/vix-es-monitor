@@ -40,6 +40,13 @@ interface Campione {
     remB?: number;
     addA?: number;
     remA?: number;
+    ofi?: number[] | null;
+    cB?: number | null;
+    cA?: number | null;
+    q1B?: number | null;
+    q1A?: number | null;
+    qm?: number | null;
+    sp1?: number | null;
 }
 
 /** Ordini limit per livello: [prezzo, contratti], solo i livelli sopra la soglia dell'add-on. */
@@ -71,6 +78,22 @@ export interface BookmapPoint {
     remB: number | null;
     addA: number | null;
     remA: number | null;
+    /**
+     * Order Flow Imbalance del secondo, livello per livello dal migliore
+     * (contratti; positivo = pressione in acquisto). Il primo e' l'OFI
+     * classico, la somma dei primi N il multilivello. Null prima che l'add-on
+     * lo calcolasse.
+     */
+    ofi: number[] | null;
+    /** Baricentro della liquidita' bid e ask, in tick dal mid. */
+    cB: number | null;
+    cA: number | null;
+    /** Contratti medi sul migliore bid e ask, e per livello sui due lati. */
+    q1B: number | null;
+    q1A: number | null;
+    qm: number | null;
+    /** Quota del secondo con lo spread a un tick. */
+    sp1: number | null;
 }
 
 interface Giornata {
@@ -131,6 +154,13 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         remB: numeroONull(c.remB),
         addA: numeroONull(c.addA),
         remA: numeroONull(c.remA),
+        ofi: Array.isArray(c.ofi) && c.ofi.every((v) => typeof v === 'number' && Number.isFinite(v)) ? c.ofi : null,
+        cB: numeroONull(c.cB),
+        cA: numeroONull(c.cA),
+        q1B: numeroONull(c.q1B),
+        q1A: numeroONull(c.q1A),
+        qm: numeroONull(c.qm),
+        sp1: numeroONull(c.sp1),
     };
     g.points.push(p);
     return p;
