@@ -37,6 +37,19 @@ const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabase
  */
 const SNAPSHOT_RECENTI = 6;
 
+/**
+ * Con `?storia=1` la route manda anche la pressione del resto della
+ * sessione, uno snapshot al minuto. Serve al primo caricamento della pagina:
+ * senza, la serie temporale partiva da quando la si apriva.
+ *
+ * Uno al minuto e non tutti: sull'intera sessione (13:30-22:00) sono ~510
+ * snapshot da ~5,5 KB, ~2,8 MB di egress per ogni apertura della pagina,
+ * contro i ~17 MB di tutti quelli a dieci secondi. Per una linea che si
+ * guarda su ore il minuto basta; il dettaglio a dieci secondi lo aggiungono
+ * poi i giri normali.
+ */
+const STORIA_MAX = 1000;
+
 interface StrikeRow {
     strike: number;
     calls?: number;
@@ -157,6 +170,46 @@ async function readSupabaseSnapshots(dateStr: string): Promise<Snapshot[] | null
         });
     }
     return snapshots;
+}
+
+/**
+ * Uno snapshot al minuto della giornata: quelli con i secondi fra 00 e 09.
+ * Il poller ne scrive uno ogni dieci secondi, quindi ne cade quasi sempre
+ * esattamente uno per minuto; `time` e' testo 'HH:MM:SS', e il filtro lo fa
+ * Postgres, cosi' gli altri cinque non escono proprio dal database.
+ */
+async function readSupabaseStoria(dateStr: string): Promise<Snapshot[] | null> {
+    if (!supabase) return null;
+    const { data, error } = await supabase
+        .from('volumes_snapshots')
+        .select('time, spx_price, und_price, volumes')
+        .eq('date', dateStr)
+        .like('time', '%:%:0_')
+        .order('time', { ascending: true })
+        .limit(STORIA_MAX);
+    if (error) {
+        console.error('Hedging pressure storia Supabase error:', error.message);
+        return null;
+    }
+    return (data ?? []).map((r) => ({
+        time: r.time,
+        spxPrice: r.spx_price,
+        undPrice: r.und_price,
+        volumes: r.volumes as StrikeRow[],
+    }));
+}
+
+/** Lo stesso campionamento sul file locale. */
+function campionaAlMinuto(snapshots: Snapshot[]): Snapshot[] {
+    const out: Snapshot[] = [];
+    let ultimoMinuto: string | null = null;
+    for (const s of snapshots) {
+        const minuto = s.time.slice(0, 5);
+        if (minuto === ultimoMinuto) continue;
+        ultimoMinuto = minuto;
+        out.push(s);
+    }
+    return out;
 }
 
 /** Solo l'ultima riga IV: la route non usa lo storico. */
@@ -309,6 +362,7 @@ function elaboraSnapshot(snapshots: Snapshot[]): {
 export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
+        const conStoria = searchParams.get('storia') === '1';
         const targetDate = getTodayKey();
 
         // Read volume snapshots (with gamma, delta, vega)
@@ -417,17 +471,29 @@ export async function GET(request: Request) {
             .slice(0, 5)
             .map((p) => p.strike);
 
-        const pressureHistory: PressureHistoryPoint[] = [];
-        if (topStrikes.length > 0 && local.length > 0) {
-            // Calculate pressure at each snapshot for top strikes
-            for (const snap of local) {
+        // Il riferimento di apertura per lo spostamento dello spot: e' il
+        // primo punto della serie, che readSupabaseSnapshots mette apposta.
+        const aperturaSpot = spot.length > 0 ? spot[0].price : null;
+        const CONTRACT_SIZE = 100;
+        const strikeGexStorico = (gamma: number, netContracts: number, s: number) => {
+            const dollars = gamma * netContracts * CONTRACT_SIZE * s * s * 0.01;
+            return Math.round((dollars / 1e6) * 100) / 100;
+        };
+
+        /**
+         * La pressione dei top strike a ogni snapshot. Lo spostamento dello
+         * spot si misura dall'apertura: prima si prendeva l'ultimo punto della
+         * serie a 30 s non oltre lo snapshot, che e' lo stesso numero a meno
+         * di mezzo minuto, ma per gli snapshot della storia quella serie non
+         * c'e'.
+         */
+        const pressioneDi = (snaps: Snapshot[]): PressureHistoryPoint[] => {
+            const out: PressureHistoryPoint[] = [];
+            if (topStrikes.length === 0 || aperturaSpot == null) return out;
+            for (const snap of snaps) {
                 const snapSpot = snap.undPrice ?? snap.spxPrice ?? null;
                 if (!snapSpot) continue;
-
-                // Simple delta from previous snapshot
-                const snapDelta = spot.filter((p) => p.time <= snap.time);
-                const currentSpotDelta =
-                    snapDelta.length > 1 ? snapDelta[snapDelta.length - 1].price - snapDelta[0].price : 0;
+                const currentSpotDelta = snapSpot - aperturaSpot;
 
                 for (const strike of topStrikes) {
                     const row = snap.volumes?.find((v) => v.strike === strike);
@@ -437,17 +503,8 @@ export async function GET(request: Request) {
                     const vanna = estimateVanna(row.vega, snapSpot, strike, atmIv, timeToExpiry);
                     const vannaHedging = vannaToHedgingPressure(vanna, snapSpot);
 
-                    const gexRow = profile.find((p) => p.strike === strike);
-                    if (!gexRow) continue;
-
-                    const CONTRACT_SIZE = 100;
-                    const strikeGex = (gamma: number, netContracts: number, s: number) => {
-                        const dollars = gamma * netContracts * CONTRACT_SIZE * s * s * 0.01;
-                        return Math.round((dollars / 1e6) * 100) / 100;
-                    };
-
                     const vol = (row.calls ?? 0) - (row.puts ?? 0);
-                    const gex = strikeGex(row.gamma, vol, snapSpot);
+                    const gex = strikeGexStorico(row.gamma, vol, snapSpot);
 
                     const scale = Math.max(1, snapSpot * 0.01 * Math.max(0.5, Math.min(2, atmIv / 25)));
                     const distance = Math.abs(strike - snapSpot);
@@ -457,7 +514,7 @@ export async function GET(request: Request) {
                     const vannaPressure = vannaHedging ? vannaHedging * ivChange * proximity : 0;
                     const totalPressure = gammaPressure + vannaPressure;
 
-                    pressureHistory.push({
+                    out.push({
                         time: snap.time,
                         strike,
                         gammaPressure: Math.round(gammaPressure * 100) / 100,
@@ -466,6 +523,21 @@ export async function GET(request: Request) {
                     });
                 }
             }
+            return out;
+        };
+
+        // Senza Supabase `local` e' la giornata intera, da cui il tetto.
+        const pressureHistory = pressioneDi(local.filter((snap) => Array.isArray(snap.volumes) && snap.volumes.length > 0)).slice(-1000);
+
+        // La storia della sessione, solo se chiesta: la pagina la vuole una
+        // volta, al primo caricamento, e poi continua con i giri normali.
+        // Si ferma dove comincia `local`, che e' gia' in pressureHistory.
+        let storia: PressureHistoryPoint[] = [];
+        if (conStoria) {
+            let campioni = await readSupabaseStoria(targetDate);
+            if (!campioni || campioni.length === 0) campioni = campionaAlMinuto(readLocalSnapshots(targetDate) ?? []);
+            const inizioRecenti = pressureHistory.length > 0 ? pressureHistory[0].time : null;
+            storia = pressioneDi(campioni.filter((snap) => inizioRecenti == null || snap.time < inizioRecenti));
         }
 
         return NextResponse.json(
@@ -480,7 +552,8 @@ export async function GET(request: Request) {
                 profile: hedgingProfile,
                 riskZones,
                 strikes,
-                pressureHistory: pressureHistory.slice(-1000), // Limit to last 1000 points
+                pressureHistory,
+                ...(conStoria ? { storia } : {}),
             },
             { status: 200 }
         );

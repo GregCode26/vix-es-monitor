@@ -38,8 +38,14 @@ interface HedgingPressureResponse {
 }
 
 const REFRESH_MS = 15000;
-/** Punti di storico tenuti in memoria: 5 strike a ogni giro, ~2 ore di sessione. */
-const MAX_STORICO = 2500;
+/**
+ * Punti di storico tenuti in memoria. Basta per la sessione intera: la
+ * storia arriva a uno snapshot al minuto (~510 x 5 strike), poi i giri
+ * aggiungono uno snapshot ogni dieci secondi (~30 punti al minuto).
+ */
+const MAX_STORICO = 20000;
+/** Quanti strike mostra la serie temporale: gli stessi per cui la route calcola lo storico. */
+const TOP_STRIKE = 5;
 
 type ViewMode = 'profile' | 'timeseries' | 'heatmap';
 
@@ -53,6 +59,18 @@ interface PressureHistoryPoint {
 
 interface HedgingPressureResponseWithHistory extends HedgingPressureResponse {
     pressureHistory?: PressureHistoryPoint[];
+    /** Il resto della sessione, uno snapshot al minuto: arriva solo con `?storia=1`. */
+    storia?: PressureHistoryPoint[];
+}
+
+/** 'HH:MM:SS' del giorno `data` -> millisecondi, per l'asse del tempo. */
+function inMs(data: string, ora: string): number {
+    return new Date(`${data}T${ora.length === 5 ? `${ora}:00` : ora}`).getTime();
+}
+
+function hhmm(ms: number): string {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 export default function HedgingPressurePage() {
@@ -74,10 +92,21 @@ export default function HedgingPressurePage() {
      * sovrappongono e lo stesso punto arriva piu' volte.
      */
     const [storico, setStorico] = useState<PressureHistoryPoint[]>([]);
+    /** La storia della sessione si chiede una volta: finche' non arriva, e di nuovo a ogni giorno nuovo. */
+    const serveStoria = useRef(true);
+    /**
+     * La finestra di zoom della serie temporale, in ms. Il grafico si
+     * ricostruisce a ogni giro (notMerge), quindi senza questo lo zoom
+     * tornerebbe a tutta la sessione ogni 15 secondi. `live`: il bordo destro
+     * era sull'ultimo dato, e allora la finestra lo segue.
+     */
+    const zoomSerie = useRef<{ da: number; a: number; live: boolean } | null>(null);
+    const ultimoMsSerie = useRef(0);
 
     const fetchHedgingPressure = useCallback(async () => {
         try {
-            const res = await fetch('/api/hedging-pressure', { cache: 'no-store' });
+            const conStoria = serveStoria.current;
+            const res = await fetch(conStoria ? '/api/hedging-pressure?storia=1' : '/api/hedging-pressure', { cache: 'no-store' });
             if (!res.ok) {
                 const body = await res.json().catch(() => null);
                 throw new Error(body?.error || 'Caricamento fallito');
@@ -88,6 +117,8 @@ export default function HedgingPressurePage() {
             if (json.date && giornoSessione.current && json.date !== giornoSessione.current) {
                 giornoSessione.current = json.date;
                 lastTime.current = null;
+                serveStoria.current = true;
+                zoomSerie.current = null;
                 setStorico([]);
                 setData(null);
                 setError(null);
@@ -96,11 +127,17 @@ export default function HedgingPressurePage() {
             if (json.date) giornoSessione.current = json.date;
 
             setData(json);
+            if (conStoria) serveStoria.current = false;
             setStorico((prec) => {
                 const visti = new Set(prec.map((p) => `${p.time}|${p.strike}`));
-                const nuovi = (json.pressureHistory ?? []).filter((p) => !visti.has(`${p.time}|${p.strike}`));
+                const arrivati = [...(json.storia ?? []), ...(json.pressureHistory ?? [])];
+                const nuovi = arrivati.filter((p) => !visti.has(`${p.time}|${p.strike}`));
                 if (nuovi.length === 0) return prec;
-                return [...prec, ...nuovi].slice(-MAX_STORICO);
+                const uniti = [...prec, ...nuovi];
+                // La storia e' piu' vecchia di quello che c'e' gia': in ordine
+                // di tempo, o le linee tornerebbero indietro.
+                if (json.storia && json.storia.length > 0) uniti.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+                return uniti.slice(-MAX_STORICO);
             });
             setError(null);
             setLoading(false);
@@ -162,44 +199,60 @@ export default function HedgingPressurePage() {
         };
     }, [data]);
 
-    // Opzione echarts per il grafico time-series (gamma vs vanna)
+    /**
+     * Serie temporale della pressione sui top strike di adesso.
+     *
+     * Prima l'asse era a categorie e ogni linea si allineava per indice:
+     * strike con orari diversi finivano sfasati. E `slice(0, 5)` su un
+     * oggetto con chiavi numeriche prendeva i cinque strike piu' BASSI, non i
+     * piu' carichi. Ora l'asse e' il tempo vero, e gli strike sono gli stessi
+     * cinque per cui la route calcola lo storico.
+     *
+     * Lo zoom: rotella e trascinamento sul grafico, o la barra sotto. L'asse
+     * Y si riadatta a quello che si vede (`filterMode: 'filter'`).
+     */
     const timeseriesOption = useMemo(() => {
-        if (storico.length === 0) {
+        if (storico.length === 0 || !data) {
             return {
                 backgroundColor: '#0c0d10',
                 title: { text: 'Nessun dato storico disponibile', left: 'center', textStyle: { color: '#94a3b8' } },
             };
         }
 
-        const groupedByStrike: Record<number, { time: string[]; total: number[] }> = {};
-        const allTimes: string[] = [];
-
-        for (const point of storico) {
-            if (!groupedByStrike[point.strike]) {
-                groupedByStrike[point.strike] = { time: [], total: [] };
-            }
-            groupedByStrike[point.strike].time.push(point.time);
-            groupedByStrike[point.strike].total.push(point.totalPressure);
-            if (!allTimes.includes(point.time)) {
-                allTimes.push(point.time);
-            }
+        const top = [...data.profile]
+            .sort((x, y) => Math.abs(y.normalizedPressure) - Math.abs(x.normalizedPressure))
+            .slice(0, TOP_STRIKE)
+            .map((r) => r.strike)
+            .sort((x, y) => x - y);
+        const perStrike = new Map<number, [number, number][]>(top.map((k) => [k, []]));
+        let ultimoMs = 0;
+        for (const p of storico) {
+            const serie = perStrike.get(p.strike);
+            if (!serie) continue;
+            const ms = inMs(data.date, p.time);
+            if (!Number.isFinite(ms)) continue;
+            serie.push([ms, p.totalPressure]);
+            if (ms > ultimoMs) ultimoMs = ms;
         }
+        ultimoMsSerie.current = ultimoMs;
 
-        const series = Object.entries(groupedByStrike)
-            .slice(0, 5) // Top 5 strikes only
-            .map(([strike, d]) => {
-                const lineData = d.total; // Just pressure values, echarts will align by category index
-                return {
-                    name: `K${strike}`,
-                    type: 'line' as const,
-                    data: lineData,
-                    smooth: true,
-                    symbolSize: 3,
-                    lineStyle: { width: 2 },
-                };
-            });
+        const series = top.map((strike) => ({
+            name: `K${strike}`,
+            type: 'line' as const,
+            data: perStrike.get(strike) ?? [],
+            showSymbol: false,
+            sampling: 'lttb' as const,
+            lineStyle: { width: 2 },
+        }));
 
-        const legendData = series.map((s) => s.name);
+        // La finestra di prima: se seguiva l'ultimo dato, scorre con lui
+        // tenendo la stessa ampiezza.
+        const z = zoomSerie.current;
+        const finestra = z
+            ? z.live
+                ? { startValue: ultimoMs - (z.a - z.da), endValue: ultimoMs }
+                : { startValue: z.da, endValue: z.a }
+            : {};
 
         return {
             backgroundColor: '#0c0d10',
@@ -208,32 +261,31 @@ export default function HedgingPressurePage() {
                 axisPointer: { type: 'cross' },
             },
             legend: {
-                data: legendData,
+                data: series.map((x) => x.name),
                 textStyle: { color: '#94a3b8', fontSize: 9 },
                 top: 10,
                 right: 10,
                 orient: 'vertical',
-                max: 8,
             },
             grid: {
                 left: 60,
-                right: 40,
+                right: 70,
                 top: 50,
-                bottom: 40,
+                bottom: 80,
             },
             xAxis: {
-                type: 'category',
-                data: allTimes,
+                type: 'time',
                 name: 'Time',
                 nameLocation: 'center',
                 nameGap: 30,
                 nameTextStyle: { color: '#e2e8f0', fontSize: 12 },
-                axisLabel: { color: '#94a3b8', fontSize: 9, formatter: (val: string) => val.substring(0, 5) },
+                axisLabel: { color: '#94a3b8', fontSize: 9, formatter: (val: number) => hhmm(val) },
                 splitLine: { lineStyle: { color: 'rgba(51, 65, 85, 0.2)' } },
                 axisLine: { lineStyle: { color: '#334155' } },
             },
             yAxis: {
                 type: 'value',
+                scale: true,
                 name: 'Gamma Pressure',
                 nameLocation: 'center',
                 nameGap: 40,
@@ -243,9 +295,46 @@ export default function HedgingPressurePage() {
                 axisLine: { lineStyle: { color: '#334155' } },
                 axisPointer: { type: 'line' },
             },
+            dataZoom: [
+                { type: 'inside', xAxisIndex: 0, filterMode: 'filter', ...finestra },
+                {
+                    type: 'slider',
+                    xAxisIndex: 0,
+                    filterMode: 'filter',
+                    height: 22,
+                    bottom: 12,
+                    borderColor: '#334155',
+                    fillerColor: 'rgba(59, 130, 246, 0.15)',
+                    textStyle: { color: '#94a3b8', fontSize: 9 },
+                    labelFormatter: (val: number) => hhmm(val),
+                    ...finestra,
+                },
+            ],
             series,
         };
-    }, [storico]);
+    }, [storico, data]);
+
+    /** Si ricorda dove l'utente ha zoomato, per rimetterlo li' al prossimo giro. */
+    const suZoomSerie = useCallback(
+        (_: unknown, chart: { getOption: () => { dataZoom?: { startValue?: number; endValue?: number; start?: number; end?: number }[] } }) => {
+            const dz = chart.getOption().dataZoom?.[0];
+            if (!dz || dz.startValue == null || dz.endValue == null) return;
+            // Tutta la sessione: nessuna finestra da ricordare.
+            if ((dz.start ?? 0) <= 0 && (dz.end ?? 100) >= 100) {
+                zoomSerie.current = null;
+                return;
+            }
+            const ultimo = ultimoMsSerie.current;
+            zoomSerie.current = {
+                da: dz.startValue,
+                a: dz.endValue,
+                // Un giro di margine: il bordo destro e' "sull'ultimo dato" anche
+                // se l'ultimo punto e' arrivato mentre si trascinava.
+                live: ultimo > 0 && dz.endValue >= ultimo - REFRESH_MS,
+            };
+        },
+        [],
+    );
 
     // Opzione echarts per heatmap (pressione per strike nel tempo)
     const heatmapOption = useMemo(() => {
@@ -581,6 +670,7 @@ export default function HedgingPressurePage() {
                                 option={viewMode === 'profile' ? option : viewMode === 'timeseries' ? timeseriesOption : heatmapOption}
                                 style={{ height: '100%', width: '100%' }}
                                 notMerge={true}
+                                onEvents={viewMode === 'timeseries' ? { datazoom: suZoomSerie } : undefined}
                             />
                         ) : (
                             <div className="flex flex-col items-center justify-center h-full gap-3 text-sm text-slate-500">
