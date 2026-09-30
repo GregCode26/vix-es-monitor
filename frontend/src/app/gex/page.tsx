@@ -18,6 +18,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import { zeroGamma } from '@/lib/zeroGamma';
 
 // Base registration (safe for SSR).
 // I *Controller servono quanto gli Element: qui il grafico si costruisce a
@@ -426,6 +427,15 @@ export default function GexPage() {
     return profile.map((p) => ({ strike: p.strike, gex: gexBasis === 'oi' ? p.gexOi : p.gex }));
   }, [profile, gexBasis]);
 
+  /**
+   * Zero Gamma di adesso, dal profilo che la pagina ha gia': nessuna
+   * chiamata in piu'. Stesso calcolo di /spx-gamma, sulla base scelta qui.
+   */
+  const zeroGammaOra = useMemo(
+    () => zeroGamma(profile, gexBasis === 'oi' ? 'gexOi' : 'gex'),
+    [profile, gexBasis],
+  );
+
   const currentBasis = useMemo(() => {
     for (let i = spxHistory.length - 1; i >= 0; i--) {
       const pt = spxHistory[i];
@@ -595,8 +605,35 @@ export default function GexPage() {
       }
     });
 
+    // 3. Zero Gamma. Nelle barre e' una riga sola, il livello di adesso;
+    // nella vista a linee e' invece un dataset che segue la sessione (vedi
+    // buildDatasets), perche' li' l'asse orizzontale e' il tempo e una riga
+    // piatta direbbe che il flip e' stato li' tutto il giorno.
+    // L'etichetta sta a sinistra: a destra ci sono quelle dei range.
+    if (viewMode === 'bars' && zeroGammaOra != null) {
+      annotations['zero-gamma'] = {
+        type: 'line',
+        yMin: zeroGammaOra,
+        yMax: zeroGammaOra,
+        borderColor: '#f59e0b',
+        borderWidth: 2,
+        borderDash: [6, 4],
+        label: {
+          display: true,
+          content: `Zero Gamma ~${zeroGammaOra.toFixed(0)}`,
+          position: 'start',
+          xAdjust: 8,
+          backgroundColor: 'rgba(15, 23, 42, 0.9)',
+          color: '#f59e0b',
+          font: { size: 11, weight: 'bold' as const },
+          padding: { top: 2, bottom: 2, left: 4, right: 4 },
+          borderRadius: 4
+        }
+      };
+    }
+
     return annotations;
-  }, [gexProfile, scalaDisegno, quotaMuro, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis]);
+  }, [gexProfile, scalaDisegno, quotaMuro, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis, zeroGammaOra]);
 
   // ─── Build datasets helper ───
   const buildDatasets = useCallback((currentSpxHistory: SpxHistoryPoint[], currentGexProfile: { strike: number; gex: number }[]) => {
@@ -612,7 +649,7 @@ export default function GexPage() {
       .filter((pt) => !isNaN(pt.x.getTime()) && pt.y > 0);
 
     const priceDataset = {
-      type: 'line' as const, label: 'SPX Price', data: priceData,
+      type: 'line' as const, chiave: 'prezzo', label: 'SPX Price', data: priceData,
       xAxisID: 'xTime', yAxisID: 'y', borderColor: '#00f0ff',
       borderWidth: 2.5, pointRadius: 0, fill: false, tension: 0.1,
       showLine: true,
@@ -662,6 +699,7 @@ export default function GexPage() {
 
         muri.push({
           type: 'line' as const,
+          chiave: `muro-${strike}`,
           // Una sola voce in legenda per tutti: le altre resterebbero
           // trenta caselle senza nome.
           label: muri.length === 0 ? 'Muri per strike' : '',
@@ -693,7 +731,27 @@ export default function GexPage() {
         });
       }
 
-      return [...muri, priceDataset];
+      // Lo Zero Gamma nel tempo, una fotografia per volta: sono le stesse
+      // della heatmap, quindi niente da scaricare in piu'. Dove il cumulato
+      // non cambia mai segno il livello non esiste, e la linea si interrompe
+      // invece di inventarlo.
+      const chiaveBase = gexBasis === 'oi' ? 'gexOi' : 'gex';
+      const flipData: { x: Date; y: number | null }[] = [];
+      for (const f of serieOra) {
+        const t = f.time.includes(':') ? f.time : `${f.time}:00`;
+        const x = new Date(`${todayStr}T${t}`);
+        if (isNaN(x.getTime())) continue;
+        const righe = strikeSerie.map((strike, i) => ({ strike, gex: f.gex[i] ?? 0, gexOi: f.gexOi[i] ?? 0 }));
+        flipData.push({ x, y: zeroGamma(righe, chiaveBase) });
+      }
+      const flipDataset = {
+        type: 'line' as const, chiave: 'zero-gamma', label: 'Zero Gamma', data: flipData,
+        xAxisID: 'xTime', yAxisID: 'y', borderColor: '#f59e0b',
+        borderWidth: 2, borderDash: [6, 4], pointRadius: 0, pointHoverRadius: 3,
+        fill: false, tension: 0, spanGaps: false, order: 1,
+      };
+
+      return [...muri, flipDataset, priceDataset];
     }
 
     // Il divisore era 15, con i valori in M$: sopra i 15 M$ -- cioe' sempre,
@@ -707,7 +765,7 @@ export default function GexPage() {
     };
 
     const posGexDataset = {
-      type: 'bar' as const, label: 'Positive GEX (M$/1%)',
+      type: 'bar' as const, chiave: 'gex-pos', label: 'Positive GEX (M$/1%)',
       data: currentGexProfile.map((p) => ({ x: p.gex > 0 ? p.gex : 0, y: p.strike })),
       xAxisID: 'xGex', yAxisID: 'y',
       backgroundColor: (ctx: any) => `rgba(34, 197, 94, ${intensita(ctx, 0.12, 0.75)})`,
@@ -715,7 +773,7 @@ export default function GexPage() {
       borderWidth: 1, barThickness: 8, indexAxis: 'y' as const,
     };
     const negGexDataset = {
-      type: 'bar' as const, label: 'Negative GEX (M$/1%)',
+      type: 'bar' as const, chiave: 'gex-neg', label: 'Negative GEX (M$/1%)',
       data: currentGexProfile.map((p) => ({ x: p.gex < 0 ? Math.abs(p.gex) : 0, y: p.strike })),
       xAxisID: 'xGex', yAxisID: 'y',
       backgroundColor: (ctx: any) => `rgba(239, 68, 68, ${intensita(ctx, 0.12, 0.75)})`,
@@ -829,6 +887,7 @@ export default function GexPage() {
               label: (ctx: any) => {
                 const l = ctx.dataset.label || '';
                 if (l.includes('SPX Price')) return `SPX Price: ${ctx.parsed.y.toFixed(2)}`;
+                if (l === 'Zero Gamma') return `Zero Gamma ~${ctx.parsed.y.toFixed(0)}`;
                 if (ctx.raw?.v !== undefined) {
                   return `Strike ${ctx.parsed.y}: ${(ctx.raw.v / 1000).toFixed(1)} Bn`;
                 }
@@ -994,8 +1053,13 @@ export default function GexPage() {
 
     const newDatasets = buildDatasets(spxHistory, gexProfile);
 
+    // Si aggiorna sul posto solo se nella stessa posizione c'e' lo stesso
+    // dataset: i muri visibili cambiano di numero durante la sessione, e
+    // copiando solo `data` per indice lo Zero Gamma o il prezzo finivano con
+    // i dati di un muro e lo stile di un altro.
     newDatasets.forEach((ds, i) => {
-      if (chart.data.datasets[i]) {
+      const esistente = chart.data.datasets[i] as { chiave?: string } | undefined;
+      if (esistente && esistente.chiave === ds.chiave) {
         chart.data.datasets[i].data = ds.data as any;
         if ('backgroundColor' in ds) chart.data.datasets[i].backgroundColor = ds.backgroundColor as any;
         if ('borderColor' in ds) chart.data.datasets[i].borderColor = ds.borderColor as any;
@@ -1129,6 +1193,15 @@ export default function GexPage() {
                 {w === 'all' ? 'Full Session' : `${w}m`}
               </button>
             ))}
+          </div>
+
+          <div
+            title="Dove la somma cumulata del GEX per strike cambia segno: sopra i dealer risultano lunghi di gamma (movimento smorzato), sotto corti (accelerato). Approssimazione sul profilo di adesso, sulla base scelta."
+            className="flex items-center gap-2 bg-slate-900/60 px-3 py-1.5 rounded-lg border border-slate-800 text-xs font-semibold"
+          >
+            <span className="w-4 border-t-2 border-dashed border-amber-500" />
+            <span className="text-slate-400">Zero Gamma</span>
+            <span className="font-mono text-amber-400">{zeroGammaOra != null ? `~${zeroGammaOra.toFixed(0)}` : 'n/d'}</span>
           </div>
         </div>
 
