@@ -107,6 +107,14 @@ ASS_MIN_CONTRATTI = 30
 ASS_MULTIPLO_CODA = 2.0
 # ...e il livello ancora li' dopo tanto dall'ultimo trade.
 ASS_TENUTA_SEC = 1.0
+# Raffiche (misura, non ancora rilevamento): eventi di matching nello stesso
+# verso arrivati entro tanti millisecondi l'uno dalla fine del precedente. Il
+# metodo degli stop qui sopra presume che la CME metta gli stop scattati
+# nello stesso evento del trade che li fa scattare, ma su Rithmic ogni evento
+# ha un solo aggressore (diag "multi" sempre 0, 05/10/2026): gli stop
+# arrivano come eventi separati subito dopo. Si contano le raffiche con tre
+# soglie per scegliere quella che corrisponde a Stops & Icebergs di Bookmap.
+RAFFICA_SOGLIE_MS = (2, 5, 20)
 
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
@@ -120,11 +128,12 @@ esecuzione = {}     # alias -> l'evento di matching in corso: aggressori per ID,
 finestre_ass = {}   # alias -> {(compra, livello): finestra di volume aggressivo a quel prezzo}
 eventi = {}         # alias -> {"stop": [...], "abs": [...]} del secondo in corso
 diag = {}           # alias -> contatori del secondo per verificare il metodo degli stop
+raffiche = {}       # alias -> {soglia ms: raffica in corso o None}
 # Tutti i dizionari per alias, da svuotare quando uno strumento si stacca. In
 # una costante e non nella riga del `for`: un'intestazione di blocco spezzata
 # su due righe manda in crash l'editor di Bookmap (NullPointerException in
 # PythonFoldParser, 05/10/2026), che non apre piu' il file.
-STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, esecuzione, finestre_ass, eventi, diag)
+STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, esecuzione, finestre_ass, eventi, diag, raffiche)
 
 coda = queue.Queue()
 req_id = 0
@@ -147,8 +156,9 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     statistiche[alias] = statistiche_azzerate()
     esecuzione[alias] = None
     finestre_ass[alias] = {}
-    eventi[alias] = {"stop": [], "abs": []}
+    eventi[alias] = {"stop": [], "abs": [], "raff": []}
     diag[alias] = diag_azzerata()
+    raffiche[alias] = {soglia: None for soglia in RAFFICA_SOGLIE_MS}
 
     req_id += 1
     bm.subscribe_to_depth(addon, alias, req_id)
@@ -265,11 +275,61 @@ def handle_depth_info(addon, alias, is_bid, price, size):
 
 
 def diag_azzerata():
-    return {"tr": 0, "id": 0, "ex": 0, "multi": 0}
+    d = {"tr": 0, "id": 0, "ex": 0, "multi": 0}
+    for soglia in RAFFICA_SOGLIE_MS:
+        d[f"r{soglia}"] = 0
+    return d
 
 
 def orario(epoch):
     return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
+
+
+def orario_ms(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%H:%M:%S.%f")[:-3]
+
+
+def accoda_a_raffica(alias, ev):
+    """Un evento di matching chiuso entra nella raffica in corso di ogni soglia, o ne apre una nuova."""
+    for soglia in RAFFICA_SOGLIE_MS:
+        r = raffiche[alias][soglia]
+        vicino = r is not None and r["buy"] == ev["buy"] and (ev["pc0"] - r["pc_fine"]) * 1000 <= soglia
+        if vicino:
+            r["n"] += 1
+            r["ids"] |= ev["ids"]
+            r["ignoti"] += ev["ignoti"]
+            r["dopo"] += ev["size"]
+            r["estremo"] = max(r["estremo"], ev["estremo"]) if ev["buy"] else min(r["estremo"], ev["estremo"])
+            r["pc_fine"] = ev["pc1"]
+            continue
+        chiudi_raffica(alias, soglia)
+        raffiche[alias][soglia] = {"buy": ev["buy"], "t": ev["t"], "pc_fine": ev["pc1"], "n": 1, "ids": set(ev["ids"]), "ignoti": ev["ignoti"], "inizio": ev["inizio"], "estremo": ev["estremo"], "primo": ev["size"], "dopo": 0.0}
+
+
+def chiudi_raffica(alias, soglia):
+    """Una raffica conta se ha almeno due eventi, due aggressori diversi e ha spostato il prezzo di un tick."""
+    r = raffiche[alias][soglia]
+    raffiche[alias][soglia] = None
+    if r is None or r["n"] < 2:
+        return
+    aggressori = len(r["ids"]) + r["ignoti"]
+    verso = 1 if r["buy"] else -1
+    tick = (r["estremo"] - r["inizio"]) * verso
+    if aggressori < 2 or tick < 1:
+        return
+    diag[alias][f"r{soglia}"] += 1
+    pips = strumenti[alias]["pips"]
+    # [soglia ms, prezzo d'inizio, contratti dopo il primo evento, verso, orario al ms, eventi, aggressori, tick]
+    eventi[alias]["raff"].append([soglia, round(r["inizio"] * pips, 2), round(r["dopo"]), verso, orario_ms(r["t"]), r["n"], aggressori, tick])
+
+
+def scadi_raffiche(alias):
+    """Chiude le raffiche ferme da piu' della loro soglia, senza aspettare il prossimo evento."""
+    adesso = time.perf_counter()
+    for soglia in RAFFICA_SOGLIE_MS:
+        r = raffiche[alias][soglia]
+        if r is not None and (adesso - r["pc_fine"]) * 1000 > soglia:
+            chiudi_raffica(alias, soglia)
 
 
 def livello_trade(alias, price):
@@ -292,6 +352,13 @@ def chiudi_esecuzione(alias):
         return
     d = diag[alias]
     d["ex"] += 1
+    try:
+        tutti = [lv for a in b["aggr"].values() for lv in a["livelli"]]
+        compra = b["aggr"][b["ordine"][0]]["buy"]
+        ev = {"buy": compra, "t": b["t"], "pc0": b["pc0"], "pc1": time.perf_counter(), "ids": {k for k in b["ordine"] if k != "?"}, "ignoti": 1 if "?" in b["aggr"] else 0, "inizio": tutti[0], "estremo": max(tutti) if compra else min(tutti), "size": sum(a["size"] for a in b["aggr"].values())}
+        accoda_a_raffica(alias, ev)
+    except Exception as e:
+        print(f"Raffiche: {e}", flush=True)
     ordine = b["ordine"]
     if len(ordine) < 2 or "?" in b["aggr"]:
         return
@@ -371,7 +438,7 @@ def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start,
         if id_aggr:
             d["id"] += 1
         if is_execution_start or esecuzione.get(alias) is None:
-            esecuzione[alias] = {"t": adesso, "aggr": {}, "ordine": []}
+            esecuzione[alias] = {"t": adesso, "pc0": time.perf_counter(), "aggr": {}, "ordine": []}
         b = esecuzione[alias]
         # Senza ID non si distinguono gli aggressori: tutto finisce sotto "?" e non si rileva nessuno stop.
         chiave = id_aggr or "?"
@@ -415,6 +482,7 @@ def on_interval(addon, alias):
     aggiorna_statistiche(alias, fotografia(libro, info))
     try:
         valuta_assorbimenti(alias, time.time())
+        scadi_raffiche(alias)
     except Exception as e:
         print(f"Assorbimenti: {e}", flush=True)
     adesso = int(time.time())
@@ -453,11 +521,12 @@ def on_interval(addon, alias):
         **riassunto_statistiche(statistiche[alias]),
         "stop": eventi[alias]["stop"],
         "abs": eventi[alias]["abs"],
+        "raff": eventi[alias]["raff"],
         "diag": diag[alias],
     }
     flusso[alias] = azzerato()
     statistiche[alias] = statistiche_azzerate()
-    eventi[alias] = {"stop": [], "abs": []}
+    eventi[alias] = {"stop": [], "abs": [], "raff": []}
     diag[alias] = diag_azzerata()
 
     if coda.qsize() < MAX_IN_CODA:
