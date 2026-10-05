@@ -70,17 +70,12 @@ type ProfiloRiga = { strike: number; gex: number; gexOi: number };
 
 function livelliGamma(profilo: ProfiloRiga[], campo: 'gex' | 'gexOi') {
     const ordinato = [...profilo].sort((a, b) => a.strike - b.strike);
-    // Zero Gamma: dove la somma cumulativa per strike cambia segno.
-    let cum = 0;
-    let zero: number | null = null;
-    for (const p of ordinato) {
-        const prima = cum;
-        cum += p[campo];
-        if (prima !== 0 && Math.sign(prima) !== Math.sign(cum)) zero = p.strike;
-    }
+    // Niente Zero Gamma: con le sole 0DTE e 37 strike attorno all'ATM il
+    // livello non si puo' calcolare in modo affidabile (tolto da tutte le
+    // pagine il 05/10/2026), e al modello arrivava un numero sbagliato.
+    const cum = ordinato.reduce((s, p) => s + p[campo], 0);
     const perValore = [...ordinato].sort((a, b) => b[campo] - a[campo]);
     return {
-        zeroGamma: zero,
         totale: r(cum, 0),
         maggioriPositivi: perValore.slice(0, 3).filter((p) => p[campo] > 0).map((p) => ({ strike: p.strike, valore: r(p[campo], 0) })),
         maggioriNegativi: perValore.slice(-3).reverse().filter((p) => p[campo] < 0).map((p) => ({ strike: p.strike, valore: r(p[campo], 0) })),

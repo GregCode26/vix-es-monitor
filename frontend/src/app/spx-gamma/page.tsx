@@ -18,7 +18,6 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
-import { zeroGamma } from '@/lib/zeroGamma';
 
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false });
 
@@ -221,7 +220,7 @@ export default function SpxGammaPage() {
 
     /** Livelli di riferimento, tutti dedotti dal profilo vero. */
     const livelli = useMemo(() => {
-        if (profile.length === 0) return { maxPos: null, maxNeg: null, flip: null };
+        if (profile.length === 0) return { maxPos: null, maxNeg: null };
         let maxPos: ProfileRow | null = null;
         let maxNeg: ProfileRow | null = null;
         for (const r of profile) {
@@ -231,7 +230,6 @@ export default function SpxGammaPage() {
         return {
             maxPos: maxPos?.strike ?? null,
             maxNeg: maxNeg?.strike ?? null,
-            flip: zeroGamma(profile, chiave),
         };
     }, [profile, chiave]);
 
@@ -283,13 +281,6 @@ export default function SpxGammaPage() {
                 yAxis: livelli.maxNeg,
                 label: { formatter: `Major Neg Gamma ${livelli.maxNeg}`, position: 'insideStartBottom', color: '#f87171' },
                 lineStyle: { color: '#f87171', type: 'dashed', width: 1 },
-            });
-        }
-        if (livelli.flip != null) {
-            markLines.push({
-                yAxis: livelli.flip,
-                label: { formatter: `Zero Gamma ~${livelli.flip}`, position: 'insideStartTop', color: '#f59e0b' },
-                lineStyle: { color: '#f59e0b', type: 'dashed', width: 1 },
             });
         }
 
@@ -552,8 +543,9 @@ export default function SpxGammaPage() {
                 <p className="mt-2 text-[11px] text-slate-500">
                     Gamma dai modelGreeks IBKR sugli stessi contratti che il poller dei volumi
                     sottoscrive. Il segno (call positive, put negative) e&apos; l&apos;euristica standard
-                    &quot;dealer lunghi di call, corti di put&quot;, non un dato osservato; lo Zero Gamma e&apos;
-                    l&apos;inversione della somma cumulata, un&apos;approssimazione del livello di flip.
+                    &quot;dealer lunghi di call, corti di put&quot;, non un dato osservato. Lo Zero Gamma non si
+                    mostra: il poller segue solo le 0DTE e 37 strike attorno all&apos;ATM, e con la catena
+                    incompleta il livello non si puo&apos; calcolare in modo affidabile.
                 </p>
             </div>
         </div>
