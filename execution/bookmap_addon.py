@@ -8,7 +8,7 @@ scegliendo questo file) e poi si attiva sul grafico di ES.
 Ogni secondo manda un campione a POST /api/bookmap del dashboard locale:
 
     {"date", "t", "alias", "price", "bid", "ask", "buy", "sell", "bidLiq", "askLiq", "levels", "book",
-     "addB", "remB", "addA", "remA", "ofi", "cB", "cA", "q1B", "q1A", "qm", "sp1", "stop", "abs", "diag"}
+     "addB", "remB", "addA", "remA", "ofi", "cB", "cA", "q1B", "q1A", "qm", "sp1", "abs"}
 
 `buy`/`sell` sono i contratti aggrediti in quel secondo, non il cumulato: il
 CVD lo somma la route sull'intera giornata, cosi' riavviare l'add-on o
@@ -46,27 +46,22 @@ a normalizzare l'OFI), `sp1` la quota di fotografie con lo spread a un tick:
 vicino a 1 e' un mercato "large tick", con code spesse e spread schiacciato.
 Tutti medie delle fotografie del secondo.
 
-`stop` e `abs` sono gli eventi del secondo, [[prezzo, contratti, verso, "HH:MM:SS"], ...]:
+`abs` sono gli assorbimenti del secondo, [[prezzo, contratti, verso, "HH:MM:SS"], ...]:
+tanto volume aggressivo su un solo prezzo, almeno ASS_MULTIPLO_CODA volte la
+coda che c'era, e il livello che regge (il migliore resta li') per
+ASS_TENUTA_SEC dopo l'ultimo trade. Verso +1 = compratori passivi che
+assorbono le vendite (sul bid), -1 = venditori passivi che assorbono gli
+acquisti (sull'ask). La soglia e' bassa apposta: la pagina filtra per
+dimensione, cosi' la si regola guardando il grafico senza ricostruire
+l'add-on.
 
-- stop: ordini stop scattati. Quando un trade fa scattare degli stop, la CME
-  li esegue nello stesso evento di matching (tra is_execution_start e
-  is_execution_end), come ordini aggressori DIVERSI da quello che li ha
-  fatti scattare. Gli aggressori dopo il primo, nello stesso verso, sono gli
-  stop. Prezzo = il primo livello che hanno colpito; verso +1 = stop in
-  acquisto (scattati salendo), -1 in vendita. Funziona solo se il feed manda
-  l'ID dell'ordine aggressore: lo dice `diag`.
-- abs: assorbimenti. Tanto volume aggressivo su un solo prezzo, almeno
-  ASS_MULTIPLO_CODA volte la coda che c'era, e il livello che regge (il
-  migliore resta li') per ASS_TENUTA_SEC dopo l'ultimo trade. Verso +1 =
-  compratori passivi che assorbono le vendite (sul bid), -1 = venditori
-  passivi che assorbono gli acquisti (sull'ask).
-
-Le soglie qui sono basse apposta: la pagina filtra per dimensione, cosi' le
-si regola guardando il grafico senza ricostruire l'add-on.
-
-`diag` (contatori del secondo) serve a verificare il metodo degli stop sul
-feed vero: trade, trade con ID aggressore, esecuzioni, esecuzioni con piu'
-aggressori.
+Gli stop non ci sono piu' (05/10/2026). Si cercavano come aggressori diversi
+nello stesso evento di matching (is_execution_start..is_execution_end), ma su
+Rithmic ogni evento ha un solo aggressore: in 126 mila eventi nessuno ne
+aveva due. Il ripiego -- raffiche di eventi nello stesso verso a pochi
+millisecondi l'uno dall'altro -- confrontato con Stops & Icebergs di Bookmap
+mescolava stop, riempimenti di iceberg e ordini grossi spezzati: quell'add-on
+vede il book ordine per ordine, dai soli trade non si separano.
 
 Attenzione nel modificare questo file: l'editor di Bookmap va in crash su
 un'intestazione di blocco (for/if/def...) spezzata su piu' righe.
@@ -98,8 +93,6 @@ LIVELLI_OFI = 15
 # Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
 # contratti aggiunti in un colpo. Per questi secondi non si conta.
 AVVIO_SENZA_FLUSSO_SEC = 3
-# Stop: si scartano gli eventi sotto questi contratti (la pagina filtra ancora).
-STOP_MIN_CONTRATTI = 1
 # Assorbimento: volume aggressivo a un prezzo dentro questa finestra...
 ASS_FINESTRA_SEC = 5.0
 # ...almeno tanti contratti e tante volte la coda iniziale...
@@ -107,14 +100,6 @@ ASS_MIN_CONTRATTI = 30
 ASS_MULTIPLO_CODA = 2.0
 # ...e il livello ancora li' dopo tanto dall'ultimo trade.
 ASS_TENUTA_SEC = 1.0
-# Raffiche (misura, non ancora rilevamento): eventi di matching nello stesso
-# verso arrivati entro tanti millisecondi l'uno dalla fine del precedente. Il
-# metodo degli stop qui sopra presume che la CME metta gli stop scattati
-# nello stesso evento del trade che li fa scattare, ma su Rithmic ogni evento
-# ha un solo aggressore (diag "multi" sempre 0, 05/10/2026): gli stop
-# arrivano come eventi separati subito dopo. Si contano le raffiche con tre
-# soglie per scegliere quella che corrisponde a Stops & Icebergs di Bookmap.
-RAFFICA_SOGLIE_MS = (2, 5, 20)
 
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
@@ -124,16 +109,13 @@ conta_da = {}       # alias -> da quando (epoch) contare aggiunte e rimozioni
 ultimo_secondo = {}  # alias -> secondo (epoch) dell'ultimo campione emesso
 foto_prima = {}     # alias -> ultima fotografia dei primi LIVELLI_OFI livelli, per l'OFI
 statistiche = {}    # alias -> OFI per livello e medie del secondo in corso
-esecuzione = {}     # alias -> l'evento di matching in corso: aggressori per ID, in ordine di arrivo
 finestre_ass = {}   # alias -> {(compra, livello): finestra di volume aggressivo a quel prezzo}
-eventi = {}         # alias -> {"stop": [...], "abs": [...]} del secondo in corso
-diag = {}           # alias -> contatori del secondo per verificare il metodo degli stop
-raffiche = {}       # alias -> {soglia ms: raffica in corso o None}
+eventi = {}         # alias -> {"abs": [...]} del secondo in corso
 # Tutti i dizionari per alias, da svuotare quando uno strumento si stacca. In
 # una costante e non nella riga del `for`: un'intestazione di blocco spezzata
 # su due righe manda in crash l'editor di Bookmap (NullPointerException in
 # PythonFoldParser, 05/10/2026), che non apre piu' il file.
-STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, esecuzione, finestre_ass, eventi, diag, raffiche)
+STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, finestre_ass, eventi)
 
 coda = queue.Queue()
 req_id = 0
@@ -154,11 +136,8 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     ultimo_secondo[alias] = int(time.time())
     foto_prima[alias] = None
     statistiche[alias] = statistiche_azzerate()
-    esecuzione[alias] = None
     finestre_ass[alias] = {}
-    eventi[alias] = {"stop": [], "abs": [], "raff": []}
-    diag[alias] = diag_azzerata()
-    raffiche[alias] = {soglia: None for soglia in RAFFICA_SOGLIE_MS}
+    eventi[alias] = {"abs": []}
 
     req_id += 1
     bm.subscribe_to_depth(addon, alias, req_id)
@@ -274,62 +253,8 @@ def handle_depth_info(addon, alias, is_bid, price, size):
         f["remB" if is_bid else "remA"] -= variazione
 
 
-def diag_azzerata():
-    d = {"tr": 0, "id": 0, "ex": 0, "multi": 0}
-    for soglia in RAFFICA_SOGLIE_MS:
-        d[f"r{soglia}"] = 0
-    return d
-
-
 def orario(epoch):
     return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
-
-
-def orario_ms(epoch):
-    return datetime.fromtimestamp(epoch).strftime("%H:%M:%S.%f")[:-3]
-
-
-def accoda_a_raffica(alias, ev):
-    """Un evento di matching chiuso entra nella raffica in corso di ogni soglia, o ne apre una nuova."""
-    for soglia in RAFFICA_SOGLIE_MS:
-        r = raffiche[alias][soglia]
-        vicino = r is not None and r["buy"] == ev["buy"] and (ev["pc0"] - r["pc_fine"]) * 1000 <= soglia
-        if vicino:
-            r["n"] += 1
-            r["ids"] |= ev["ids"]
-            r["ignoti"] += ev["ignoti"]
-            r["dopo"] += ev["size"]
-            r["estremo"] = max(r["estremo"], ev["estremo"]) if ev["buy"] else min(r["estremo"], ev["estremo"])
-            r["pc_fine"] = ev["pc1"]
-            continue
-        chiudi_raffica(alias, soglia)
-        raffiche[alias][soglia] = {"buy": ev["buy"], "t": ev["t"], "pc_fine": ev["pc1"], "n": 1, "ids": set(ev["ids"]), "ignoti": ev["ignoti"], "inizio": ev["inizio"], "estremo": ev["estremo"], "primo": ev["size"], "dopo": 0.0}
-
-
-def chiudi_raffica(alias, soglia):
-    """Una raffica conta se ha almeno due eventi, due aggressori diversi e ha spostato il prezzo di un tick."""
-    r = raffiche[alias][soglia]
-    raffiche[alias][soglia] = None
-    if r is None or r["n"] < 2:
-        return
-    aggressori = len(r["ids"]) + r["ignoti"]
-    verso = 1 if r["buy"] else -1
-    tick = (r["estremo"] - r["inizio"]) * verso
-    if aggressori < 2 or tick < 1:
-        return
-    diag[alias][f"r{soglia}"] += 1
-    pips = strumenti[alias]["pips"]
-    # [soglia ms, prezzo d'inizio, contratti dopo il primo evento, verso, orario al ms, eventi, aggressori, tick]
-    eventi[alias]["raff"].append([soglia, round(r["inizio"] * pips, 2), round(r["dopo"]), verso, orario_ms(r["t"]), r["n"], aggressori, tick])
-
-
-def scadi_raffiche(alias):
-    """Chiude le raffiche ferme da piu' della loro soglia, senza aspettare il prossimo evento."""
-    adesso = time.perf_counter()
-    for soglia in RAFFICA_SOGLIE_MS:
-        r = raffiche[alias][soglia]
-        if r is not None and (adesso - r["pc_fine"]) * 1000 > soglia:
-            chiudi_raffica(alias, soglia)
 
 
 def livello_trade(alias, price):
@@ -342,35 +267,6 @@ def livello_trade(alias, price):
     if migliori_bid and abs(price - migliori_bid[0]) > 1000:
         return int(round(price / strumenti[alias]["pips"]))
     return int(round(price))
-
-
-def chiudi_esecuzione(alias):
-    """Fine di un evento di matching: gli aggressori dopo il primo, nello stesso verso, sono stop scattati."""
-    b = esecuzione.get(alias)
-    esecuzione[alias] = None
-    if not b:
-        return
-    d = diag[alias]
-    d["ex"] += 1
-    try:
-        tutti = [lv for a in b["aggr"].values() for lv in a["livelli"]]
-        compra = b["aggr"][b["ordine"][0]]["buy"]
-        ev = {"buy": compra, "t": b["t"], "pc0": b["pc0"], "pc1": time.perf_counter(), "ids": {k for k in b["ordine"] if k != "?"}, "ignoti": 1 if "?" in b["aggr"] else 0, "inizio": tutti[0], "estremo": max(tutti) if compra else min(tutti), "size": sum(a["size"] for a in b["aggr"].values())}
-        accoda_a_raffica(alias, ev)
-    except Exception as e:
-        print(f"Raffiche: {e}", flush=True)
-    ordine = b["ordine"]
-    if len(ordine) < 2 or "?" in b["aggr"]:
-        return
-    d["multi"] += 1
-    primo = b["aggr"][ordine[0]]
-    stop = [b["aggr"][i] for i in ordine[1:] if b["aggr"][i]["buy"] == primo["buy"]]
-    totale = sum(a["size"] for a in stop)
-    if not stop or totale < STOP_MIN_CONTRATTI:
-        return
-    pips = strumenti[alias]["pips"]
-    eventi[alias]["stop"].append([round(stop[0]["livelli"][0] * pips, 2), round(totale), 1 if primo["buy"] else -1,
-                                  orario(b["t"])])
 
 
 def registra_assorbimento(alias, livello, compra, contratti, adesso):
@@ -428,31 +324,11 @@ def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start,
     else:
         f["sell"] += contratti
 
-    # Stop e assorbimenti: un errore qui non deve fermare CVD e liquidita'.
+    # Assorbimenti: un errore qui non deve fermare CVD e liquidita'.
     try:
-        adesso = time.time()
-        livello = livello_trade(alias, price)
-        d = diag[alias]
-        d["tr"] += 1
-        id_aggr = aggressor_order_id if aggressor_order_id not in (None, "", "null", "None") else None
-        if id_aggr:
-            d["id"] += 1
-        if is_execution_start or esecuzione.get(alias) is None:
-            esecuzione[alias] = {"t": adesso, "pc0": time.perf_counter(), "aggr": {}, "ordine": []}
-        b = esecuzione[alias]
-        # Senza ID non si distinguono gli aggressori: tutto finisce sotto "?" e non si rileva nessuno stop.
-        chiave = id_aggr or "?"
-        if chiave not in b["aggr"]:
-            b["aggr"][chiave] = {"buy": is_bid, "size": 0.0, "livelli": []}
-            b["ordine"].append(chiave)
-        a = b["aggr"][chiave]
-        a["size"] += contratti
-        a["livelli"].append(livello)
-        if is_execution_end:
-            chiudi_esecuzione(alias)
-        registra_assorbimento(alias, livello, is_bid, contratti, adesso)
+        registra_assorbimento(alias, livello_trade(alias, price), is_bid, contratti, time.time())
     except Exception as e:
-        print(f"Stop/assorbimenti: {e}", flush=True)
+        print(f"Assorbimenti: {e}", flush=True)
 
 
 
@@ -482,7 +358,6 @@ def on_interval(addon, alias):
     aggiorna_statistiche(alias, fotografia(libro, info))
     try:
         valuta_assorbimenti(alias, time.time())
-        scadi_raffiche(alias)
     except Exception as e:
         print(f"Assorbimenti: {e}", flush=True)
     adesso = int(time.time())
@@ -519,15 +394,11 @@ def on_interval(addon, alias):
         "addA": round(f["addA"]),
         "remA": round(f["remA"]),
         **riassunto_statistiche(statistiche[alias]),
-        "stop": eventi[alias]["stop"],
         "abs": eventi[alias]["abs"],
-        "raff": eventi[alias]["raff"],
-        "diag": diag[alias],
     }
     flusso[alias] = azzerato()
     statistiche[alias] = statistiche_azzerate()
-    eventi[alias] = {"stop": [], "abs": [], "raff": []}
-    diag[alias] = diag_azzerata()
+    eventi[alias] = {"abs": []}
 
     if coda.qsize() < MAX_IN_CODA:
         coda.put(campione)

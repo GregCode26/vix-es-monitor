@@ -47,25 +47,17 @@ interface Campione {
     q1A?: number | null;
     qm?: number | null;
     sp1?: number | null;
-    stop?: unknown;
     abs?: unknown;
-    diag?: Diagnostica;
 }
 
 /**
- * Un evento rilevato dall'add-on: [prezzo, contratti, verso, 'HH:MM:SS'].
- * Stop: verso +1 = stop in acquisto (scattati salendo), -1 in vendita.
- * Assorbimento: +1 = compratori passivi che assorbono le vendite, -1 il contrario.
+ * Un assorbimento rilevato dall'add-on: [prezzo, contratti, verso, 'HH:MM:SS'].
+ * Verso +1 = compratori passivi che assorbono le vendite, -1 il contrario.
+ * Gli stop non ci sono piu' (05/10/2026): dai soli trade non si separano da
+ * iceberg e ordini spezzati. Le righe salvate prima li hanno ancora nel file,
+ * e qui si ignorano.
  */
 export type Evento = [number, number, number, string];
-
-/** Contatori del secondo per verificare il rilevamento degli stop sul feed vero. */
-export interface Diagnostica {
-    tr: number;
-    id: number;
-    ex: number;
-    multi: number;
-}
 
 /** Ordini limit per livello: [prezzo, contratti], solo i livelli sopra la soglia dell'add-on. */
 export interface Book {
@@ -112,10 +104,8 @@ export interface BookmapPoint {
     qm: number | null;
     /** Quota del secondo con lo spread a un tick. */
     sp1: number | null;
-    /** Stop scattati e assorbimenti rilevati in quel secondo; null prima dell'add-on che li cerca. */
-    stop: Evento[] | null;
+    /** Assorbimenti rilevati in quel secondo; null prima dell'add-on che li cerca. */
     abs: Evento[] | null;
-    diag: Diagnostica | null;
 }
 
 interface Giornata {
@@ -183,9 +173,7 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         q1A: numeroONull(c.q1A),
         qm: numeroONull(c.qm),
         sp1: numeroONull(c.sp1),
-        stop: eventi(c.stop),
         abs: eventi(c.abs),
-        diag: c.diag && typeof c.diag === 'object' ? c.diag : null,
     };
 
     g.points.push(p);

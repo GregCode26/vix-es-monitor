@@ -38,34 +38,34 @@ interface BookmapPoint {
   q1A: number | null;
   qm: number | null;
   sp1: number | null;
-  /** Stop scattati e assorbimenti del secondo, [prezzo, contratti, verso, 'HH:MM:SS']; null prima dell'add-on che li cerca. */
-  stop: [number, number, number, string][] | null;
+  /** Assorbimenti del secondo, [prezzo, contratti, verso, 'HH:MM:SS']; null prima dell'add-on che li cerca. */
   abs: [number, number, number, string][] | null;
-  /** Contatori per verificare il rilevamento degli stop: trade, trade con ID aggressore, esecuzioni, esecuzioni con piu' aggressori. */
-  diag: { tr: number; id: number; ex: number; multi: number } | null;
 }
 
-/** Uno stop scattato o un assorbimento, sull'asse del tempo del grafico. */
+/**
+ * Un assorbimento, sull'asse del tempo del grafico.
+ *
+ * Gli stop non ci sono piu' (05/10/2026): l'add-on li cercava come aggressori
+ * diversi nello stesso evento di matching, cosa che su Rithmic non succede
+ * mai, e il ripiego sulle raffiche di aggressori, confrontato con Stops &
+ * Icebergs di Bookmap, mescolava stop, iceberg e ordini spezzati. Quell'add-on
+ * vede il book ordine per ordine; dai soli trade gli stop non si separano.
+ */
 interface Evento {
   x: number;
   prezzo: number;
   contratti: number;
-  /** Stop: +1 in acquisto (scattati salendo), -1 in vendita. Assorbimento: +1 compratori che assorbono, -1 venditori. */
+  /** +1 compratori passivi che assorbono le vendite, -1 venditori che assorbono gli acquisti. */
   verso: number;
 }
 
-/** Quanto a lungo la linea di uno stop resta sul grafico dopo che e' scattato, in secondi. */
-const STOP_DURATA_SEC = 600;
-const ARANCIO_STOP = '#fb923c';
-const FUCSIA_STOP = '#e879f9';
-type MinStop = '1' | '5' | '10' | '25';
 type MinAss = '30' | '60' | '100' | '200';
 
 /** Tutti gli eventi della sessione in memoria, sopra la dimensione scelta. */
-function eventiDi(pts: BookmapPoint[], campo: 'stop' | 'abs', minimo: number): Evento[] {
+function eventiDi(pts: BookmapPoint[], minimo: number): Evento[] {
   const out: Evento[] = [];
   for (const p of pts) {
-    for (const [prezzo, contratti, verso, t] of p[campo] ?? []) {
+    for (const [prezzo, contratti, verso, t] of p.abs ?? []) {
       if (contratti >= minimo) out.push({ x: secondi(t), prezzo, contratti, verso });
     }
   }
@@ -664,9 +664,7 @@ export default function BookmapPage() {
   const [vistaBook, setVistaBook] = useState<VistaBook>('mlofi');
   const [livelliOfi, setLivelliOfi] = useState<LivelliOfi>('10');
   const [durataMin, setDurataMin] = useState<DurataMin>('5');
-  const [mostraStop, setMostraStop] = useState(true);
   const [mostraAss, setMostraAss] = useState(true);
-  const [minStop, setMinStop] = useState<MinStop>('5');
   const [minAss, setMinAss] = useState<MinAss>('60');
 
   /** L'ultimo OFI %, calcolato in `applica` insieme alla linea. */
@@ -707,12 +705,10 @@ export default function BookmapPage() {
   const vistaBookRef = useRef<VistaBook>('mlofi');
   const livelliOfiRef = useRef<LivelliOfi>('10');
   const durataMinRef = useRef<DurataMin>('5');
-  const mostraStopRef = useRef(true);
   const mostraAssRef = useRef(true);
-  const minStopRef = useRef<MinStop>('5');
   const minAssRef = useRef<MinAss>('60');
-  /** Stop e assorbimenti da disegnare, gia' filtrati per dimensione. */
-  const eventiRef = useRef<{ stop: Evento[]; abs: Evento[] }>({ stop: [], abs: [] });
+  /** Assorbimenti da disegnare, gia' filtrati per dimensione. */
+  const eventiRef = useRef<Evento[]>([]);
   const segmentiRef = useRef<Segmento[]>([]);
   /** Secondi visibili scelti con la rotella in LIVE; null = quelli della finestra selezionata. */
   const ampiezzaRef = useRef<number | null>(null);
@@ -889,10 +885,7 @@ export default function BookmapPage() {
     // CVD spento: linea nascosta, asse destro vuoto ma largo uguale, cosi' i
     // due grafici restano allineati sul tempo.
     segmentiRef.current = mostraOrdiniRef.current ? segmentiBook(pts, xs, sogliaRef.current, Number(durataMinRef.current)) : [];
-    eventiRef.current = {
-      stop: mostraStopRef.current ? eventiDi(pts, 'stop', Number(minStopRef.current)) : [],
-      abs: mostraAssRef.current ? eventiDi(pts, 'abs', Number(minAssRef.current)) : [],
-    };
+    eventiRef.current = mostraAssRef.current ? eventiDi(pts, Number(minAssRef.current)) : [];
 
     const cvdAcceso = mostraCvdRef.current;
     cp.data.datasets[1].hidden = !cvdAcceso;
@@ -1144,22 +1137,18 @@ export default function BookmapPage() {
       };
 
       /**
-       * Stop e assorbimenti, sopra la linea del prezzo.
-       * - Stop: linea orizzontale al prezzo dove sono scattati, per
-       *   STOP_DURATA_SEC da quel momento; arancio in acquisto (scattati
-       *   salendo), fucsia in vendita; piu' spessa con piu' contratti.
-       * - Assorbimento: una palla, verde se i compratori passivi hanno
-       *   assorbito le vendite, rossa se i venditori hanno assorbito gli
-       *   acquisti; l'area e' proporzionale ai contratti.
+       * Assorbimenti, sopra la linea del prezzo: una palla, verde se i
+       * compratori passivi hanno assorbito le vendite, rossa se i venditori
+       * hanno assorbito gli acquisti; l'area e' proporzionale ai contratti.
        * Col mouse sopra, il riquadro con prezzo, contratti e ora.
        */
       const eventiPlugin = {
         id: 'eventi',
         afterDatasetsDraw: (chart: ChartJS) => {
-          const { stop, abs } = eventiRef.current;
+          const abs = eventiRef.current;
           const sx = chart.scales.x;
           const sy = chart.scales.yPrezzo;
-          if ((stop.length === 0 && abs.length === 0) || !sx || !sy) return;
+          if (abs.length === 0 || !sx || !sy) return;
           const { ctx, chartArea: a } = chart;
           const m = mirinoRef.current?.sorgente === chart ? mirinoRef.current : null;
           const mx = m ? sx.getPixelForValue(m.sec) : null;
@@ -1168,33 +1157,6 @@ export default function BookmapPage() {
           ctx.beginPath();
           ctx.rect(a.left, a.top, a.right - a.left, a.bottom - a.top);
           ctx.clip();
-
-          ctx.font = 'bold 9px Arial';
-          ctx.textBaseline = 'bottom';
-          ctx.textAlign = 'left';
-          for (const e of stop) {
-            const x1 = sx.getPixelForValue(e.x);
-            const x2 = sx.getPixelForValue(e.x + STOP_DURATA_SEC);
-            if (x2 < a.left || x1 > a.right) continue;
-            const y = sy.getPixelForValue(e.prezzo);
-            if (y < a.top || y > a.bottom) continue;
-            const colore = e.verso > 0 ? ARANCIO_STOP : FUCSIA_STOP;
-            ctx.strokeStyle = colore;
-            ctx.lineWidth = Math.min(4, 1.5 + Math.sqrt(e.contratti) / 4);
-            ctx.beginPath();
-            ctx.moveTo(x1, y);
-            ctx.lineTo(x2, y);
-            ctx.stroke();
-            ctx.fillStyle = colore;
-            ctx.fillText(`${e.verso > 0 ? '▲' : '▼'} STOP ${e.contratti}`, x1 + 2, y - 2);
-            if (m && mx != null && mx >= x1 - 4 && mx <= x2 && Math.abs(m.y - y) <= 5) {
-              sotto = {
-                testo: `Stop ${e.verso > 0 ? 'in acquisto' : 'in vendita'}: ${e.contratti} ct a ${e.prezzo.toFixed(2)} · ${orario(e.x)}`,
-                x: x1,
-                y,
-              };
-            }
-          }
 
           for (const e of abs) {
             const x = sx.getPixelForValue(e.x);
@@ -1864,21 +1826,12 @@ export default function BookmapPage() {
     rifaiOrdini();
   };
 
-  // Stop e assorbimenti: accesi o spenti e la dimensione minima, ricordati nel browser.
+  // Assorbimenti: accesi o spenti e la dimensione minima, ricordati nel browser.
   useEffect(() => {
     try {
-      if (localStorage.getItem('bookmap_stop') === 'off') {
-        mostraStopRef.current = false;
-        setMostraStop(false);
-      }
       if (localStorage.getItem('bookmap_ass') === 'off') {
         mostraAssRef.current = false;
         setMostraAss(false);
-      }
-      const ms = localStorage.getItem('bookmap_min_stop');
-      if (ms === '1' || ms === '5' || ms === '10' || ms === '25') {
-        minStopRef.current = ms;
-        setMinStop(ms);
       }
       const ma = localStorage.getItem('bookmap_min_ass');
       if (ma === '30' || ma === '60' || ma === '100' || ma === '200') {
@@ -1890,24 +1843,10 @@ export default function BookmapPage() {
     }
   }, []);
 
-  const cambiaMostraStop = () => {
-    mostraStopRef.current = !mostraStopRef.current;
-    setMostraStop(mostraStopRef.current);
-    salva('bookmap_stop', mostraStopRef.current ? 'on' : 'off');
-    applica();
-  };
-
   const cambiaMostraAss = () => {
     mostraAssRef.current = !mostraAssRef.current;
     setMostraAss(mostraAssRef.current);
     salva('bookmap_ass', mostraAssRef.current ? 'on' : 'off');
-    applica();
-  };
-
-  const cambiaMinStop = (v: MinStop) => {
-    minStopRef.current = v;
-    setMinStop(v);
-    salva('bookmap_min_stop', v);
     applica();
   };
 
@@ -1983,15 +1922,8 @@ export default function BookmapPage() {
     return v == null || Number.isNaN(v) ? null : v;
   };
   const conOfi = corrente?.ofi != null;
-  const conEventi = corrente?.stop != null;
-  // L'ultimo minuto di contatori: dice se il feed permette di riconoscere gli stop.
-  const diagMinuto = coda.slice(-60).reduce(
-    (t, p) => (p.diag ? { tr: t.tr + p.diag.tr, id: t.id + p.diag.id, ex: t.ex + p.diag.ex, multi: t.multi + p.diag.multi } : t),
-    { tr: 0, id: 0, ex: 0, multi: 0 },
-  );
-  const quotaId = diagMinuto.tr > 0 ? diagMinuto.id / diagMinuto.tr : null;
-  const contaOggi = (campo: 'stop' | 'abs', minimo: number) =>
-    points.reduce((n, p) => n + (p[campo] ?? []).filter((e) => e[1] >= minimo).length, 0);
+  const conEventi = corrente?.abs != null;
+  const contaOggi = (minimo: number) => points.reduce((n, p) => n + (p.abs ?? []).filter((e) => e[1] >= minimo).length, 0);
   const nLivelli = Number(livelliOfi);
   const letto = lettura(coda, finestraLettura, nLivelli, qmMediana, forzaOra);
 
@@ -2077,20 +2009,6 @@ export default function BookmapPage() {
                 opzioni={[['0', 'Tutti'], ['5', '5 s'], ['15', '15 s'], ['60', '60 s']]}
                 onChange={cambiaDurataMin}
               />
-            </div>
-            <div className="flex items-center gap-2" title="Ordini stop scattati: linee orizzontali al prezzo dove sono scattati (arancio in acquisto, fucsia in vendita)">
-              <button
-                onClick={cambiaMostraStop}
-                className={`px-2 py-0.5 rounded-lg font-bold border flex items-center gap-1.5 ${
-                  mostraStop ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
-                }`}
-              >
-                <span className="inline-block w-4 border-t-2" style={{ borderColor: mostraStop ? ARANCIO_STOP : '#475569' }} />
-                Stop {mostraStop ? 'ON' : 'OFF'}
-              </button>
-              <div className={mostraStop ? '' : 'opacity-40 pointer-events-none'}>
-                <Selettore titolo="≥" valore={minStop} opzioni={[['1', '1'], ['5', '5'], ['10', '10'], ['25', '25']]} onChange={cambiaMinStop} />
-              </div>
             </div>
             <div className="flex items-center gap-2" title="Assorbimenti: palle verdi se i compratori assorbono le vendite, rosse se i venditori assorbono gli acquisti; grandezza = contratti">
               <button
@@ -2191,20 +2109,11 @@ export default function BookmapPage() {
               <div className="text-[11px] text-slate-500 tabular-nums">
                 {!conEventi ? (
                   <span className="text-amber-200/80">
-                    Stop e assorbimenti: l&apos;add-on in Bookmap e&apos; la versione di prima. Copia execution/bookmap_addon.py in C:\Bookmap\Python\, ricostruiscilo e riattivalo.
+                    Assorbimenti: l&apos;add-on in Bookmap e&apos; la versione di prima. Copia execution/bookmap_addon.py in C:\Bookmap\Python\, ricostruiscilo e riattivalo.
                   </span>
                 ) : (
                   <>
-                    Oggi: <span style={{ color: ARANCIO_STOP }}>{contaOggi('stop', Number(minStop))} stop</span> ·{' '}
-                    <span style={{ color: VERDE }}>{contaOggi('abs', Number(minAss))} assorbimenti</span>
-                    {' · '}
-                    <span
-                      title="Gli stop si riconoscono solo se il feed manda l'ID dell'ordine aggressore: quando scattano, compaiono come aggressori diversi nella stessa esecuzione"
-                      className={quotaId === 0 ? 'text-amber-300' : ''}
-                    >
-                      feed (ultimo minuto): {quotaId == null ? '—' : `${Math.round(quotaId * 100)}% trade con ID aggressore`}, {diagMinuto.multi}/{diagMinuto.ex} esecuzioni con piu&apos; aggressori
-                      {quotaId === 0 && ' — senza ID gli stop non si possono riconoscere'}
-                    </span>
+                    Oggi: <span style={{ color: VERDE }}>{contaOggi(Number(minAss))} assorbimenti</span>
                   </>
                 )}
               </div>
