@@ -8,7 +8,7 @@ scegliendo questo file) e poi si attiva sul grafico di ES.
 Ogni secondo manda un campione a POST /api/bookmap del dashboard locale:
 
     {"date", "t", "alias", "price", "bid", "ask", "buy", "sell", "bidLiq", "askLiq", "levels", "book",
-     "addB", "remB", "addA", "remA", "ofi", "cB", "cA", "q1B", "q1A", "qm", "sp1"}
+     "addB", "remB", "addA", "remA", "ofi", "cB", "cA", "q1B", "q1A", "qm", "sp1", "stop", "abs", "diag"}
 
 `buy`/`sell` sono i contratti aggrediti in quel secondo, non il cumulato: il
 CVD lo somma la route sull'intera giornata, cosi' riavviare l'add-on o
@@ -46,6 +46,31 @@ a normalizzare l'OFI), `sp1` la quota di fotografie con lo spread a un tick:
 vicino a 1 e' un mercato "large tick", con code spesse e spread schiacciato.
 Tutti medie delle fotografie del secondo.
 
+`stop` e `abs` sono gli eventi del secondo, [[prezzo, contratti, verso, "HH:MM:SS"], ...]:
+
+- stop: ordini stop scattati. Quando un trade fa scattare degli stop, la CME
+  li esegue nello stesso evento di matching (tra is_execution_start e
+  is_execution_end), come ordini aggressori DIVERSI da quello che li ha
+  fatti scattare. Gli aggressori dopo il primo, nello stesso verso, sono gli
+  stop. Prezzo = il primo livello che hanno colpito; verso +1 = stop in
+  acquisto (scattati salendo), -1 in vendita. Funziona solo se il feed manda
+  l'ID dell'ordine aggressore: lo dice `diag`.
+- abs: assorbimenti. Tanto volume aggressivo su un solo prezzo, almeno
+  ASS_MULTIPLO_CODA volte la coda che c'era, e il livello che regge (il
+  migliore resta li') per ASS_TENUTA_SEC dopo l'ultimo trade. Verso +1 =
+  compratori passivi che assorbono le vendite (sul bid), -1 = venditori
+  passivi che assorbono gli acquisti (sull'ask).
+
+Le soglie qui sono basse apposta: la pagina filtra per dimensione, cosi' le
+si regola guardando il grafico senza ricostruire l'add-on.
+
+`diag` (contatori del secondo) serve a verificare il metodo degli stop sul
+feed vero: trade, trade con ID aggressore, esecuzioni, esecuzioni con piu'
+aggressori.
+
+Attenzione nel modificare questo file: l'editor di Bookmap va in crash su
+un'intestazione di blocco (for/if/def...) spezzata su piu' righe.
+
 I callback di Bookmap (trade e depth arrivano a migliaia al secondo su ES)
 non devono mai aspettare la rete: qui si mette il campione in una coda e lo
 spedisce un thread a parte. Se il dashboard e' spento i campioni restano in
@@ -73,6 +98,15 @@ LIVELLI_OFI = 15
 # Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
 # contratti aggiunti in un colpo. Per questi secondi non si conta.
 AVVIO_SENZA_FLUSSO_SEC = 3
+# Stop: si scartano gli eventi sotto questi contratti (la pagina filtra ancora).
+STOP_MIN_CONTRATTI = 1
+# Assorbimento: volume aggressivo a un prezzo dentro questa finestra...
+ASS_FINESTRA_SEC = 5.0
+# ...almeno tanti contratti e tante volte la coda iniziale...
+ASS_MIN_CONTRATTI = 30
+ASS_MULTIPLO_CODA = 2.0
+# ...e il livello ancora li' dopo tanto dall'ultimo trade.
+ASS_TENUTA_SEC = 1.0
 
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
@@ -82,6 +116,15 @@ conta_da = {}       # alias -> da quando (epoch) contare aggiunte e rimozioni
 ultimo_secondo = {}  # alias -> secondo (epoch) dell'ultimo campione emesso
 foto_prima = {}     # alias -> ultima fotografia dei primi LIVELLI_OFI livelli, per l'OFI
 statistiche = {}    # alias -> OFI per livello e medie del secondo in corso
+esecuzione = {}     # alias -> l'evento di matching in corso: aggressori per ID, in ordine di arrivo
+finestre_ass = {}   # alias -> {(compra, livello): finestra di volume aggressivo a quel prezzo}
+eventi = {}         # alias -> {"stop": [...], "abs": [...]} del secondo in corso
+diag = {}           # alias -> contatori del secondo per verificare il metodo degli stop
+# Tutti i dizionari per alias, da svuotare quando uno strumento si stacca. In
+# una costante e non nella riga del `for`: un'intestazione di blocco spezzata
+# su due righe manda in crash l'editor di Bookmap (NullPointerException in
+# PythonFoldParser, 05/10/2026), che non apre piu' il file.
+STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, esecuzione, finestre_ass, eventi, diag)
 
 coda = queue.Queue()
 req_id = 0
@@ -102,6 +145,10 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     ultimo_secondo[alias] = int(time.time())
     foto_prima[alias] = None
     statistiche[alias] = statistiche_azzerate()
+    esecuzione[alias] = None
+    finestre_ass[alias] = {}
+    eventi[alias] = {"stop": [], "abs": []}
+    diag[alias] = diag_azzerata()
 
     req_id += 1
     bm.subscribe_to_depth(addon, alias, req_id)
@@ -112,7 +159,7 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
 
 
 def handle_unsubscribe_instrument(addon, alias):
-    for d in (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche):
+    for d in STATO_PER_ALIAS:
         d.pop(alias, None)
     print(f"Staccato {alias}", flush=True)
 
@@ -217,6 +264,91 @@ def handle_depth_info(addon, alias, is_bid, price, size):
         f["remB" if is_bid else "remA"] -= variazione
 
 
+def diag_azzerata():
+    return {"tr": 0, "id": 0, "ex": 0, "multi": 0}
+
+
+def orario(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
+
+
+def livello_trade(alias, price):
+    """Il prezzo del trade in tick, come quelli del book.
+
+    Il modulo `bookmap` lo dichiara solo come float: se arriva gia' in tick e'
+    vicino al miglior bid del book, se arriva in prezzo reale no, e lo si
+    divide per il tick."""
+    migliori_bid, _ = bm.get_bbo(libri[alias])
+    if migliori_bid and abs(price - migliori_bid[0]) > 1000:
+        return int(round(price / strumenti[alias]["pips"]))
+    return int(round(price))
+
+
+def chiudi_esecuzione(alias):
+    """Fine di un evento di matching: gli aggressori dopo il primo, nello stesso verso, sono stop scattati."""
+    b = esecuzione.get(alias)
+    esecuzione[alias] = None
+    if not b:
+        return
+    d = diag[alias]
+    d["ex"] += 1
+    ordine = b["ordine"]
+    if len(ordine) < 2 or "?" in b["aggr"]:
+        return
+    d["multi"] += 1
+    primo = b["aggr"][ordine[0]]
+    stop = [b["aggr"][i] for i in ordine[1:] if b["aggr"][i]["buy"] == primo["buy"]]
+    totale = sum(a["size"] for a in stop)
+    if not stop or totale < STOP_MIN_CONTRATTI:
+        return
+    pips = strumenti[alias]["pips"]
+    eventi[alias]["stop"].append([round(stop[0]["livelli"][0] * pips, 2), round(totale), 1 if primo["buy"] else -1,
+                                  orario(b["t"])])
+
+
+def registra_assorbimento(alias, livello, compra, contratti, adesso):
+    """Accumula il volume aggressivo a un prezzo; la valutazione la fa valuta_assorbimenti."""
+    finestre = finestre_ass[alias]
+    chiave = (compra, livello)
+    f = finestre.get(chiave)
+    if f is not None and adesso - f["t0"] > ASS_FINESTRA_SEC:
+        valuta_finestra(alias, chiave, f)
+        f = None
+    if f is None:
+        # La coda passiva che c'era: quella di adesso piu' questo trade, perche'
+        # l'aggiornamento del book puo' arrivare prima del trade.
+        lato = libri[alias]["asks" if compra else "bids"]
+        coda_ora = lato.get(livello, 0) / strumenti[alias]["granularita"]
+        f = {"t0": adesso, "ultimo": adesso, "vol": 0.0, "coda0": coda_ora + contratti}
+        finestre[chiave] = f
+    f["vol"] += contratti
+    f["ultimo"] = adesso
+
+
+def valuta_finestra(alias, chiave, f):
+    finestre_ass[alias].pop(chiave, None)
+    compra, livello = chiave
+    if f["vol"] < max(ASS_MIN_CONTRATTI, ASS_MULTIPLO_CODA * f["coda0"]):
+        return
+    migliori_bid, migliori_ask = bm.get_bbo(libri[alias])
+    # Il livello ha retto se il lato passivo e' ancora li' (o meglio):
+    # gli acquisti aggressivi non hanno portato l'ask sopra, le vendite il bid sotto.
+    if compra:
+        tenuto = bool(migliori_ask) and migliori_ask[0] <= livello
+    else:
+        tenuto = bool(migliori_bid) and migliori_bid[0] >= livello
+    if not tenuto:
+        return
+    eventi[alias]["abs"].append([round(livello * strumenti[alias]["pips"], 2), round(f["vol"]), -1 if compra else 1,
+                                 orario(f["ultimo"])])
+
+
+def valuta_assorbimenti(alias, adesso):
+    for chiave, f in list(finestre_ass[alias].items()):
+        if adesso - f["ultimo"] >= ASS_TENUTA_SEC or adesso - f["t0"] > ASS_FINESTRA_SEC + ASS_TENUTA_SEC:
+            valuta_finestra(alias, chiave, f)
+
+
 def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start, is_execution_end,
                   aggressor_order_id, passive_order_id):
     f = flusso.get(alias)
@@ -228,6 +360,34 @@ def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start,
         f["buy"] += contratti
     else:
         f["sell"] += contratti
+
+    # Stop e assorbimenti: un errore qui non deve fermare CVD e liquidita'.
+    try:
+        adesso = time.time()
+        livello = livello_trade(alias, price)
+        d = diag[alias]
+        d["tr"] += 1
+        id_aggr = aggressor_order_id if aggressor_order_id not in (None, "", "null", "None") else None
+        if id_aggr:
+            d["id"] += 1
+        if is_execution_start or esecuzione.get(alias) is None:
+            esecuzione[alias] = {"t": adesso, "aggr": {}, "ordine": []}
+        b = esecuzione[alias]
+        # Senza ID non si distinguono gli aggressori: tutto finisce sotto "?" e non si rileva nessuno stop.
+        chiave = id_aggr or "?"
+        if chiave not in b["aggr"]:
+            b["aggr"][chiave] = {"buy": is_bid, "size": 0.0, "livelli": []}
+            b["ordine"].append(chiave)
+        a = b["aggr"][chiave]
+        a["size"] += contratti
+        a["livelli"].append(livello)
+        if is_execution_end:
+            chiudi_esecuzione(alias)
+        registra_assorbimento(alias, livello, is_bid, contratti, adesso)
+    except Exception as e:
+        print(f"Stop/assorbimenti: {e}", flush=True)
+
+
 
 
 def livelli_book(lato, migliore, verso, info):
@@ -253,6 +413,10 @@ def on_interval(addon, alias):
         return
     info = strumenti[alias]
     aggiorna_statistiche(alias, fotografia(libro, info))
+    try:
+        valuta_assorbimenti(alias, time.time())
+    except Exception as e:
+        print(f"Assorbimenti: {e}", flush=True)
     adesso = int(time.time())
     if adesso == ultimo_secondo[alias]:
         return
@@ -287,9 +451,14 @@ def on_interval(addon, alias):
         "addA": round(f["addA"]),
         "remA": round(f["remA"]),
         **riassunto_statistiche(statistiche[alias]),
+        "stop": eventi[alias]["stop"],
+        "abs": eventi[alias]["abs"],
+        "diag": diag[alias],
     }
     flusso[alias] = azzerato()
     statistiche[alias] = statistiche_azzerate()
+    eventi[alias] = {"stop": [], "abs": []}
+    diag[alias] = diag_azzerata()
 
     if coda.qsize() < MAX_IN_CODA:
         coda.put(campione)

@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation';
 import { Chart as ChartJS, registerables, type Scale, type ScriptableContext } from 'chart.js';
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
-import { zeroGamma } from '@/lib/zeroGamma';
 
 ChartJS.register(...registerables);
 
@@ -39,6 +38,38 @@ interface BookmapPoint {
   q1A: number | null;
   qm: number | null;
   sp1: number | null;
+  /** Stop scattati e assorbimenti del secondo, [prezzo, contratti, verso, 'HH:MM:SS']; null prima dell'add-on che li cerca. */
+  stop: [number, number, number, string][] | null;
+  abs: [number, number, number, string][] | null;
+  /** Contatori per verificare il rilevamento degli stop: trade, trade con ID aggressore, esecuzioni, esecuzioni con piu' aggressori. */
+  diag: { tr: number; id: number; ex: number; multi: number } | null;
+}
+
+/** Uno stop scattato o un assorbimento, sull'asse del tempo del grafico. */
+interface Evento {
+  x: number;
+  prezzo: number;
+  contratti: number;
+  /** Stop: +1 in acquisto (scattati salendo), -1 in vendita. Assorbimento: +1 compratori che assorbono, -1 venditori. */
+  verso: number;
+}
+
+/** Quanto a lungo la linea di uno stop resta sul grafico dopo che e' scattato, in secondi. */
+const STOP_DURATA_SEC = 600;
+const ARANCIO_STOP = '#fb923c';
+const FUCSIA_STOP = '#e879f9';
+type MinStop = '1' | '5' | '10' | '25';
+type MinAss = '30' | '60' | '100' | '200';
+
+/** Tutti gli eventi della sessione in memoria, sopra la dimensione scelta. */
+function eventiDi(pts: BookmapPoint[], campo: 'stop' | 'abs', minimo: number): Evento[] {
+  const out: Evento[] = [];
+  for (const p of pts) {
+    for (const [prezzo, contratti, verso, t] of p[campo] ?? []) {
+      if (contratti >= minimo) out.push({ x: secondi(t), prezzo, contratti, verso });
+    }
+  }
+  return out;
 }
 
 /** Un ordine limit rimasto allo stesso prezzo per un tratto di tempo: una linea orizzontale. */
@@ -71,52 +102,27 @@ const VIOLA = '#a855f7';
 
 type Finestra = '15' | '60' | '180';
 /**
- * I dodici livelli R1/R2/R3 del Range Calc di /market, gia' in prezzi ES:
- * stessi colori e stesso tratto del grafico principale (mattina tratteggiata,
- * Opening Bell continua). Qui non si calcolano, si leggono.
+ * I sei livelli R1/R2/R3 dell'Opening Bell, gia' in prezzi ES (SPX +- straddle
+ * SPX delle 15:35 + basis ES-SPX di quel momento): stessi colori del grafico
+ * principale. Quelli del mattino non si disegnano: questa pagina e' sul
+ * pomeriggio americano. Qui non si calcolano, si leggono.
  */
-const RANGE_ES = (['', 'Ob'] as const).flatMap((suffisso) =>
-  ([
-    ['r1Down', '#ef4444', 'R1↓'],
-    ['r2Down', '#f97316', 'R2↓'],
-    ['r3Down', '#facc15', 'R3↓'],
-    ['r1Up', '#3b82f6', 'R1↑'],
-    ['r2Up', '#06b6d4', 'R2↑'],
-    ['r3Up', '#10b981', 'R3↑'],
-  ] as const).map(([chiave, colore, etichetta]) => ({
-    key: `${chiave}${suffisso}`,
-    colore,
-    etichetta: `${etichetta}${suffisso ? ' OB' : ''}`,
-    tratteggio: suffisso ? [] : [6, 3],
-  })),
-);
+const RANGE_ES = ([
+  ['r1Down', '#ef4444', 'R1↓'],
+  ['r2Down', '#f97316', 'R2↓'],
+  ['r3Down', '#facc15', 'R3↓'],
+  ['r1Up', '#3b82f6', 'R1↑'],
+  ['r2Up', '#06b6d4', 'R2↑'],
+  ['r3Up', '#10b981', 'R3↑'],
+] as const).map(([chiave, colore, etichetta]) => ({
+  key: `${chiave}Ob`,
+  colore,
+  etichetta: `${etichetta} OB`,
+  tratteggio: [] as number[],
+}));
 
-/**
- * Zero Gamma: su quale base calcolarlo, come il selettore di /gex, oppure
- * spento. La chiave e' quella del profilo di /api/gex.
- */
-type BaseZeroGamma = 'off' | 'gex' | 'gexOi';
-const ARANCIO = '#f59e0b';
-/**
- * Ogni quanto rileggere il profilo del gamma. Il poller dei volumi scrive
- * uno snapshot ogni 10 secondi, ma lo Zero Gamma e' un livello lento: un
- * minuto basta, e ogni giro porta solo gli snapshot nuovi (`since`).
- */
-const GAMMA_MS = 60000;
-/**
- * Quanto indietro guarda la prima lettura. Deve coprire STRIKE_SCADUTO_SEC
- * della route (300 s): con meno, gli strike visti per ultimi prima della
- * finestra resterebbero fuori dal profilo.
- */
-const GAMMA_PRIMA_SEC = 300;
-/** Spot SPX e prezzo ES piu' distanti di cosi' (secondi) non danno una base affidabile. */
-const BASE_MAX_SEC = 5;
-
-interface ProfiloGamma {
-  strike: number;
-  gex: number;
-  gexOi: number;
-}
+/** Ogni quanto richiedere i range al server finche' quelli delle 15:35 non ci sono. */
+const RANGE_RETRY_MS = 60_000;
 
 /** Da quanti contratti in su un livello del book diventa una linea: il cursore va da SOGLIA_MIN a SOGLIA_MAX. */
 const SOGLIA_MIN = 50;
@@ -140,9 +146,48 @@ type MediaLiq = '1' | '10' | '30' | '60';
  * Cosa mostra il grafico del book.
  * - mlofi: Order Flow Imbalance multilivello, come cambia il book (la pressione vera)
  * - asimmetria: dove sta la liquidita' dei due lati rispetto al mid
+ * - ofiPct: lo stesso MLOFI su scala fissa ±100, come percentile di sessione
  * - statico: bid contro ask esposti, lo sbilancio di prima (fuorviante da solo)
  */
-type VistaBook = 'mlofi' | 'asimmetria' | 'statico';
+type VistaBook = 'mlofi' | 'ofiPct' | 'asimmetria' | 'statico';
+/** Oltre questo valore di OFI % la pressione e' estrema rispetto alla sessione: le linee tratteggiate. */
+const ZONA_ESTREMA = 80;
+/** Sotto questi campioni (5 minuti) il percentile non ha ancora una sessione con cui confrontarsi. */
+const MIN_CAMPIONI_PCT = 300;
+
+/**
+ * MLOFI come percentile di sessione, da −100 a +100: il modulo di ogni valore
+ * confrontato con i moduli di tutti quelli PRIMA di lui (cosi' lo storico
+ * mostra quello che si sarebbe visto live, senza guardare avanti), con il
+ * segno rimesso. +85 = pressione in acquisto piu' forte dell'85% delle
+ * letture della sessione. Sul modulo e non sul valore: con un percentile
+ * semplice lo zero finirebbe sulla mediana, che in una giornata in trend non
+ * e' zero, e un flusso in acquisto sotto la mediana risulterebbe rosso.
+ */
+function ofiPercentile(valori: number[]): number[] {
+  const ordinati: number[] = [];
+  const primoMaggiore = (x: number, compreso: boolean) => {
+    let lo = 0;
+    let hi = ordinati.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (ordinati[m] < x || (compreso && ordinati[m] === x)) lo = m + 1;
+      else hi = m;
+    }
+    return lo;
+  };
+  return valori.map((v) => {
+    if (!Number.isFinite(v)) return NaN;
+    const a = Math.abs(v);
+    const n = ordinati.length;
+    const sotto = primoMaggiore(a, false);
+    const finoA = primoMaggiore(a, true);
+    ordinati.splice(finoA, 0, a);
+    if (n < MIN_CAMPIONI_PCT) return NaN;
+    // I pari contano a meta': un valore uguale a tutti gli altri sta a 50.
+    return Math.sign(v) * ((sotto + (finoA - sotto) / 2) / n) * 100;
+  });
+}
 /** Quanti livelli sommare nell'OFI: 1 e' l'OFI classico del solo migliore. L'add-on ne manda 15. */
 type LivelliOfi = '1' | '5' | '10' | '15';
 const LIVELLI_OFI_MAX = 15;
@@ -243,9 +288,11 @@ interface Lettura {
   /** OFI di ciascun livello nella finestra, in code medie. */
   livelli: (number | null)[];
   finestraSec: number;
+  /** Il MLOFI di adesso come percentile di sessione (OFI %); null nei primi minuti. */
+  forza: number | null;
 }
 
-function lettura(pts: BookmapPoint[], finestraSec: number, n: number, qmMediana: number | null): Lettura | null {
+function lettura(pts: BookmapPoint[], finestraSec: number, n: number, qmMediana: number | null, forza: number | null): Lettura | null {
   if (pts.length === 0) return null;
   const fine = secondi(pts[pts.length - 1].time);
   const ultimi = (sec: number) => {
@@ -300,6 +347,7 @@ function lettura(pts: BookmapPoint[], finestraSec: number, n: number, qmMediana:
     fugaci,
     livelli,
     finestraSec,
+    forza,
   };
 }
 
@@ -485,6 +533,7 @@ function compatto(v: number | null | undefined, decimali = 0) {
 /** Un valore dell'asse del book: l'OFI in code medie, asimmetria e sbilancio in %. */
 function valoreBook(v: number, vista: VistaBook) {
   if (vista === 'mlofi') return `${v > 0 ? '+' : ''}${Math.abs(v) >= 10 ? v.toFixed(0) : v.toFixed(1)}`;
+  if (vista === 'ofiPct') return `${v > 0 ? '+' : ''}${Math.round(v)}`;
   return `${Math.round(v)}%`;
 }
 
@@ -560,11 +609,13 @@ export default function BookmapPage() {
   const [vistaBook, setVistaBook] = useState<VistaBook>('mlofi');
   const [livelliOfi, setLivelliOfi] = useState<LivelliOfi>('10');
   const [durataMin, setDurataMin] = useState<DurataMin>('5');
-  const [baseZg, setBaseZg] = useState<BaseZeroGamma>('gex');
-  /** L'ultimo profilo del gamma da /api/gex e lo spot SPX a cui e' stato valutato. */
-  const [gamma, setGamma] = useState<{ profilo: ProfiloGamma[]; spot: { time: string; price: number } | null } | null>(null);
-  /** Lo Zero Gamma di adesso, in SPX e gia' portato in ES; null se manca il profilo o la base. */
-  const [zg, setZg] = useState<{ spx: number; es: number; base: number } | null>(null);
+  const [mostraStop, setMostraStop] = useState(true);
+  const [mostraAss, setMostraAss] = useState(true);
+  const [minStop, setMinStop] = useState<MinStop>('5');
+  const [minAss, setMinAss] = useState<MinAss>('60');
+
+  /** L'ultimo OFI %, calcolato in `applica` insieme alla linea. */
+  const [ofiPctOra, setOfiPctOra] = useState<number | null>(null);
 
   const prezzoRef = useRef<HTMLCanvasElement | null>(null);
   const liquiditaRef = useRef<HTMLCanvasElement | null>(null);
@@ -593,14 +644,15 @@ export default function BookmapPage() {
   const vistaBookRef = useRef<VistaBook>('mlofi');
   const livelliOfiRef = useRef<LivelliOfi>('10');
   const durataMinRef = useRef<DurataMin>('5');
+  const mostraStopRef = useRef(true);
+  const mostraAssRef = useRef(true);
+  const minStopRef = useRef<MinStop>('5');
+  const minAssRef = useRef<MinAss>('60');
+  /** Stop e assorbimenti da disegnare, gia' filtrati per dimensione. */
+  const eventiRef = useRef<{ stop: Evento[]; abs: Evento[] }>({ stop: [], abs: [] });
   const segmentiRef = useRef<Segmento[]>([]);
   /** Secondi visibili scelti con la rotella in LIVE; null = quelli della finestra selezionata. */
   const ampiezzaRef = useRef<number | null>(null);
-  const zgRef = useRef<{ spx: number; es: number } | null>(null);
-  /** L'ultima differenza ES - SPX misurata: la base cambia piano, e se Bookmap ha un buco si tiene l'ultima. */
-  const baseEsRef = useRef<number | null>(null);
-  const gammaDopo = useRef<string | null>(null);
-  const gammaGiorno = useRef<string | null>(null);
   /** Posizione del mirino: l'orario vale per tutti e due i grafici, l'altezza solo per quello sotto il mouse. */
   const mirinoRef = useRef<{ sec: number; y: number; sorgente: ChartJS } | null>(null);
 
@@ -652,78 +704,6 @@ export default function BookmapPage() {
     return () => clearInterval(id);
   }, []);
 
-  // Il profilo del gamma, per lo Zero Gamma. E' la stessa route di /gex, ma
-  // qui serve solo il profilo di adesso: `flow=0` toglie le bolle e `since`
-  // gia' dalla prima lettura evita la storia della sessione (`serie`), che
-  // la route manda solo quando `since` manca. Ogni snapshot porta i totali
-  // di giornata, quindi l'ultimo basta.
-  useEffect(() => {
-    if (!autorizzato) return;
-    const carica = async () => {
-      try {
-        const adesso = new Date();
-        const oraSec = adesso.getHours() * 3600 + adesso.getMinutes() * 60 + adesso.getSeconds();
-        const since = gammaDopo.current ?? orario(Math.max(0, oraSec - GAMMA_PRIMA_SEC));
-        const res = await fetch(`/api/gex?flow=0&since=${since}`, { cache: 'no-store' });
-        if (!res.ok) return;
-        const json: {
-          date?: string;
-          lastTime?: string | null;
-          profile?: ProfiloGamma[];
-          spot?: { time: string; price: number }[];
-        } = await res.json();
-        // Cambio di giornata: il cursore di ieri sera scarterebbe tutto
-        // quello che oggi arriva prima di quell'ora.
-        if (json.date && gammaGiorno.current && json.date !== gammaGiorno.current) {
-          gammaGiorno.current = json.date;
-          gammaDopo.current = null;
-          setGamma(null);
-          return;
-        }
-        if (json.date) gammaGiorno.current = json.date;
-        if (json.lastTime) gammaDopo.current = json.lastTime;
-        const profilo = json.profile ?? [];
-        if (profilo.length === 0) return;
-        const spot = json.spot && json.spot.length > 0 ? json.spot[json.spot.length - 1] : null;
-        setGamma((prec) => ({ profilo, spot: spot ?? prec?.spot ?? null }));
-      } catch (e) {
-        console.error('GEX fetch failed:', e);
-      }
-    };
-    carica();
-    const id = setInterval(carica, GAMMA_MS);
-    return () => clearInterval(id);
-  }, [autorizzato]);
-
-  // Lo Zero Gamma e' uno strike SPX, il grafico e' in ES: la differenza si
-  // misura qui, confrontando lo spot a cui IBKR ha valutato il gamma con il
-  // prezzo ES che Bookmap aveva nello stesso secondo. Tutti e due gli orari
-  // sono l'ora del PC, quindi si confrontano senza conversioni. Non si usa
-  // la base di /market per non aggiungere un'altra chiamata.
-  useEffect(() => {
-    const spot = gamma?.spot;
-    if (spot) {
-      const obiettivo = secondi(spot.time);
-      let migliore: { distanza: number; prezzo: number } | null = null;
-      for (let i = points.length - 1; i >= 0; i--) {
-        const sec = secondi(points[i].time);
-        if (sec < obiettivo - BASE_MAX_SEC) break;
-        const prezzo = points[i].price;
-        const distanza = Math.abs(sec - obiettivo);
-        if (prezzo != null && distanza <= BASE_MAX_SEC && (!migliore || distanza < migliore.distanza)) {
-          migliore = { distanza, prezzo };
-        }
-      }
-      if (migliore) baseEsRef.current = migliore.prezzo - spot.price;
-    }
-    const livello = gamma && baseZg !== 'off' ? zeroGamma(gamma.profilo, baseZg) : null;
-    const base = baseEsRef.current;
-    const nuovo = livello != null && base != null ? { spx: livello, es: livello + base, base } : null;
-    zgRef.current = nuovo;
-    setZg((prec) => (prec?.es === nuovo?.es && prec?.spx === nuovo?.spx ? prec : nuovo));
-    chartPrezzo.current?.draw();
-  }, [gamma, points, baseZg]);
-
   /**
    * Mette i dati nei grafici e ricalcola gli assi che l'utente non ha fissato.
    * Il tempo libero segue l'ultimo campione con la finestra scelta; i valori
@@ -757,12 +737,18 @@ export default function BookmapPage() {
     const cAM = mediaMobile(xs, pts.map((p) => p.cA ?? NaN), w);
     const asimM = cBM.map((v, i) => asimmetria(v, cAM[i]));
     cl.data.datasets[4].data = xs.map((x, i) => ({ x, y: asimM[i] }));
+    // Il percentile costa un ordinamento della sessione: solo quando lo si guarda.
+    const ofiPct = vistaBook === 'ofiPct' ? ofiPercentile(mlofi) : [];
+    cl.data.datasets[5].data = ofiPct.map((y, i) => ({ x: xs[i], y }));
+    const ultimoPct = ofiPct.length > 0 ? ofiPct[ofiPct.length - 1] : NaN;
+    setOfiPctOra(Number.isFinite(ultimoPct) ? ultimoPct : null);
     const bidAsk = mostraBidAskRef.current && vistaBook === 'statico';
     cl.data.datasets[0].hidden = vistaBook !== 'statico';
     cl.data.datasets[1].hidden = !bidAsk;
     cl.data.datasets[2].hidden = !bidAsk;
     cl.data.datasets[3].hidden = vistaBook !== 'mlofi';
     cl.data.datasets[4].hidden = vistaBook !== 'asimmetria';
+    cl.data.datasets[5].hidden = vistaBook !== 'ofiPct';
     const asseLiq = cl.options.scales!.yLiq!;
     asseLiq.ticks!.display = bidAsk;
     const fl = flussoMobile(pts, xs, Number(finestraFlussoRef.current), toltiRef.current === 'cancellati');
@@ -810,6 +796,10 @@ export default function BookmapPage() {
     // CVD spento: linea nascosta, asse destro vuoto ma largo uguale, cosi' i
     // due grafici restano allineati sul tempo.
     segmentiRef.current = mostraOrdiniRef.current ? segmentiBook(pts, xs, sogliaRef.current, Number(durataMinRef.current)) : [];
+    eventiRef.current = {
+      stop: mostraStopRef.current ? eventiDi(pts, 'stop', Number(minStopRef.current)) : [],
+      abs: mostraAssRef.current ? eventiDi(pts, 'abs', Number(minAssRef.current)) : [],
+    };
 
     const cvdAcceso = mostraCvdRef.current;
     cp.data.datasets[1].hidden = !cvdAcceso;
@@ -857,10 +847,13 @@ export default function BookmapPage() {
       // Simmetrico attorno allo zero, stretto su quello che si vede: con -100/+100
       // fissi uno sbilancio del 20% era una riga piatta. L'OFI e' in code medie,
       // numeri piccoli: niente arrotondamento a 5.
+      // L'OFI % invece e' fisso: e' il senso della vista, un +80 e' sempre un +80.
       const semi =
-        vistaBook === 'mlofi'
-          ? Math.max(0.5, Math.ceil(massimoSbil * 1.15 * 2) / 2)
-          : Math.max(5, Math.ceil((massimoSbil * 1.15) / 5) * 5);
+        vistaBook === 'ofiPct'
+          ? 100
+          : vistaBook === 'mlofi'
+            ? Math.max(0.5, Math.ceil(massimoSbil * 1.15 * 2) / 2)
+            : Math.max(5, Math.ceil((massimoSbil * 1.15) / 5) * 5);
       sl.ySbil!.min = -semi;
       sl.ySbil!.max = semi;
     }
@@ -1058,47 +1051,98 @@ export default function BookmapPage() {
       };
 
       /**
-       * Lo Zero Gamma, gia' in ES: tratteggiato arancio con l'etichetta a
-       * sinistra (a destra ci sono quelle dei range). La scala non si allarga
-       * per lui -- a una ventina di punti di distanza schiaccerebbe il prezzo --
-       * quindi se e' fuori vista resta un'etichetta sul bordo con la freccia.
+       * Stop e assorbimenti, sopra la linea del prezzo.
+       * - Stop: linea orizzontale al prezzo dove sono scattati, per
+       *   STOP_DURATA_SEC da quel momento; arancio in acquisto (scattati
+       *   salendo), fucsia in vendita; piu' spessa con piu' contratti.
+       * - Assorbimento: una palla, verde se i compratori passivi hanno
+       *   assorbito le vendite, rossa se i venditori hanno assorbito gli
+       *   acquisti; l'area e' proporzionale ai contratti.
+       * Col mouse sopra, il riquadro con prezzo, contratti e ora.
        */
-      const zeroGammaPlugin = {
-        id: 'zeroGamma',
+      const eventiPlugin = {
+        id: 'eventi',
         afterDatasetsDraw: (chart: ChartJS) => {
-          const z = zgRef.current;
+          const { stop, abs } = eventiRef.current;
+          const sx = chart.scales.x;
           const sy = chart.scales.yPrezzo;
-          if (!z || !sy) return;
+          if ((stop.length === 0 && abs.length === 0) || !sx || !sy) return;
           const { ctx, chartArea: a } = chart;
-          const y = sy.getPixelForValue(z.es);
+          const m = mirinoRef.current?.sorgente === chart ? mirinoRef.current : null;
+          const mx = m ? sx.getPixelForValue(m.sec) : null;
+          let sotto: { testo: string; x: number; y: number } | null = null;
           ctx.save();
-          ctx.font = 'bold 10px Arial';
-          ctx.textBaseline = 'middle';
+          ctx.beginPath();
+          ctx.rect(a.left, a.top, a.right - a.left, a.bottom - a.top);
+          ctx.clip();
+
+          ctx.font = 'bold 9px Arial';
+          ctx.textBaseline = 'bottom';
           ctx.textAlign = 'left';
-          let testo = `Zero Gamma ~${z.es.toFixed(0)}`;
-          let yEtichetta = y;
-          if (y < a.top) {
-            testo = `▲ ${testo}`;
-            yEtichetta = a.top + 10;
-          } else if (y > a.bottom) {
-            testo = `▼ ${testo}`;
-            yEtichetta = a.bottom - 10;
-          } else {
+          for (const e of stop) {
+            const x1 = sx.getPixelForValue(e.x);
+            const x2 = sx.getPixelForValue(e.x + STOP_DURATA_SEC);
+            if (x2 < a.left || x1 > a.right) continue;
+            const y = sy.getPixelForValue(e.prezzo);
+            if (y < a.top || y > a.bottom) continue;
+            const colore = e.verso > 0 ? ARANCIO_STOP : FUCSIA_STOP;
+            ctx.strokeStyle = colore;
+            ctx.lineWidth = Math.min(4, 1.5 + Math.sqrt(e.contratti) / 4);
             ctx.beginPath();
-            ctx.setLineDash([8, 4]);
-            ctx.lineWidth = 2;
-            ctx.strokeStyle = ARANCIO;
-            ctx.moveTo(a.left, y);
-            ctx.lineTo(a.right, y);
+            ctx.moveTo(x1, y);
+            ctx.lineTo(x2, y);
             ctx.stroke();
-            ctx.setLineDash([]);
+            ctx.fillStyle = colore;
+            ctx.fillText(`${e.verso > 0 ? '▲' : '▼'} STOP ${e.contratti}`, x1 + 2, y - 2);
+            if (m && mx != null && mx >= x1 - 4 && mx <= x2 && Math.abs(m.y - y) <= 5) {
+              sotto = {
+                testo: `Stop ${e.verso > 0 ? 'in acquisto' : 'in vendita'}: ${e.contratti} ct a ${e.prezzo.toFixed(2)} · ${orario(e.x)}`,
+                x: x1,
+                y,
+              };
+            }
           }
-          const w = ctx.measureText(testo).width + 8;
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
-          ctx.fillRect(a.left + 4, yEtichetta - 8, w, 16);
-          ctx.fillStyle = ARANCIO;
-          ctx.fillText(testo, a.left + 8, yEtichetta);
+
+          for (const e of abs) {
+            const x = sx.getPixelForValue(e.x);
+            const y = sy.getPixelForValue(e.prezzo);
+            if (x < a.left - 20 || x > a.right + 20 || y < a.top - 20 || y > a.bottom + 20) continue;
+            const r = Math.min(20, Math.max(4, Math.sqrt(e.contratti) * 0.9));
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, Math.PI * 2);
+            ctx.fillStyle = e.verso > 0 ? 'rgba(52, 211, 153, 0.55)' : 'rgba(244, 63, 94, 0.55)';
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.stroke();
+            if (m && mx != null && Math.hypot(mx - x, m.y - y) <= r + 2) {
+              sotto = {
+                testo: `Assorbimento: ${e.contratti} ct a ${e.prezzo.toFixed(2)}, ${
+                  e.verso > 0 ? 'compratori assorbono le vendite' : 'venditori assorbono gli acquisti'
+                } · ${orario(e.x)}`,
+                x,
+                y: y - r,
+              };
+            }
+          }
           ctx.restore();
+
+          if (sotto) {
+            ctx.save();
+            ctx.font = '11px Arial';
+            const w = ctx.measureText(sotto.testo).width + 12;
+            let bx = sotto.x + 8;
+            if (bx + w > a.right) bx = a.right - w;
+            const by = Math.max(a.top, sotto.y - 26);
+            ctx.fillStyle = 'rgba(15, 17, 26, 0.95)';
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.5)';
+            ctx.fillRect(bx, by, w, 20);
+            ctx.strokeRect(bx + 0.5, by + 0.5, w - 1, 19);
+            ctx.fillStyle = '#e2e8f0';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(sotto.testo, bx + 6, by + 10);
+            ctx.restore();
+          }
         },
       };
 
@@ -1176,7 +1220,7 @@ export default function BookmapPage() {
 
       chartPrezzo.current = new ChartJS(prezzoRef.current, {
         type: 'line',
-        plugins: [ordini, range, zeroGammaPlugin, mirino],
+        plugins: [ordini, range, eventiPlugin, mirino],
         data: {
           datasets: [
             {
@@ -1212,9 +1256,42 @@ export default function BookmapPage() {
         },
       });
 
+      /**
+       * Le zone estreme dell'OFI %: fondo appena colorato oltre ±ZONA_ESTREMA
+       * e la linea tratteggiata sul confine. Sotto le linee dei dati.
+       */
+      const zoneEstreme = {
+        id: 'zoneEstreme',
+        beforeDatasetsDraw: (chart: ChartJS) => {
+          const sy = chart.scales.ySbil;
+          if (vistaBookRef.current !== 'ofiPct' || !sy) return;
+          const { ctx, chartArea: a } = chart;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(a.left, a.top, a.right - a.left, a.bottom - a.top);
+          ctx.clip();
+          for (const [livello, colore, bordo] of [
+            [ZONA_ESTREMA, 'rgba(52, 211, 153, 0.07)', sy.getPixelForValue(100)],
+            [-ZONA_ESTREMA, 'rgba(244, 63, 94, 0.07)', sy.getPixelForValue(-100)],
+          ] as const) {
+            const y = sy.getPixelForValue(livello);
+            ctx.fillStyle = colore;
+            ctx.fillRect(a.left, Math.min(y, bordo), a.right - a.left, Math.abs(bordo - y));
+            ctx.beginPath();
+            ctx.setLineDash([6, 4]);
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = livello > 0 ? 'rgba(52, 211, 153, 0.6)' : 'rgba(244, 63, 94, 0.6)';
+            ctx.moveTo(a.left, y);
+            ctx.lineTo(a.right, y);
+            ctx.stroke();
+          }
+          ctx.restore();
+        },
+      };
+
       chartLiquidita.current = new ChartJS(liquiditaRef.current, {
         type: 'line',
-        plugins: [mirino],
+        plugins: [zoneEstreme, mirino],
         data: {
           datasets: [
             // Il segnale: sopra lo zero verde (piu' bid), sotto rosso (piu' ask).
@@ -1244,6 +1321,16 @@ export default function BookmapPage() {
             },
             {
               label: 'Asimmetria %',
+              data: [],
+              yAxisID: 'ySbil',
+              borderWidth: 1.8,
+              pointRadius: 0,
+              tension: 0.2,
+              fill: { target: 'origin', above: 'rgba(52, 211, 153, 0.28)', below: 'rgba(244, 63, 94, 0.28)' },
+              segment: { borderColor: (ctx) => ((ctx.p1.parsed.y ?? 0) >= 0 ? VERDE : ROSSO) },
+            },
+            {
+              label: 'OFI %',
               data: [],
               yAxisID: 'ySbil',
               borderWidth: 1.8,
@@ -1419,8 +1506,13 @@ export default function BookmapPage() {
     chartPrezzo.current?.draw();
   };
 
-  // I livelli li scrive /market, anche dopo che questa pagina e' aperta: si
-  // rileggono quando cambiano in un'altra scheda e quando si torna qui (come /gex).
+  // I livelli vengono dal server (/api/market?history=true, campo `range.ob`),
+  // calcolati sugli stessi dati del poller che usa il pannello Range di
+  // /market: prima si leggevano solo dal localStorage che scrive /market, e
+  // se quella pagina non era stata aperta oggi in questo browser le linee
+  // non c'erano. Il localStorage resta piu' forte (modifiche fatte a mano nel
+  // pannello, come in /gex) e decide la visibilita'; si rilegge quando cambia
+  // in un'altra scheda e quando si torna qui.
   useEffect(() => {
     try {
       if (localStorage.getItem('bookmap_range') === 'off') {
@@ -1430,8 +1522,10 @@ export default function BookmapPage() {
     } catch {
       // niente preferenza salvata
     }
+    let dalServer: Record<string, string> = {};
+    let fermo = false;
     const rileggi = () => {
-      const valori = leggiRefLines() ?? {};
+      const valori = { ...dalServer, ...Object.fromEntries(Object.entries(leggiRefLines() ?? {}).filter(([, v]) => v)) };
       const vis = leggiVisibilita() ?? {};
       rangeRef.current = RANGE_ES.flatMap((r) => {
         const v = parseFloat(valori[r.key] ?? '');
@@ -1443,6 +1537,31 @@ export default function BookmapPage() {
       applica();
     };
     rileggi();
+    // Prima delle 15:35 il server non ha ancora range.ob: si riprova ogni
+    // minuto e ci si ferma appena arriva (lo storico pesa ~400 KB, inutile
+    // riscaricarlo per livelli che per il resto della giornata non cambiano).
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const chiediAlServer = async () => {
+      let trovati = false;
+      try {
+        const res = await fetch('/api/market?history=true', { cache: 'no-store' });
+        if (res.ok) {
+          const ob = (await res.json())?.range?.ob as Record<string, number> | null | undefined;
+          if (ob && !fermo) {
+            dalServer = Object.fromEntries(RANGE_ES.flatMap((r) => {
+              const v = ob[r.key.replace(/Ob$/, '')];
+              return typeof v === 'number' && Number.isFinite(v) ? [[r.key, v.toFixed(2)]] : [];
+            }));
+            trovati = true;
+            rileggi();
+          }
+        }
+      } catch (e) {
+        console.error('Range fetch failed:', e);
+      }
+      if (!trovati && !fermo) timer = setTimeout(chiediAlServer, RANGE_RETRY_MS);
+    };
+    chiediAlServer();
     const suStorage = (e: StorageEvent) => {
       if (e.key === null || e.key === REF_LINES_KEY || e.key === REF_LINES_VIS_KEY) rileggi();
     };
@@ -1453,6 +1572,8 @@ export default function BookmapPage() {
     document.addEventListener('visibilitychange', suRitorno);
     window.addEventListener('focus', rileggi);
     return () => {
+      fermo = true;
+      if (timer) clearTimeout(timer);
       window.removeEventListener('storage', suStorage);
       document.removeEventListener('visibilitychange', suRitorno);
       window.removeEventListener('focus', rileggi);
@@ -1539,7 +1660,7 @@ export default function BookmapPage() {
   useEffect(() => {
     try {
       const v = localStorage.getItem('bookmap_vista_book');
-      if (v === 'mlofi' || v === 'asimmetria' || v === 'statico') {
+      if (v === 'mlofi' || v === 'ofiPct' || v === 'asimmetria' || v === 'statico') {
         vistaBookRef.current = v;
         setVistaBook(v);
       }
@@ -1587,28 +1708,64 @@ export default function BookmapPage() {
     rifaiOrdini();
   };
 
-  const cambiaTolti = (v: Tolti) => {
-    toltiRef.current = v;
-    setTolti(v);
-    applica();
-  };
-
+  // Stop e assorbimenti: accesi o spenti e la dimensione minima, ricordati nel browser.
   useEffect(() => {
     try {
-      const v = localStorage.getItem('bookmap_zero_gamma');
-      if (v === 'off' || v === 'gex' || v === 'gexOi') setBaseZg(v);
+      if (localStorage.getItem('bookmap_stop') === 'off') {
+        mostraStopRef.current = false;
+        setMostraStop(false);
+      }
+      if (localStorage.getItem('bookmap_ass') === 'off') {
+        mostraAssRef.current = false;
+        setMostraAss(false);
+      }
+      const ms = localStorage.getItem('bookmap_min_stop');
+      if (ms === '1' || ms === '5' || ms === '10' || ms === '25') {
+        minStopRef.current = ms;
+        setMinStop(ms);
+      }
+      const ma = localStorage.getItem('bookmap_min_ass');
+      if (ma === '30' || ma === '60' || ma === '100' || ma === '200') {
+        minAssRef.current = ma;
+        setMinAss(ma);
+      }
     } catch {
       // niente preferenza salvata
     }
   }, []);
 
-  const cambiaBaseZg = (v: BaseZeroGamma) => {
-    setBaseZg(v);
-    try {
-      localStorage.setItem('bookmap_zero_gamma', v);
-    } catch {
-      // la preferenza vale solo per questa visita
-    }
+  const cambiaMostraStop = () => {
+    mostraStopRef.current = !mostraStopRef.current;
+    setMostraStop(mostraStopRef.current);
+    salva('bookmap_stop', mostraStopRef.current ? 'on' : 'off');
+    applica();
+  };
+
+  const cambiaMostraAss = () => {
+    mostraAssRef.current = !mostraAssRef.current;
+    setMostraAss(mostraAssRef.current);
+    salva('bookmap_ass', mostraAssRef.current ? 'on' : 'off');
+    applica();
+  };
+
+  const cambiaMinStop = (v: MinStop) => {
+    minStopRef.current = v;
+    setMinStop(v);
+    salva('bookmap_min_stop', v);
+    applica();
+  };
+
+  const cambiaMinAss = (v: MinAss) => {
+    minAssRef.current = v;
+    setMinAss(v);
+    salva('bookmap_min_ass', v);
+    applica();
+  };
+
+  const cambiaTolti = (v: Tolti) => {
+    toltiRef.current = v;
+    setTolti(v);
+    applica();
   };
 
   const cambiaCvd = () => {
@@ -1632,6 +1789,18 @@ export default function BookmapPage() {
 
   // Il metro per "book pieno" o "sottile": la coda media per livello tipica della sessione in memoria.
   const qmMediana = useMemo(() => mediana(points.flatMap((p) => (p.qm != null ? [p.qm] : []))), [points]);
+
+  // La forza della pressione di adesso rispetto alla sessione, sulla stessa
+  // finestra e sugli stessi livelli della lettura: un modulo del MLOFI in
+  // code dipende da Somma e Livelli, e nessuna soglia fissa vale per tutte
+  // le combinazioni (0,5 code, la prima scelta, non scattava mai: a 30 s la
+  // mediana su ES e' ~7).
+  const finestraLettura = Math.max(LETTURA_MIN_SEC, Number(mediaLiq));
+  const forzaOra = useMemo(() => {
+    const serie = ofiPercentile(mlofiMobile(points, points.map((p) => secondi(p.time)), finestraLettura, Number(livelliOfi)));
+    const v = serie[serie.length - 1];
+    return v != null && Number.isFinite(v) ? v : null;
+  }, [points, finestraLettura, livelliOfi]);
 
   const corrente = points[points.length - 1] ?? null;
   const oraLocale = orologio.getHours() * 3600 + orologio.getMinutes() * 60 + orologio.getSeconds();
@@ -1658,8 +1827,17 @@ export default function BookmapPage() {
     return v == null || Number.isNaN(v) ? null : v;
   };
   const conOfi = corrente?.ofi != null;
+  const conEventi = corrente?.stop != null;
+  // L'ultimo minuto di contatori: dice se il feed permette di riconoscere gli stop.
+  const diagMinuto = coda.slice(-60).reduce(
+    (t, p) => (p.diag ? { tr: t.tr + p.diag.tr, id: t.id + p.diag.id, ex: t.ex + p.diag.ex, multi: t.multi + p.diag.multi } : t),
+    { tr: 0, id: 0, ex: 0, multi: 0 },
+  );
+  const quotaId = diagMinuto.tr > 0 ? diagMinuto.id / diagMinuto.tr : null;
+  const contaOggi = (campo: 'stop' | 'abs', minimo: number) =>
+    points.reduce((n, p) => n + (p[campo] ?? []).filter((e) => e[1] >= minimo).length, 0);
   const nLivelli = Number(livelliOfi);
-  const letto = lettura(coda, Math.max(LETTURA_MIN_SEC, Number(mediaLiq)), nLivelli, qmMediana);
+  const letto = lettura(coda, finestraLettura, nLivelli, qmMediana, forzaOra);
 
   if (!autorizzato) return null;
 
@@ -1699,19 +1877,6 @@ export default function BookmapPage() {
               </span>
             </span>
             {corrente && <span className="text-xs text-slate-500 font-normal">{corrente.levels} livelli per lato</span>}
-            {baseZg !== 'off' && (
-              <span
-                className="text-slate-400"
-                title={
-                  zg
-                    ? `Dove la somma cumulata del GEX per strike cambia segno (${baseZg === 'gexOi' ? 'open interest' : 'volume'}): sopra i dealer risultano lunghi di gamma, sotto corti. Strike SPX ${zg.spx.toFixed(2)}, portato in ES con la base ${zg.base >= 0 ? '+' : ''}${zg.base.toFixed(2)}. Approssimazione.`
-                    : 'Serve il profilo del gamma (poller dei volumi, 13:30-22:00) e un prezzo ES di Bookmap nello stesso momento dello spot SPX'
-                }
-              >
-                Zero Gamma: <span style={{ color: ARANCIO }}>{zg ? `~${zg.es.toFixed(0)}` : '—'}</span>
-                {zg && <span className="text-xs text-slate-500 font-normal"> (SPX {zg.spx.toFixed(0)})</span>}
-              </span>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-xs">
@@ -1757,6 +1922,34 @@ export default function BookmapPage() {
                 onChange={cambiaDurataMin}
               />
             </div>
+            <div className="flex items-center gap-2" title="Ordini stop scattati: linee orizzontali al prezzo dove sono scattati (arancio in acquisto, fucsia in vendita)">
+              <button
+                onClick={cambiaMostraStop}
+                className={`px-2 py-0.5 rounded-lg font-bold border flex items-center gap-1.5 ${
+                  mostraStop ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+              >
+                <span className="inline-block w-4 border-t-2" style={{ borderColor: mostraStop ? ARANCIO_STOP : '#475569' }} />
+                Stop {mostraStop ? 'ON' : 'OFF'}
+              </button>
+              <div className={mostraStop ? '' : 'opacity-40 pointer-events-none'}>
+                <Selettore titolo="≥" valore={minStop} opzioni={[['1', '1'], ['5', '5'], ['10', '10'], ['25', '25']]} onChange={cambiaMinStop} />
+              </div>
+            </div>
+            <div className="flex items-center gap-2" title="Assorbimenti: palle verdi se i compratori assorbono le vendite, rosse se i venditori assorbono gli acquisti; grandezza = contratti">
+              <button
+                onClick={cambiaMostraAss}
+                className={`px-2 py-0.5 rounded-lg font-bold border flex items-center gap-1.5 ${
+                  mostraAss ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+              >
+                <span className="inline-block w-2.5 h-2.5 rounded-full border border-white/80" style={{ backgroundColor: mostraAss ? VERDE : '#475569' }} />
+                Assorbimenti {mostraAss ? 'ON' : 'OFF'}
+              </button>
+              <div className={mostraAss ? '' : 'opacity-40 pointer-events-none'}>
+                <Selettore titolo="≥" valore={minAss} opzioni={[['30', '30'], ['60', '60'], ['100', '100'], ['200', '200']]} onChange={cambiaMinAss} />
+              </div>
+            </div>
             <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`}>
               <span className="text-slate-500">Spessore</span>
               <input
@@ -1779,21 +1972,15 @@ export default function BookmapPage() {
               }`}
               title={
                 quantiRange === 0
-                  ? "Nessun range di oggi: calcolalo o applicalo nel grafico principale (/market)"
+                  ? "Range Opening Bell non ancora disponibili: arrivano dopo le 15:35"
                   : mostraRange
-                    ? 'Nascondi i range ES del grafico principale'
-                    : 'Mostra i range ES del grafico principale'
+                    ? "Nascondi i range ES dell'Opening Bell"
+                    : "Mostra i range ES dell'Opening Bell"
               }
             >
               <span className="w-2 h-2 rounded-full" style={{ backgroundColor: mostraRange && quantiRange > 0 ? '#3b82f6' : '#475569' }} />
               Range {quantiRange === 0 ? '—' : mostraRange ? 'ON' : 'OFF'}
             </button>
-            <Selettore
-              titolo="Zero Gamma"
-              valore={baseZg}
-              opzioni={[['gex', 'Volume'], ['gexOi', 'OI'], ['off', 'Off']]}
-              onChange={cambiaBaseZg}
-            />
             <button
               onClick={cambiaCvd}
               className={`px-3 py-1 rounded-lg font-bold flex items-center gap-2 border ${
@@ -1842,7 +2029,31 @@ export default function BookmapPage() {
 
           {caricato && points.length > 0 && <LetturaBook letto={conOfi ? letto : null} livelli={nLivelli} />}
 
-          <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">Prezzo e CVD</div>
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 mb-1">
+            <div className="text-[11px] uppercase tracking-wide text-slate-500">Prezzo e CVD</div>
+            {caricato && points.length > 0 && (
+              <div className="text-[11px] text-slate-500 tabular-nums">
+                {!conEventi ? (
+                  <span className="text-amber-200/80">
+                    Stop e assorbimenti: l&apos;add-on in Bookmap e&apos; la versione di prima. Copia execution/bookmap_addon.py in C:\Bookmap\Python\, ricostruiscilo e riattivalo.
+                  </span>
+                ) : (
+                  <>
+                    Oggi: <span style={{ color: ARANCIO_STOP }}>{contaOggi('stop', Number(minStop))} stop</span> ·{' '}
+                    <span style={{ color: VERDE }}>{contaOggi('abs', Number(minAss))} assorbimenti</span>
+                    {' · '}
+                    <span
+                      title="Gli stop si riconoscono solo se il feed manda l'ID dell'ordine aggressore: quando scattano, compaiono come aggressori diversi nella stessa esecuzione"
+                      className={quotaId === 0 ? 'text-amber-300' : ''}
+                    >
+                      feed (ultimo minuto): {quotaId == null ? '—' : `${Math.round(quotaId * 100)}% trade con ID aggressore`}, {diagMinuto.multi}/{diagMinuto.ex} esecuzioni con piu&apos; aggressori
+                      {quotaId === 0 && ' — senza ID gli stop non si possono riconoscere'}
+                    </span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
           <div className="relative h-[340px] md:h-[400px]">
             <canvas ref={prezzoRef} className="cursor-crosshair" />
           </div>
@@ -1853,19 +2064,34 @@ export default function BookmapPage() {
                 ? `Order Flow Imbalance ${nLivelli === 1 ? 'al migliore (OFI)' : `multilivello (MLOFI) · primi ${nLivelli} livelli`} · ${
                     mediaLiq === '1' ? 'secondo per secondo' : `somma ultimi ${mediaLiq} s`
                   } · in code medie · sopra zero pressione in acquisto, sotto in vendita`
+                : vistaBook === 'ofiPct'
+                  ? `OFI % · ${nLivelli === 1 ? 'OFI al migliore' : `MLOFI ${nLivelli} livelli`}, ${
+                      mediaLiq === '1' ? 'secondo per secondo' : `somma ${mediaLiq} s`
+                    }, come percentile di sessione · oltre ±${ZONA_ESTREMA} pressione estrema: non vuol dire che stia per finire`
                 : vistaBook === 'asimmetria'
                   ? `Asimmetria del book · baricentro della liquidita' dal mid, 15 livelli · sopra zero l'ask si allontana, sotto e' il bid ad allontanarsi`
                   : `Sbilancio statico della liquidita' esposta · ${corrente?.levels ?? 10} livelli per lato · sopra zero piu' bid · da solo inganna: la liquidita' va e viene`}
             </div>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
               {vistaBook === 'mlofi' && <Netto testo={nLivelli === 1 ? 'OFI' : 'MLOFI'} valore={letto?.mlofi ?? null} decimali={1} />}
+              {vistaBook === 'ofiPct' && (
+                <span
+                  title={
+                    ofiPctOra == null
+                      ? `Servono almeno ${MIN_CAMPIONI_PCT / 60} minuti di OFI in sessione per un percentile`
+                      : 'Pressione di adesso rispetto a quelle della sessione, col segno: +80 = in acquisto, piu\' forte dell\'80% delle letture'
+                  }
+                >
+                  <Netto testo="OFI %" valore={ofiPctOra} />
+                </span>
+              )}
               <Selettore
                 titolo="Vista"
                 valore={vistaBook}
-                opzioni={[['mlofi', 'OFI'], ['asimmetria', 'Asimmetria'], ['statico', 'Statico']]}
+                opzioni={[['mlofi', 'OFI'], ['ofiPct', 'OFI %'], ['asimmetria', 'Asimmetria'], ['statico', 'Statico']]}
                 onChange={cambiaVistaBook}
               />
-              {vistaBook === 'mlofi' && (
+              {(vistaBook === 'mlofi' || vistaBook === 'ofiPct') && (
                 <Selettore
                   titolo="Livelli"
                   valore={livelliOfi}
@@ -1874,9 +2100,9 @@ export default function BookmapPage() {
                 />
               )}
               <Selettore
-                titolo={vistaBook === 'mlofi' ? 'Somma' : 'Media'}
+                titolo={vistaBook === 'mlofi' || vistaBook === 'ofiPct' ? 'Somma' : 'Media'}
                 valore={mediaLiq}
-                opzioni={[['1', vistaBook === 'mlofi' ? '1 s' : 'Off'], ['10', '10 s'], ['30', '30 s'], ['60', '60 s']]}
+                opzioni={[['1', vistaBook === 'mlofi' || vistaBook === 'ofiPct' ? '1 s' : 'Off'], ['10', '10 s'], ['30', '30 s'], ['60', '60 s']]}
                 onChange={cambiaMediaLiq}
               />
               {vistaBook === 'statico' && (
@@ -2024,9 +2250,12 @@ const SOGLIA_LARGE_TICK = 0.9;
 const SOGLIA_SOTTILE = 0.75;
 const SOGLIA_PIENO = 1.25;
 /** Asimmetria oltre questa percentuale = un lato si sta ritirando. */
-const SOGLIA_ASIMMETRIA = 15;
-/** MLOFI sotto questo modulo (code medie) = pressione debole. */
-const SOGLIA_MLOFI = 0.5;
+// Tarata sulla prima ora di dati veri (30/09/2026): su ES l'asimmetria stava
+// fra −2,7 e +6,6 (5° e 95° percentile), e ±15 non scattava mai. Da
+// ricontrollare con piu' sessioni.
+const SOGLIA_ASIMMETRIA = 5;
+/** OFI % sotto questo modulo = pressione debole: meno forte di meta' delle letture della sessione. */
+const SOGLIA_FORZA = 50;
 /** Persistenza sotto la prima = pressione non confermata, sopra la seconda = continua. */
 const PERSISTENZA_BASSA = 0.15;
 const PERSISTENZA_ALTA = 0.35;
@@ -2100,7 +2329,7 @@ function LetturaBook({ letto, livelli }: { letto: Lettura | null; livelli: numbe
     const lato = l.mlofi > 0 ? 'acquisto' : 'vendita';
     const colore = l.mlofi > 0 ? VERDE : ROSSO;
     if (l.persistenza < PERSISTENZA_BASSA) pressione = { verdetto: 'Non confermata', colore: AMBRA };
-    else if (Math.abs(l.mlofi) < SOGLIA_MLOFI) pressione = { verdetto: 'Debole', colore: NEUTRO };
+    else if (l.forza != null && Math.abs(l.forza) < SOGLIA_FORZA) pressione = { verdetto: 'Debole', colore: NEUTRO };
     else if (l.persistenza >= PERSISTENZA_ALTA) pressione = { verdetto: `In ${lato}, continua`, colore };
     else pressione = { verdetto: `In ${lato}, a strappi`, colore };
   }
@@ -2143,8 +2372,8 @@ function LetturaBook({ letto, livelli }: { letto: Lettura | null; livelli: numbe
           titolo={livelli === 1 ? 'Pressione (OFI)' : `Pressione (MLOFI ${livelli})`}
           verdetto={pressione.verdetto}
           colore={pressione.colore}
-          dettaglio={`${uno(l.mlofi, true)} code · persistenza ${pct(l.persistenza)} · fugaci ${pct(l.fugaci)}${fugace ? ' !' : ''}`}
-          spiegazione={`MLOFI: come cambia il book (inserimenti, cancellazioni, eseguiti), non quanto ce n'e'. Persistenza = |somma| / somma dei moduli dell'OFI secondo per secondo: bassa vuol dire che la pressione va avanti e indietro (100, 60, 300, 70...), ordini che vengono aggiunti e tolti. Fugaci = ordini aggiunti nei primi 5 livelli poi cancellati invece che eseguiti${fugace ? ': oltre il 90%, liquidita\' che non va presa per un muro' : ''}.`}
+          dettaglio={`${uno(l.mlofi, true)} code · forza ${l.forza == null ? '—' : `${l.forza > 0 ? '+' : ''}${Math.round(l.forza)}`} · persistenza ${pct(l.persistenza)} · fugaci ${pct(l.fugaci)}${fugace ? ' !' : ''}`}
+          spiegazione={`MLOFI: come cambia il book (inserimenti, cancellazioni, eseguiti), non quanto ce n'e'. Forza = OFI %, il MLOFI rispetto alla sessione (sotto ±50 la pressione e' debole). Persistenza = |somma| / somma dei moduli dell'OFI secondo per secondo: bassa vuol dire che la pressione va avanti e indietro (100, 60, 300, 70...), ordini che vengono aggiunti e tolti. Fugaci = ordini aggiunti nei primi 5 livelli poi cancellati invece che eseguiti${fugace ? ': oltre il 90%, liquidita\' che non va presa per un muro' : ''}.`}
         />
         <div
           className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 col-span-2 md:col-span-1"
