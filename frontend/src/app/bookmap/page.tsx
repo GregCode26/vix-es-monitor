@@ -537,6 +537,61 @@ function valoreBook(v: number, vista: VistaBook) {
   return `${Math.round(v)}%`;
 }
 
+/** Colore dell'SPX corrispondente, accanto al prezzo ES. */
+const VERDE_SPX = '#4ade80';
+/** Ogni quanto rileggere l'ultima base ES - SPX (una riga di /api/market, ~1 KB). */
+const BASE_MS = 15_000;
+
+/** Una misura della base: ES - SPX allo stesso istante dello stesso snapshot IBKR. */
+interface PuntoBase {
+  sec: number;
+  base: number;
+}
+
+/** La serie della base dallo storico di /api/market: solo i punti con SPX cash vero (dalle 15:30). */
+function serieBase(storico: { time?: string; esf?: number | null; spx?: number | null }[] | undefined): PuntoBase[] {
+  const out: PuntoBase[] = [];
+  for (const p of storico ?? []) {
+    if (!p.time || !p.esf || !p.spx || p.esf <= 0 || p.spx <= 0) continue;
+    const sec = secondi(p.time);
+    if (out.length > 0 && sec <= out[out.length - 1].sec) continue;
+    out.push({ sec, base: p.esf - p.spx });
+  }
+  return out;
+}
+
+/**
+ * Finestra della mediana della base. Una lettura sola e' rumorosa: esf e spx
+ * del poller non sono presi nello stesso istante esatto, e il 05/10/2026 le
+ * letture andavano da 50,15 a 54,59 con uno scarto tipico di 0,44 punti dalla
+ * mediana di 5 minuti, che invece si e' mossa piano (52,0 -> 52,6).
+ */
+const BASE_FINESTRA_SEC = 300;
+
+/**
+ * La base in vigore a `sec`: la mediana delle misure dei BASE_FINESTRA_SEC
+ * prima (o, se in quella finestra non ce ne sono, l'ultima misurata). null
+ * prima della prima misura, cioe' prima che l'SPX cash cominci a quotare:
+ * li' non c'e' un SPX da mostrare, e usare la base di dopo inventerebbe un
+ * prezzo che quell'ora non aveva.
+ */
+function baseAl(serie: PuntoBase[], sec: number): number | null {
+  if (serie.length === 0 || sec < serie[0].sec) return null;
+  let lo = 0;
+  let hi = serie.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (serie[mid].sec <= sec) lo = mid;
+    else hi = mid - 1;
+  }
+  const valori: number[] = [];
+  for (let i = lo; i >= 0 && serie[i].sec > sec - BASE_FINESTRA_SEC; i--) valori.push(serie[i].base);
+  if (valori.length === 0) return serie[lo].base;
+  valori.sort((a, b) => a - b);
+  const m = valori.length >> 1;
+  return valori.length % 2 ? valori[m] : (valori[m - 1] + valori[m]) / 2;
+}
+
 function fissaLarghezza(scale: Scale) {
   scale.width = LARGHEZZA_ASSE;
 }
@@ -635,6 +690,14 @@ export default function BookmapPage() {
   const mostraRangeRef = useRef(true);
   /** Livelli R1/R2/R3 da disegnare, gia' filtrati per la visibilita' scelta in /market. */
   const rangeRef = useRef<{ valore: number; colore: string; etichetta: string; tratteggio: number[] }[]>([]);
+  /**
+   * La base ES - SPX della giornata, misurata nel tempo: varia (il fair value
+   * scende verso la scadenza, e intraday si muove di qualche decimo), quindi
+   * ogni istante usa la sua invece di una sola fissata.
+   */
+  const baseRef = useRef<PuntoBase[]>([]);
+  /** Il giorno a cui appartiene `baseRef`: a mezzanotte la serie di ieri non vale piu'. */
+  const baseGiorno = useRef<string | null>(null);
   const spessoreRef = useRef(1);
   const finestraFlussoRef = useRef<FinestraFlusso>('30');
   const mediaLiqRef = useRef<MediaLiq>('30');
@@ -703,6 +766,36 @@ export default function BookmapPage() {
     const id = setInterval(() => setOrologio(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  // La base ES - SPX si allunga con l'ultima riga di /api/market, che porta
+  // esf e spx dallo stesso snapshot del poller: nessun allineamento di orari
+  // fra due fonti. Lo storico della giornata arriva insieme ai range (sotto).
+  useEffect(() => {
+    if (!autorizzato) return;
+    const carica = async () => {
+      try {
+        const oggi = new Date().toDateString();
+        if (baseGiorno.current !== oggi) {
+          baseRef.current = [];
+          baseGiorno.current = oggi;
+        }
+        const res = await fetch('/api/market', { cache: 'no-store' });
+        if (!res.ok) return;
+        const json: { sourceTime?: string | null; esf?: number | null; spx?: number | null } = await res.json();
+        const nuovi = serieBase([{ time: json.sourceTime ?? undefined, esf: json.esf, spx: json.spx }]);
+        const serie = baseRef.current;
+        if (nuovi.length === 1 && (serie.length === 0 || nuovi[0].sec > serie[serie.length - 1].sec)) {
+          serie.push(nuovi[0]);
+          chartPrezzo.current?.draw();
+        }
+      } catch (e) {
+        console.error('Base ES-SPX fetch failed:', e);
+      }
+    };
+    carica();
+    const id = setInterval(carica, BASE_MS);
+    return () => clearInterval(id);
+  }, [autorizzato]);
 
   /**
    * Mette i dati nei grafici e ricalcola gli assi che l'utente non ha fissato.
@@ -1146,6 +1239,49 @@ export default function BookmapPage() {
         },
       };
 
+      /**
+       * L'SPX corrispondente accanto a ogni prezzo ES dell'asse, dentro il
+       * grafico (l'asse e' largo LARGHEZZA_ASSE, fisso per allineare i tre
+       * grafici, e due numeri non ci stanno). La base e' quella dell'ultimo
+       * istante visibile: spostandosi indietro nella giornata si usa quella
+       * di allora. Prima delle 15:30 non c'e' SPX cash e non si scrive niente.
+       */
+      const spxAsse = {
+        id: 'spxAsse',
+        afterDatasetsDraw: (chart: ChartJS) => {
+          const sy = chart.scales.yPrezzo;
+          const sx = chart.scales.x;
+          const pts = pointsRef.current;
+          if (!sy || !sx || pts.length === 0) return;
+          const ultimo = secondi(pts[pts.length - 1].time);
+          const b = baseAl(baseRef.current, Math.min(sx.max, ultimo));
+          if (b == null) return;
+          const { ctx, chartArea: a } = chart;
+          ctx.save();
+          ctx.font = '10px Arial';
+          ctx.textBaseline = 'middle';
+          ctx.textAlign = 'left';
+          for (const t of sy.ticks) {
+            const y = sy.getPixelForValue(t.value);
+            if (y < a.top + 6 || y > a.bottom - 6) continue;
+            const testo = (t.value - b).toFixed(2);
+            const w = ctx.measureText(testo).width + 6;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+            ctx.fillRect(a.left + 2, y - 7, w, 14);
+            ctx.fillStyle = VERDE_SPX;
+            ctx.fillText(testo, a.left + 5, y);
+          }
+          // Quale base si sta usando, in alto: e' il numero da controllare.
+          const titolo = `SPX = ES ${b >= 0 ? '−' : '+'} ${Math.abs(b).toFixed(2)}`;
+          const w = ctx.measureText(titolo).width + 8;
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+          ctx.fillRect(a.left + 2, a.top + 2, w, 14);
+          ctx.fillStyle = VERDE_SPX;
+          ctx.fillText(titolo, a.left + 6, a.top + 9);
+          ctx.restore();
+        },
+      };
+
       const mirino = {
         id: 'mirino',
         afterEvent: (chart: ChartJS, args: { event: { type: string; x: number | null; y: number | null }; changed?: boolean }) => {
@@ -1212,6 +1348,18 @@ export default function BookmapPage() {
                       ? `${Math.round(v)}%`
                       : compatto(v);
               etichetta(testo, (scala.left + scala.right) / 2, m.y, scala.right - scala.left);
+              // L'SPX dello stesso livello, con la base di quell'istante.
+              if (scala.id === 'yPrezzo') {
+                const b = baseAl(baseRef.current, m.sec);
+                if (b != null) {
+                  const t = `SPX ${(v - b).toFixed(2)}`;
+                  const w = ctx.measureText(t).width + 10;
+                  ctx.fillStyle = '#14532d';
+                  ctx.fillRect(a.left + 2, m.y - 10, w, 20);
+                  ctx.fillStyle = '#dcfce7';
+                  ctx.fillText(t, a.left + 2 + w / 2, m.y);
+                }
+              }
             }
           }
           ctx.restore();
@@ -1220,7 +1368,7 @@ export default function BookmapPage() {
 
       chartPrezzo.current = new ChartJS(prezzoRef.current, {
         type: 'line',
-        plugins: [ordini, range, eventiPlugin, mirino],
+        plugins: [ordini, range, eventiPlugin, spxAsse, mirino],
         data: {
           datasets: [
             {
@@ -1546,7 +1694,15 @@ export default function BookmapPage() {
       try {
         const res = await fetch('/api/market?history=true', { cache: 'no-store' });
         if (res.ok) {
-          const ob = (await res.json())?.range?.ob as Record<string, number> | null | undefined;
+          const json = await res.json();
+          // Lo stesso storico porta esf e spx di ogni riga: e' la serie della
+          // base, senza scaricarlo una seconda volta.
+          if (!fermo) {
+            baseRef.current = serieBase(json?.history);
+            baseGiorno.current = new Date().toDateString();
+            chartPrezzo.current?.draw();
+          }
+          const ob = json?.range?.ob as Record<string, number> | null | undefined;
           if (ob && !fermo) {
             dalServer = Object.fromEntries(RANGE_ES.flatMap((r) => {
               const v = ob[r.key.replace(/Ob$/, '')];
