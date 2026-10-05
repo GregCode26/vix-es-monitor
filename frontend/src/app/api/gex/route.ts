@@ -19,6 +19,15 @@
 // In entrambi i casi non si sa chi ha comprato e chi ha venduto: il segno
 // (call positive, put negative) resta l'euristica standard "dealer lunghi di
 // call, corti di put", non un dato osservato.
+//
+// La terza misura, `gexLr`, invece il lato lo usa: il poller classifica ogni
+// trade con Lee-Ready (cb/cs/pb/ps = call e put comprate e vendute dai
+// clienti), e la posizione dei dealer e' l'opposto del flusso dei clienti:
+//   dealer netti = -(cb - cs) - (pb - ps)
+// Un'opzione comprata dal cliente e' venduta dal dealer, e un'opzione corta
+// e' gamma negativo per chi la ha, call o put che sia. Positivo = dealer
+// lunghi di gamma, come per le altre due. Vale solo per i contratti visti dal
+// poller da quando lo classifica (niente open interest pregresso).
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
@@ -39,6 +48,11 @@ interface StrikeRow {
     gamma?: number | null;
     delta?: number | null;
     vega?: number | null;
+    /** Lee-Ready: call comprate/vendute e put comprate/vendute oggi. Assenti prima del poller che le conta. */
+    cb?: number;
+    cs?: number;
+    pb?: number;
+    ps?: number;
 }
 
 interface Snapshot {
@@ -66,6 +80,10 @@ interface ProfileRow {
     strike: number;
     gex: number;
     gexOi: number;
+    /** GEX dei dealer dal flusso Lee-Ready; 0 dove il poller non lo conta ancora. */
+    gexLr: number;
+    /** I conti Lee-Ready di oggi: [call comprate, call vendute, put comprate, put vendute]. */
+    lr?: [number, number, number, number];
 }
 
 /**
@@ -96,6 +114,7 @@ interface SerieFrame {
     time: string;
     gex: number[];
     gexOi: number[];
+    gexLr: number[];
 }
 
 /** Quanto lontano indietro guardano i pallini storici. */
@@ -211,6 +230,8 @@ function elaboraSnapshot(
     profileHistory: ProfileSnapshot[];
     strikes: number[];
     serie: SerieFrame[];
+    conLr: boolean;
+    inizioLr: string | null;
 } {
     const points: GexPoint[] = [];
     const precedenti = new Map<number, Netti>(base ?? []);
@@ -223,6 +244,10 @@ function elaboraSnapshot(
     const spotSerie: SpotPoint[] = [];
     let ultimoSpotSec = -Infinity;
     let ultimoValido: SpotPoint | null = null;
+    /** Qualche snapshot porta i conti Lee-Ready: altrimenti `gexLr` e' tutto zero e la pagina lo deve sapere. */
+    let haLr = false;
+    /** Il primo snapshot con i conti Lee-Ready: prima di allora `gexLr` vale zero perche' non misurato. */
+    let inizioLr: string | null = null;
 
     // Il profilo di N minuti fa non si ricostruisce dai `points`: quelli sono
     // differenze di contratti, mentre il profilo e' l'ultimo cumulato valutato
@@ -263,11 +288,19 @@ function elaboraSnapshot(
 
             const vol = (row.calls ?? 0) - (row.puts ?? 0);
             const oi = (row.callsOi ?? 0) - (row.putsOi ?? 0);
+            const conLr = row.cb != null && row.cs != null && row.pb != null && row.ps != null;
+            if (conLr) {
+                haLr = true;
+                if (inizioLr == null) inizioLr = orario;
+            }
+            const dealer = conLr ? -(row.cb! - row.cs!) - (row.pb! - row.ps!) : 0;
 
             profilo.set(row.strike, {
                 strike: row.strike,
                 gex: strikeGex(row.gamma, vol, spot),
                 gexOi: strikeGex(row.gamma, oi, spot),
+                gexLr: strikeGex(row.gamma, dealer, spot),
+                ...(conLr ? { lr: [row.cb!, row.cs!, row.pb!, row.ps!] as [number, number, number, number] } : {}),
             });
             vistoIl.set(row.strike, snapSec);
 
@@ -342,6 +375,7 @@ function elaboraSnapshot(
         time: f.time,
         gex: strikes.map((s) => Math.round(f.mappa.get(s)?.gex ?? 0)),
         gexOi: strikes.map((s) => Math.round(f.mappa.get(s)?.gexOi ?? 0)),
+        gexLr: strikes.map((s) => Math.round(f.mappa.get(s)?.gexLr ?? 0)),
     }));
 
     return {
@@ -351,6 +385,8 @@ function elaboraSnapshot(
         profileHistory,
         strikes,
         serie,
+        conLr: haLr,
+        inizioLr,
     };
 }
 
@@ -487,7 +523,7 @@ export async function GET(request: Request) {
         // dieci minuti i pallini: dopo, il client ha gia' i profili che ha
         // ricevuto e se li tiene da solo. Con `since` la finestra e' larga
         // pochi secondi e non conterrebbe comunque niente.
-        const { points, profile, spot, profileHistory, strikes, serie } = elaboraSnapshot(snapshots, targetDate, base, !since);
+        const { points, profile, spot, profileHistory, strikes, serie, conLr, inizioLr } = elaboraSnapshot(snapshots, targetDate, base, !since);
         // `lastTime` e' l'ora di Roma dell'ultimo snapshot: il client la
         // rimanda come `since`. I punti invece portano l'ora di New York,
         // che e' quella su cui ragiona la pagina.
@@ -523,7 +559,7 @@ export async function GET(request: Request) {
         // `profile` sostituisce quello che il client ha, non ci si somma: e'
         // gia' il totale di giornata. `points` invece si accoda.
         return NextResponse.json(
-            { date: targetDate, since, lastTime, points: finali, profile, spot, profileHistory, strikes, serie, troncato: tagliati },
+            { date: targetDate, since, lastTime, points: finali, profile, spot, profileHistory, strikes, serie, conLr, inizioLr, troncato: tagliati },
             { status: 200 },
         );
     } catch (e: unknown) {

@@ -157,6 +157,106 @@ class MarketTide:
     def fotografia(self):
         return {"ncp": round(self.ncp), "npp": round(self.npp), "ncv": self.ncv, "npv": self.npv}
 
+
+class LeeReady:
+    """Call e put comprate e vendute per strike, con l'algoritmo di Lee e Ready (1991).
+
+    Ogni volta che il volume cumulato di un contratto sale, i contratti in piu'
+    sono un trade (o piu' trade fra due aggiornamenti: IBKR campiona i tick
+    delle opzioni, non li manda tutti). Si classificano cosi':
+
+    1. regola della quotazione: prezzo del trade sopra il mid del bid/ask in
+       vigore PRIMA del trade = iniziato da un compratore, sotto = da un
+       venditore. Il bid/ask di prima e non quello arrivato insieme: un trade
+       aggressivo sposta la quotazione, e letto dopo sembrerebbe a meta';
+    2. tick test, per i trade esattamente sul mid: prezzo salito rispetto
+       all'ultimo trade a prezzo diverso = acquisto, sceso = vendita; a
+       prezzo uguale vale il verso dell'ultima variazione (zero-tick).
+
+    A differenza di MarketTide non scarta i trade a meta' spread e tiene i
+    conti per strike, che e' quello che serve a stimare la posizione dei
+    dealer: il cliente che compra ha davanti un market maker che vende.
+
+    I conti sono cumulati dall'inizio della giornata e ripartono dall'ultimo
+    snapshot dopo un riavvio; i contratti scambiati mentre il poller era giu'
+    restano fuori, perche' il loro lato non si puo' piu' ricostruire.
+    """
+
+    def __init__(self):
+        # conId -> volume visto, bid/ask in vigore, ultimo prezzo di trade diverso e verso dell'ultima variazione
+        self.stato = {}
+        # (strike, 'C'|'P') -> [comprati, venduti]
+        self.conti = {}
+        self.non_classificati = 0
+
+    def riprendi(self, snapshots):
+        for snap in reversed(snapshots):
+            righe = snap.get("volumes") or []
+            if not any("cb" in r for r in righe):
+                continue
+            for r in righe:
+                k = r.get("strike")
+                self.conti[(k, 'C')] = [int(r.get("cb", 0)), int(r.get("cs", 0))]
+                self.conti[(k, 'P')] = [int(r.get("pb", 0)), int(r.get("ps", 0))]
+            print(f"Lee-Ready ripreso dalle {snap.get('time')}")
+            return
+
+    @staticmethod
+    def _valido(x):
+        return x is not None and x == x and x > 0
+
+    def _lato(self, prezzo, s):
+        """+1 acquisto, -1 vendita, 0 se non si puo' dire."""
+        bid, ask = s["bid"], s["ask"]
+        if bid is not None and ask is not None:
+            mid = (bid + ask) / 2
+            if prezzo > mid + 1e-9:
+                return 1
+            if prezzo < mid - 1e-9:
+                return -1
+        rif = s["rif"]
+        if rif is not None and prezzo != rif:
+            return 1 if prezzo > rif else -1
+        return s["verso"]
+
+    def su_tickers(self, tickers):
+        for t in tickers:
+            c = t.contract
+            if c is None or c.secType != 'OPT':
+                continue
+            s = self.stato.setdefault(c.conId, {"vol": None, "bid": None, "ask": None, "rif": None, "verso": 0})
+            prezzo = t.last
+            vol = t.volume
+            if vol is not None and vol == vol:
+                precedente = s["vol"]
+                s["vol"] = vol
+                # Il primo volume visto e' la base; se scende (IBKR lo azzera
+                # all'apertura del cash) si riparte da li' senza classificare.
+                if precedente is not None and vol > precedente:
+                    nuovi = int(vol - precedente)
+                    if s["bid"] is None and self._valido(t.bid) and self._valido(t.ask) and t.ask > t.bid:
+                        s["bid"], s["ask"] = t.bid, t.ask
+                    lato = self._lato(prezzo, s) if self._valido(prezzo) else 0
+                    if lato == 0:
+                        self.non_classificati += nuovi
+                    else:
+                        conto = self.conti.setdefault((c.strike, c.right), [0, 0])
+                        conto[0 if lato > 0 else 1] += nuovi
+            # Dopo la classificazione: il riferimento del tick test e la
+            # quotazione valgono per il trade SUCCESSIVO.
+            if self._valido(prezzo) and prezzo != s["rif"]:
+                if s["rif"] is not None:
+                    s["verso"] = 1 if prezzo > s["rif"] else -1
+                s["rif"] = prezzo
+            if self._valido(t.bid) and self._valido(t.ask) and t.ask > t.bid:
+                s["bid"], s["ask"] = t.bid, t.ask
+
+    def riga(self, strike):
+        """I quattro conti di uno strike, per lo snapshot."""
+        cb, cs = self.conti.get((strike, 'C'), [0, 0])
+        pb, ps = self.conti.get((strike, 'P'), [0, 0])
+        return {"cb": cb, "cs": cs, "pb": pb, "ps": ps}
+
 _supabase_client = None
 
 # Quando Supabase ha risposto che la colonna `tide` non esiste
@@ -348,6 +448,9 @@ def main():
         _session_cache["snapshots"] = read_session_file(oggi)
     tide.riprendi(_session_cache["snapshots"])
     ib.pendingTickersEvent += tide.su_tickers
+    lee_ready = LeeReady()
+    lee_ready.riprendi(_session_cache["snapshots"])
+    ib.pendingTickersEvent += lee_ready.su_tickers
 
     print("Subscribed. Starting poller loop...")
 
@@ -463,9 +566,12 @@ def main():
                     # valutato il gamma.
                     "undPrice": und_price,
                     "isOpening": is_opening_snapshot,
+                    # cb/cs/pb/ps: call e put comprate e vendute oggi, per
+                    # Lee-Ready (vedi LeeReady): ~1 KB in piu' a snapshot.
                     "volumes": [{"strike": k, "calls": v["calls"], "puts": v["puts"], "gamma": v["gamma"],
                                  "delta": v["delta"], "vega": v["vega"],
-                                 "callsOi": v["callsOi"], "putsOi": v["putsOi"]}
+                                 "callsOi": v["callsOi"], "putsOi": v["putsOi"],
+                                 **lee_ready.riga(k)}
                                 for k, v in volume_by_strike.items()],
                     # Solo nel file locale: push_snapshot_to_supabase sceglie
                     # le colonne una per una e questa non c'e'.
