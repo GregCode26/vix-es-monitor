@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false });
+// Su canvas e con i suoi dati: si monta solo con la vista Mappa Calore aperta.
+const GammaHeatmapLive = dynamic(() => import('@/components/GammaHeatmapLive'), { ssr: false });
 
 interface HedgingPressureRow {
     strike: number;
@@ -81,6 +83,12 @@ export default function HedgingPressurePage() {
     const [showDebug, setShowDebug] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
     const [viewMode, setViewMode] = useState<ViewMode>('profile');
+    /**
+     * La mappa, una volta aperta, resta montata (nascosta) per tutta la vita
+     * della pagina: rimontarla a ogni ritorno rileggeva l'intera sessione di
+     * gamma da Supabase.
+     */
+    const [mappaAperta, setMappaAperta] = useState(false);
     const lastTime = useRef<string | null>(null);
     const giornoSessione = useRef<string | null>(null);
     /**
@@ -336,90 +344,10 @@ export default function HedgingPressurePage() {
         [],
     );
 
-    // Opzione echarts per heatmap (pressione per strike nel tempo)
-    const heatmapOption = useMemo(() => {
-        if (storico.length === 0) return {};
-
-        // Group by strike and create heatmap data
-        const heatmapData: [number, number, number][] = []; // [time_index, strike, pressure]
-        const timeIndex: Record<string, number> = {};
-        const uniqueTimes: string[] = [];
-        const uniqueStrikes = Array.from(new Set(storico.map((p) => p.strike))).sort((a, b) => a - b);
-
-        // Build time index
-        for (const point of storico) {
-            if (!(point.time in timeIndex)) {
-                timeIndex[point.time] = uniqueTimes.length;
-                uniqueTimes.push(point.time);
-            }
-        }
-
-        // Build heatmap data
-        for (const point of storico) {
-            const timeIdx = timeIndex[point.time];
-            const strikeIdx = uniqueStrikes.indexOf(point.strike);
-            heatmapData.push([timeIdx, strikeIdx, Math.round(point.totalPressure * 10) / 10]);
-        }
-
-        return {
-            backgroundColor: '#0c0d10',
-            tooltip: { position: 'top' },
-            grid: {
-                left: 60,
-                right: 40,
-                top: 50,
-                bottom: 40,
-            },
-            xAxis: {
-                type: 'category',
-                data: uniqueTimes,
-                name: 'Time',
-                nameLocation: 'center',
-                nameGap: 30,
-                nameTextStyle: { color: '#e2e8f0', fontSize: 12 },
-                axisLabel: { color: '#94a3b8', fontSize: 9, formatter: (val: string) => val.split(':').slice(0, 2).join(':') },
-                splitLine: { show: false },
-                axisLine: { lineStyle: { color: '#334155' } },
-            },
-            yAxis: {
-                type: 'category',
-                data: uniqueStrikes,
-                name: 'Strike',
-                nameLocation: 'center',
-                nameGap: 40,
-                nameTextStyle: { color: '#e2e8f0', fontSize: 12 },
-                axisLabel: { color: '#94a3b8', fontSize: 8 },
-                splitLine: { show: false },
-                axisLine: { lineStyle: { color: '#334155' } },
-            },
-            visualMap: {
-                min: -100,
-                max: 100,
-                calculable: true,
-                orient: 'vertical',
-                right: 10,
-                top: 50,
-                inRange: {
-                    color: ['#ef4444', '#f97316', '#fbbf24', '#e5e7eb', '#93c5fd', '#3b82f6'],
-                },
-                textStyle: { color: '#94a3b8', fontSize: 9 },
-            },
-            series: [
-                {
-                    name: 'Hedging Pressure',
-                    type: 'heatmap',
-                    data: heatmapData,
-                    cellSize: ['auto', 20],
-                    emphasis: {
-                        itemStyle: {
-                            borderColor: '#fff',
-                            borderWidth: 1,
-                        },
-                    },
-                },
-            ],
-        };
-    }, [storico]);
+    // La vista Mappa Calore non e' piu' un grafico echarts: prima era la
+    // pressione dei soli cinque strike di `storico`, troppo pochi per una
+    // mappa. Ora e' il gamma dei market maker su tutta la catena nel tempo,
+    // sul modello di SpotGamma (GammaHeatmapLive).
 
     // Opzione echarts per il grafico profile (barre)
     const option = useMemo(() => {
@@ -580,7 +508,10 @@ export default function HedgingPressurePage() {
                             {(['profile', 'timeseries', 'heatmap'] as const).map((mode) => (
                                 <button
                                     key={mode}
-                                    onClick={() => setViewMode(mode)}
+                                    onClick={() => {
+                                        setViewMode(mode);
+                                        if (mode === 'heatmap') setMappaAperta(true);
+                                    }}
                                     className={`px-2.5 py-1.5 text-xs transition-colors ${
                                         viewMode === mode
                                             ? 'bg-blue-600/30 text-blue-300'
@@ -665,9 +596,14 @@ export default function HedgingPressurePage() {
 
                 <div className="bg-[#0c0d10] border border-slate-800/80 rounded-xl p-2 shadow-2xl w-full mb-3">
                     <div className="h-[calc(100vh-300px)] min-h-[600px]">
-                        {pronto ? (
+                        {mappaAperta && (
+                            <div className={viewMode === 'heatmap' ? 'h-full' : 'hidden'}>
+                                <GammaHeatmapLive attiva={viewMode === 'heatmap'} />
+                            </div>
+                        )}
+                        {viewMode === 'heatmap' ? null : pronto ? (
                             <ReactECharts
-                                option={viewMode === 'profile' ? option : viewMode === 'timeseries' ? timeseriesOption : heatmapOption}
+                                option={viewMode === 'profile' ? option : timeseriesOption}
                                 style={{ height: '100%', width: '100%' }}
                                 notMerge={true}
                                 onEvents={viewMode === 'timeseries' ? { datazoom: suZoomSerie } : undefined}
