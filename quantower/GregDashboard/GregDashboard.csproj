@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Indicatore Quantower che legge la dashboard (localhost:3000) e disegna sul
+    grafico di ES i range, il profilo GEX in ES e la liquidita' di Bookmap.
+
+    `dotnet build -c Release` compila e copia la DLL nella cartella degli
+    indicatori di Quantower. Quantower installa ogni versione in una cartella
+    sua (v1.141.4, ...): dopo un aggiornamento va cambiato QuantowerBin, o
+    passato da riga di comando con -p:QuantowerBin=...
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GregDashboard</AssemblyName>
+    <RootNamespace>GregDashboard</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Il Quantower che si usa e' quello di AMP in Documenti, non quello in Program Files. -->
+    <QuantowerRoot Condition="'$(QuantowerRoot)' == ''">$(USERPROFILE)\Documents\AMP Quantower</QuantowerRoot>
+    <QuantowerBin Condition="'$(QuantowerBin)' == ''">$(QuantowerRoot)\TradingPlatform\v1.141.4\bin</QuantowerBin>
+    <QuantowerIndicators>$(QuantowerRoot)\Settings\Scripts\Indicators</QuantowerIndicators>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>$(QuantowerBin)\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CopiaInQuantower" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(QuantowerIndicators)" ContinueOnError="true" />
+    <Message Importance="high" Text="Copiato in $(QuantowerIndicators)" />
+  </Target>
+
+</Project>

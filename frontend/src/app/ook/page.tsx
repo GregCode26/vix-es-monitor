@@ -34,6 +34,7 @@ interface GexResponse {
     profile?: ProfileRow[];
     spot?: SpotPoint[];
     date?: string;
+    lastTime?: string | null;
 }
 
 interface VolumesResponse {
@@ -42,6 +43,15 @@ interface VolumesResponse {
 }
 
 const REFRESH_MS = 5000;
+/** Il primo giro chiede solo gli snapshot di questi ultimi minuti, non la sessione. */
+const FINESTRA_INIZIALE_MS = 5 * 60 * 1000;
+
+/** HH:MM:SS a Roma, il fuso in cui i poller scrivono `time`. */
+function oraRoma(ms: number): string {
+    return new Intl.DateTimeFormat('it-IT', {
+        timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(new Date(ms));
+}
 
 interface RangeValues {
     r1Up: number;
@@ -130,15 +140,37 @@ export default function OokPage() {
     const [chartOffset, setChartOffset] = useState({ x: 0, y: 0 });
     const [showTheory, setShowTheory] = useState(false);
 
+    /** Ora di Roma dell'ultimo snapshot ricevuto, da rimandare come `since`. */
+    const cursore = useRef<string | null>(null);
+    const giorno = useRef<string | null>(null);
+
     const fetchData = useCallback(async () => {
         try {
-            const gexRes = await fetch('/api/gex?flow=0', { cache: 'no-store' });
+            // Sempre con `since`: senza, ogni giro da 5 secondi riscaricava da
+            // Supabase la sessione intera due volte (12-17 MB l'una a fine
+            // giornata), ed e' fra le cose che hanno esaurito l'egress del
+            // piano gratuito. La pagina usa solo l'ultimo snapshot e il
+            // profilo, che e' gia' il totale di giornata: al primo giro
+            // bastano gli ultimi minuti.
+            const since = cursore.current ?? oraRoma(Date.now() - FINESTRA_INIZIALE_MS);
+            const q = encodeURIComponent(since);
+            const [gexRes, volRes] = await Promise.all([
+                fetch(`/api/gex?flow=0&since=${q}`, { cache: 'no-store' }),
+                fetch(`/api/volumes?since=${q}`, { cache: 'no-store' }),
+            ]);
             if (!gexRes.ok) throw new Error('GEX fetch failed');
-            const gexData: GexResponse = await gexRes.json();
-
-            const volRes = await fetch('/api/volumes', { cache: 'no-store' });
             if (!volRes.ok) throw new Error('Volumes fetch failed');
+            const gexData: GexResponse = await gexRes.json();
             const volData: VolumesResponse = await volRes.json();
+
+            // Cambio di giornata: il cursore di ieri sera scarterebbe tutto oggi.
+            if (gexData.date && giorno.current && gexData.date !== giorno.current) {
+                giorno.current = gexData.date;
+                cursore.current = null;
+                return;
+            }
+            if (gexData.date) giorno.current = gexData.date;
+            if (gexData.lastTime) cursore.current = gexData.lastTime;
 
             if (gexData.profile && gexData.profile.length > 0) {
                 setGex(gexData.profile);
