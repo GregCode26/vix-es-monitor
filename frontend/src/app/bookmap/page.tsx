@@ -652,8 +652,7 @@ export default function BookmapPage() {
   const [blocco, setBlocco] = useState<Blocco>(LIBERO);
   const [mostraCvd, setMostraCvd] = useState(true);
   const [soglia, setSoglia] = useState(SOGLIA_MIN);
-  const [mostraOrdini, setMostraOrdini] = useState(true);
-  const [mostraRange, setMostraRange] = useState(true);
+  const [mostraOrdini, setMostraOrdini] = useState(true);  const [mostraRange, setMostraRange] = useState(true);
   const [quantiRange, setQuantiRange] = useState(0);
   const [spessore, setSpessore] = useState(1);
   const [finestraFlusso, setFinestraFlusso] = useState<FinestraFlusso>('30');
@@ -683,8 +682,7 @@ export default function BookmapPage() {
   const finestraRef = useRef<Finestra>('60');
   const bloccoRef = useRef<Blocco>(LIBERO);
   const mostraCvdRef = useRef(true);
-  const sogliaRef = useRef(SOGLIA_MIN);
-  const mostraOrdiniRef = useRef(true);
+  const sogliaRef = useRef(SOGLIA_MIN);  const mostraOrdiniRef = useRef(true);
   const mostraRangeRef = useRef(true);
   /** Livelli R1/R2/R3 da disegnare, gia' filtrati per la visibilita' scelta in /market. */
   const rangeRef = useRef<{ valore: number; colore: string; etichetta: string; tratteggio: number[] }[]>([]);
@@ -810,6 +808,15 @@ export default function BookmapPage() {
     const xs = pts.map((p) => secondi(p.time));
     cp.data.datasets[0].data = pts.map((p, i) => ({ x: xs[i], y: p.price ?? NaN }));
     cp.data.datasets[1].data = pts.map((p, i) => ({ x: xs[i], y: p.cvd }));
+    // Con livelli contigui (un tick l'uno) il livello N sta N-1 tick oltre il migliore.
+    const nLiv = Number(livelliOfiRef.current);
+    const scarto = (nLiv - 1) * TICK;
+    const bordoBid = pts.map((p) => (p.bid != null ? p.bid - scarto : NaN));
+    const bordoAsk = pts.map((p) => (p.ask != null ? p.ask + scarto : NaN));
+    cp.data.datasets[2].data = xs.map((x, i) => ({ x, y: bordoBid[i] }));
+    cp.data.datasets[3].data = xs.map((x, i) => ({ x, y: bordoAsk[i] }));
+    cp.data.datasets[2].hidden = nLiv <= 1;
+    cp.data.datasets[3].hidden = nLiv <= 1;
     // Lo sbilancio si calcola sulle medie, non si fa la media dello sbilancio:
     // cosi' pesa di piu' quando il book e' pieno.
     const w = Number(mediaLiqRef.current);
@@ -896,6 +903,8 @@ export default function BookmapPage() {
     if (!b.sopra) {
       const sp = cp.options.scales!;
       const prezzi = visibili.map((p) => p.price ?? NaN);
+      // Le due linee dei livelli devono stare dentro la scala, se no non si vedono.
+      if (nLiv > 1) xs.forEach((x, i) => { if (x >= da && x <= a) prezzi.push(bordoBid[i], bordoAsk[i]); });
       // Con i range accesi la scala arriva fino al livello piu' vicino sopra e
       // sotto il prezzo: se si fermasse al prezzo non se ne vedrebbe quasi mai
       // uno, se li prendesse tutti e dodici il prezzo diventerebbe una riga.
@@ -1346,6 +1355,10 @@ export default function BookmapPage() {
               tension: 0,
             },
             { label: 'CVD', data: [], yAxisID: 'yCvd', borderColor: VIOLA, borderWidth: 2, pointRadius: 0, tension: 0 },
+            // Il bordo dei livelli che entrano nell'OFI/MLOFI (selettore Livelli):
+            // l'N-esimo bid sotto e l'N-esimo ask sopra il prezzo.
+            { label: 'Livello N bid', data: [], yAxisID: 'yPrezzo', borderColor: 'rgba(52, 211, 153, 0.55)', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, tension: 0 },
+            { label: 'Livello N ask', data: [], yAxisID: 'yPrezzo', borderColor: 'rgba(244, 63, 94, 0.55)', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, tension: 0 },
           ],
         },
         options: {
@@ -1601,8 +1614,7 @@ export default function BookmapPage() {
       if (localStorage.getItem('bookmap_ordini') === 'off') {
         mostraOrdiniRef.current = false;
         setMostraOrdini(false);
-      }
-    } catch {
+      }    } catch {
       // niente preferenza salvata
     }
   }, []);
@@ -1984,8 +1996,7 @@ export default function BookmapPage() {
                 title={mostraOrdini ? 'Nascondi le linee degli ordini limit' : 'Mostra le linee degli ordini limit'}
               >
                 {mostraOrdini ? 'ON' : 'OFF'}
-              </button>
-              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title="Da quanti contratti in su un livello diventa una linea">
+              </button>              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title="Da quanti contratti in su un livello diventa una linea">
                 <input
                   type="range"
                   min={SOGLIA_MIN}

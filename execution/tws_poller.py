@@ -71,8 +71,8 @@ def cono_gia_fissato(date_key):
     """
     Il cono di oggi, se era gia' stato fissato prima di questo avvio.
 
-    Sta in un file suo e non fra gli snapshot: quelli sono tagliati agli
-    ultimi 100, cioe' venticinque minuti, quindi un poller ripartito la sera
+    Sta in un file suo e non fra gli snapshot: quelli fino al 13/10/2026
+    erano tagliati agli ultimi 100, cioe' venticinque minuti, e un poller ripartito la sera
     non ci troverebbe piu' il punto delle 15:35 -- ci troverebbe il piu'
     vecchio che gli e' rimasto, delle 20:30, e lo congelerebbe chiamandolo
     apertura. Un valore sbagliato con l'aria di essere quello giusto e' il
@@ -101,15 +101,16 @@ def append_to_session_file(date_key, point):
     ensure_data_dir()
     existing = read_session_file(date_key)
     existing.append(point)
-    
-    # Keep only the last 100 snapshots to ensure performance
-    if len(existing) > 100:
-        existing = existing[-100:]
-        
+
+    # La giornata intera, non gli ultimi 100 punti: col solo locale (Supabase
+    # spento dal 12/10/2026) questo file e' l'unico storico, e tagliato a
+    # venticinque minuti perdeva il punto delle 15:35 da cui /api/market
+    # calcola i range R1/R2/R3 (spariti da /market, /bookmap e Quantower).
+    # Senza indentazione: ~10.000 punti al giorno restano qualche MB.
     file_path = get_file_path(date_key)
     try:
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(existing, f, indent=2)
+            json.dump(existing, f)
     except Exception as e:
         print(f"Error writing to file {file_path}: {e}")
 

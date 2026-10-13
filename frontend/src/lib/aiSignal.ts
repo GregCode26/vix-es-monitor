@@ -111,7 +111,7 @@ export function riassumi(fonti: {
         },
         gammaSpx: gex
             ? {
-                  nota: 'Valori in $M. gex = pesato sul volume del giorno (flusso), gexOi = pesato su open interest (posizionamento). Segno: call +, put − (euristica dealer long call / short put).',
+                  nota: 'Valori in $M. gex = pesato sul volume del giorno (flusso), gexOi = pesato su open interest (posizionamento). Segno: call +, put − (euristica dealer long call / short put). Solo 0DTE e 37 strike attorno all\'ATM: non bastano per uno Zero Gamma o una soglia di regime.',
                   spotSpx: spot,
                   flusso: livelliGamma(profilo, 'gex'),
                   posizionamento: livelliGamma(profilo, 'gexOi'),
@@ -156,5 +156,6 @@ Regole:
 - È un esercizio di studio. Sii onesto sull'incertezza: se i segnali sono contrastanti o scarsi, rispondi NEUTRALE con confidenza bassa. Una confidenza sopra 70 richiede più fonti indipendenti concordi.
 - Una sezione a null significa che quella fonte non ha dati ora (es. poller fermo o fuori orario): dillo nei rischi e non inventare.
 - SPX e ES differiscono per la base (ES di solito sopra SPX di qualche punto/decina di punti): converti i livelli SPX in livelli ES usando la differenza attuale tra i due, e dai i livelli in punti ES.
+- Gamma: non dedurre dai segni dei singoli strike uno Zero Gamma, un "flip" o una soglia di cambio di regime (tipo "sotto X la gamma diventa negativa e il movimento accelera"). Il profilo copre solo le 0DTE e 37 strike attorno all'ATM, e il segno è un'euristica, non un dato osservato. Il gex di flusso descrive lo scambiato di oggi, non il posizionamento: non chiamarlo regime. Usa gli strike solo come muri o magneti vicini allo spot.
 - livelli.riferimento = prezzo ES attuale; invalidazione = livello ES che smentirebbe il bias; obiettivo = livello ES plausibile. Con bias NEUTRALE puoi lasciarli a null.
 - Scrivi in italiano, conciso.`;

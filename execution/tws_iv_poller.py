@@ -206,9 +206,11 @@ def calculate_iv_change(current_iv, history_deques, lookback_seconds=60):
     now = time.time()
     cutoff = now - lookback_seconds
 
-    # Cerca il valore più vecchio dentro il window
+    # Cerca il valore più vecchio dentro il window. La storia si riempie con
+    # appendleft (il più recente in testa): letta in avanti, il primo valore
+    # trovato era quello appena aggiunto, e la variazione valeva sempre 0.
     previous_iv = None
-    for ts, iv in history_deques:
+    for ts, iv in reversed(history_deques):
         if ts >= cutoff and iv is not None:
             previous_iv = iv
             break

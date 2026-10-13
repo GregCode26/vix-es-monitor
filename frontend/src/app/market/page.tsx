@@ -1897,6 +1897,7 @@ export default function MarketPage() {
                             <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET MAKER</button>
                             <button onClick={() => router.push('/market-tide')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET TIDE</button>
                             <button onClick={() => router.push('/bookmap')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">BOOKMAP</button>
+                            <button onClick={() => router.push('/iv-monitor')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">IV MONITOR</button>
                         </div>
                         
                         {/* Bias su ES da Claude, a titolo di studio */}
