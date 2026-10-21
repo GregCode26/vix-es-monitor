@@ -249,7 +249,126 @@ interface RangeCalcInput {
 const APERTURA_USA = '15:30:00';
 const OB_SNAPSHOT = '15:35:00';
 
+/**
+ * Accanto a ogni prezzo ES dell'asse destro, in verde, il prezzo SPX
+ * corrispondente: ES meno il basis. Il basis lo mette `chart.$basisSpx`
+ * (vedi `basisEsSpx`); finche' non c'e' -- prima delle 15:30 l'indice non
+ * quota -- la colonna non si disegna, invece di mostrare un numero finto.
+ */
+const SPX_COL = 56;
+const PCT_COL = 50;
+const spxAxisPlugin = {
+    id: 'spxAxis',
+    afterDraw: (chart: any) => {
+        const basis: number | null | undefined = chart.$basisSpx;
+        const scale = chart.scales['y-right'];
+        if (basis === null || basis === undefined || !scale) return;
+        const { ctx, chartArea } = chart;
+        const dentro = (y: number) => y >= chartArea.top - 1 && y <= chartArea.bottom + 1;
+        const pxPerPunto = Math.abs(scale.getPixelForValue(scale.min + 1) - scale.getPixelForValue(scale.min));
+        const xSpx = scale.right - PCT_COL - 4;
+        const xPct = scale.right - 4;
+        ctx.save();
+        ctx.font = '11px Arial';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#22c55e';
+        // Prezzi SPX tondi ogni 5 punti, posti dove cadono sulla scala ES.
+        // Se lo zoom e' tanto largo da accavallarli, il passo sale (10, 25,
+        // 50...) invece di sovrapporre le etichette.
+        const passo = [5, 10, 25, 50, 100, 250, 500].find((p) => p * pxPerPunto >= 14) ?? 1000;
+        const primo = Math.ceil((scale.min - basis) / passo) * passo;
+        for (let v = primo; v + basis <= scale.max; v += passo) {
+            const y = scale.getPixelForValue(v + basis);
+            if (dentro(y)) ctx.fillText(String(v), xSpx, y);
+        }
+
+        // Variazione % dall'apertura SPX delle 15:30, ogni 0,1%: lo 0 cade
+        // sul prezzo di apertura, sopra in grigio, sotto in rosso. Stessa
+        // regola del passo se lo zoom e' largo.
+        const apertura: number | null | undefined = chart.$aperturaSpx;
+        if (apertura) {
+            const pxPerPct = pxPerPunto * apertura / 100;
+            const passoPct = [0.1, 0.2, 0.5, 1, 2, 5].find((p) => p * pxPerPct >= 14) ?? 10;
+            const pctDi = (es: number) => ((es - basis) / apertura - 1) * 100;
+            const da = Math.ceil(pctDi(scale.min) / passoPct - 1e-9);
+            const a = Math.floor(pctDi(scale.max) / passoPct + 1e-9);
+            for (let i = da; i <= a; i++) {
+                const pct = Math.round(i * passoPct * 10) / 10;
+                const y = scale.getPixelForValue(apertura * (1 + pct / 100) + basis);
+                if (!dentro(y)) continue;
+                ctx.font = pct === 0 ? 'bold 11px Arial' : '11px Arial';
+                ctx.fillStyle = pct < 0 ? '#ef4444' : pct === 0 ? '#f8fafc' : '#94a3b8';
+                ctx.fillText(`${pct > 0 ? '+' : ''}${pct.toFixed(1)}%`, xPct, y);
+            }
+        }
+
+        // I cartellini del prezzo corrente, come quello giallo di ES.
+        const ultimi = chart.data.datasets[0].data;
+        const es = ultimi[ultimi.length - 1];
+        if (es !== null && es !== undefined) {
+            const y = scale.getPixelForValue(es);
+            const cartellino = (text: string, destra: number, colore: string) => {
+                const w = ctx.measureText(text).width + 8;
+                ctx.fillStyle = colore;
+                ctx.fillRect(destra - w, y - 10, w, 20);
+                ctx.fillStyle = '#000';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, destra - w / 2, y);
+            };
+            ctx.font = 'bold 11px Arial';
+            cartellino((es - basis).toFixed(2), xSpx + 4, '#22c55e');
+            if (apertura) {
+                const pct = ((es - basis) / apertura - 1) * 100;
+                cartellino(`${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`, scale.right, pct < 0 ? '#ef4444' : '#94a3b8');
+            }
+        }
+        ctx.restore();
+    },
+};
+
+/**
+ * Basis ES - SPX: mediana delle letture degli ultimi 5 minuti in cui
+ * l'indice quota, come fa `/bookmap`. La mediana e non l'ultimo punto
+ * perche' i due prezzi non arrivano nello stesso istante e un singolo
+ * scarto sposterebbe tutta la colonna. Prima delle 15:30 niente basis.
+ */
+const secondi = (t: string) => { const [h, m, s] = t.split(':').map(Number); return h * 3600 + m * 60 + (s || 0); };
+
+/**
+ * Vista live di default: le ultime 2h45 di dati, non tutta la giornata dalle
+ * 00:05, che schiaccia il pomeriggio in una striscia. E' la vista in cui si
+ * apre la pagina, dopo un refresh e dopo RESTORE LIVE VIEW; la scala
+ * verticale e' poi quella automatica calcolata sui punti di questa finestra.
+ */
+const FINESTRA_LIVE_SEC = 165 * 60;
+function finestraLive(points: DataPoint[]): [number, number] | null {
+    if (points.length === 0) return null;
+    const fine = points.length - 1;
+    const da = secondi(points[fine].time) - FINESTRA_LIVE_SEC;
+    const inizio = points.findIndex((d) => secondi(d.time) >= da);
+    return [Math.max(0, inizio), fine];
+}
+
+function basisEsSpx(points: DataPoint[]): number | null {
+    const validi = points.filter((d) => d.time >= APERTURA_USA
+        && d.esf !== null && d.spx !== null && d.spx !== undefined);
+    if (validi.length === 0) return null;
+    const fine = secondi(validi[validi.length - 1].time);
+    const diff = validi.filter((d) => fine - secondi(d.time) <= 300)
+        .map((d) => (d.esf as number) - (d.spx as number))
+        .sort((a, b) => a - b);
+    const m = Math.floor(diff.length / 2);
+    return diff.length % 2 ? diff[m] : (diff[m - 1] + diff[m]) / 2;
+}
+
 // --- Helpers ---
+// 'HH:MM:SS' in secondi da mezzanotte.
+function secondiDa(ora: string): number {
+    const [h, m, sec] = ora.split(':').map(Number);
+    return h * 3600 + m * 60 + (sec || 0);
+}
+
 function getTodayKey() {
     const now = new Date();
     const y = now.getFullYear();
@@ -354,6 +473,10 @@ export default function MarketPage() {
     const [rangeCalcTab, setRangeCalcTab] = useState<'morning' | 'ob'>('morning');
     // Ultimo orario di riga gia' inserito nel grafico, per non duplicare.
     const lastSourceTime = useRef<string | null>(null);
+    // Orario dell'ultimo punto nel grafico, letto da fetchData per accorgersi
+    // dei buchi, e lo storico da ricaricare quando ce n'e' uno.
+    const ultimoPuntoRef = useRef<string | null>(null);
+    const caricaStoricoRef = useRef<(() => Promise<boolean>) | null>(null);
     const [rangeCalcMorning, setRangeCalcMorning] = useState<RangeCalcInput>(emptyCalcInput);
     const [rangeCalcOb, setRangeCalcOb] = useState<RangeCalcInput>(emptyCalcInput);
 
@@ -671,12 +794,25 @@ export default function MarketPage() {
         chart.data.datasets[1].data = dataPoints.map((d) => d.vix);
         chart.data.datasets[4].data = dataPoints.map((d) => d.vwap ?? null);
 
+        // Basis per la colonna SPX dell'asse destro (spxAxisPlugin): quello
+        // dal vivo, altrimenti quello dello scatto Opening Bell. Tutto cio'
+        // che e' in termini SPX (linea verde, range OB SPX) si disegna
+        // spostato di questo basis, cosi' si legge sulla colonna verde e
+        // non su quella di ES.
+        const basisSpx = basisEsSpx(dataPoints) ?? obResults?.basis ?? null;
+        chart.$basisSpx = basisSpx;
+        // Apertura del cash: il primo SPX dalle 15:30, lo 0 della colonna %.
+        chart.$aperturaSpx = dataPoints.find((d) => d.time >= APERTURA_USA
+            && d.spx !== null && d.spx !== undefined)?.spx ?? null;
+        const suScalaSpx = (v: number) => v + (basisSpx ?? 0);
+
         // SPX: solo da mercato aperto. Prima delle 15:30 il valore che arriva
         // non e' l'indice che quota, quindi meglio niente linea che una linea
         // finta.
         if (chart.data.datasets[5]) {
             chart.data.datasets[5].data = dataPoints.map(
-                (d) => (d.time >= APERTURA_USA ? (d.spx ?? null) : null));
+                (d) => (d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined
+                    ? suScalaSpx(d.spx) : null));
             chart.data.datasets[5].hidden = !mostraSpx;
         }
         
@@ -743,7 +879,7 @@ export default function MarketPage() {
                     { key: 'r3Up', color: '#10b981', label: 'R3↑ SPX' },
                 ] as const;
                 spxConfigs.forEach(({ key, color, label }) => {
-                    const val = obResults[key] - obResults.basis;
+                    const val = suScalaSpx(obResults[key] - obResults.basis);
                     newAnnotations[`${key}ObSpx`] = {
                         type: 'line',
                         xScaleID: 'x',
@@ -800,79 +936,62 @@ export default function MarketPage() {
             chart.options.scales.x.min = manualLimitsRef.current.x[0];
             chart.options.scales.x.max = manualLimitsRef.current.x[1];
         } else {
-            delete chart.options.scales.x.min;
-            delete chart.options.scales.x.max;
+            const finestra = finestraLive(dataPoints);
+            if (finestra) {
+                chart.options.scales.x.min = finestra[0];
+                chart.options.scales.x.max = finestra[1];
+            } else {
+                delete chart.options.scales.x.min;
+                delete chart.options.scales.x.max;
+            }
         }
 
         // Determine visible window indices for adaptive scaling
-        const xMinIdx = chart.scales.x.min !== undefined ? Math.max(0, Math.floor(chart.scales.x.min)) : 0;
-        const xMaxIdx = chart.scales.x.max !== undefined ? Math.min(dataPoints.length - 1, Math.ceil(chart.scales.x.max)) : dataPoints.length - 1;
+        // Dalle opzioni appena impostate, non da chart.scales: quelle sono
+        // ancora la vista del disegno precedente.
+        const xOpt = chart.options.scales.x;
+        const xMinIdx = typeof xOpt.min === 'number' ? Math.max(0, Math.floor(xOpt.min)) : 0;
+        const xMaxIdx = typeof xOpt.max === 'number' ? Math.min(dataPoints.length - 1, Math.ceil(xOpt.max)) : dataPoints.length - 1;
         const visiblePoints = dataPoints.slice(xMinIdx, xMaxIdx + 1);
 
         // Handle Y Scales (Auto-scaling vs Lock)
         if (visiblePoints.length > 0) {
-            // 1. Scale proporzionali: stessa distanza verticale = stessa
-            //    variazione percentuale, su entrambi gli assi.
-            //
-            //    ES sta attorno a 7800 e il VIX attorno a 14,7: qualunque
-            //    scala calcolata in valore assoluto rende le due linee
-            //    incomparabili. Con l'autoscala indipendente ciascuna riempiva
-            //    l'altezza disponibile, e un VIX fermo sembrava agitato quanto
-            //    un ES in tendenza. Qui si sceglie UNA semi-ampiezza relativa
-            //    `p` valida per entrambi: l'asse di ES diventa
-            //    [centroEs*(1-p), centroEs*(1+p)] e quello del VIX
-            //    [centroVix*(1-p), centroVix*(1+p)]. A quel punto un
-            //    movimento dell'1% occupa lo stesso spazio sui due assi, e il
-            //    rapporto visivo fra le linee e' quello vero.
-            // Con la linea SPX accesa l'asse destro deve contenere due prezzi
-            // distanti quanto il basis, che a indice 6.600 vale mezzo punto
-            // percentuale: tarandolo sul solo ES la linea verde finirebbe
-            // sotto il bordo.
+            // 1. Ogni linea nella sua fascia, ciascuna sulla sua scala: ES
+            //    occupa circa un terzo dell'altezza nella meta' alta, il VIX
+            //    un quarto in quella bassa, cosi' le due non si accavallano.
+            //    E' la vista che si costruiva a mano a ogni apertura
+            //    (screenshot del 21/10/2026). Sostituisce la scala
+            //    proporzionale (stessa % su entrambi gli assi), che con un VIX
+            //    che si muove dell'1% contro lo 0,2% di ES schiacciava ES in
+            //    una riga. Le linee di riferimento non allargano la scala:
+            //    quelle fuori dalla fascia si vedono allargando lo zoom.
+            // La linea SPX, gia' spostata del basis sulla scala verde, sta
+            // vicina a ES ma non coincide (il basis si muove nella seduta):
+            // conta anche lei, o potrebbe finire oltre il bordo.
             const esfValues = visiblePoints
-                .flatMap(d => [d.esf, mostraSpx && d.time >= APERTURA_USA ? (d.spx ?? null) : null])
+                .flatMap(d => [d.esf, mostraSpx && d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined ? suScalaSpx(d.spx) : null])
                 .filter((v): v is number => v !== null && v !== undefined);
             const vixValuesAuto = visiblePoints.map(d => d.vix).filter((v): v is number => v !== null);
-            const semiRelativa = (v: number[]) => {
+            // `quota` = dove cade il centro dei dati, da 0 (fondo) a 1 (cima);
+            // `altezza` = quanta parte dell'asse occupano. Soglia minima
+            // relativa perche' una linea piatta non degeneri l'asse in un punto.
+            const fascia = (v: number[], quota: number, altezza: number): [number, number] | null => {
                 if (v.length === 0) return null;
                 const lo = Math.min(...v), hi = Math.max(...v), c = (lo + hi) / 2;
-                return c > 0 ? { centro: c, rel: (hi - lo) / 2 / c } : null;
+                const ampiezza = Math.max(hi - lo, Math.abs(c) * 0.0008) / altezza;
+                const min = c - quota * ampiezza;
+                return [min, min + ampiezza];
             };
-            const es = semiRelativa(esfValues);
-            const vix = semiRelativa(vixValuesAuto);
-
-            // Soglia minima: con una linea perfettamente piatta `rel` e' zero e
-            // l'asse degenererebbe in un punto.
-            const MIN_REL = 0.0004;
-            let p = Math.max(es?.rel ?? 0, vix?.rel ?? 0, MIN_REL) * 1.18;
-
-            // Le linee di riferimento allargano la scala solo se non la
-            // stravolgono: R3 puo' stare all'1,8% dallo spot, quasi dieci volte
-            // l'escursione di una giornata tranquilla, e includerla a forza
-            // schiacciava ES in una banda sottile. Oltre il doppio della
-            // finestra si lascia fuori: per vederla basta allargare lo zoom.
-            if (es) {
-                const livelliSpx = mostraRangeSpxOb && obResults
-                    ? [obResults.r1Up, obResults.r2Up, obResults.r3Up,
-                       obResults.r1Down, obResults.r2Down, obResults.r3Down]
-                        .map((v) => v - obResults.basis)
-                    : [];
-                const distanzeRef = Object.entries(refLines)
-                    .filter(([k]) => (refLineVisibility as unknown as Record<string, boolean | undefined>)[k] !== false)
-                    .map(([, v]) => parseFloat(v))
-                    .concat(livelliSpx)
-                    .filter((v) => !isNaN(v))
-                    .map((v) => Math.abs(v - es.centro) / es.centro);
-                const vicine = distanzeRef.filter((d) => d <= p * 2);
-                if (vicine.length > 0) p = Math.max(p, Math.max(...vicine) * 1.08);
-            }
+            const es = fascia(esfValues, 0.70, 0.30);
+            const vix = fascia(vixValuesAuto, 0.30, 0.25);
 
             if (!yRightLocked && es) {
-                chart.options.scales['y-right'].min = es.centro * (1 - p);
-                chart.options.scales['y-right'].max = es.centro * (1 + p);
+                chart.options.scales['y-right'].min = es[0];
+                chart.options.scales['y-right'].max = es[1];
             }
             if (!yLeftLocked && vix) {
-                chart.options.scales['y-left'].min = vix.centro * (1 - p);
-                chart.options.scales['y-left'].max = vix.centro * (1 + p);
+                chart.options.scales['y-left'].min = vix[0];
+                chart.options.scales['y-left'].max = vix[1];
             }
 
             if (yRightLocked) {
@@ -1091,9 +1210,28 @@ export default function MarketPage() {
                 }
             }
 
+            // Un buco fra l'ultimo punto e questo vuol dire che i poll si sono
+            // fermati: una scheda in secondo piano il browser la rallenta e poi
+            // la congela, e prima i punti persi non tornavano piu' -- lo storico
+            // si caricava solo all'apertura, e il 14/10/2026 restava un vuoto
+            // dalle 12:37 alle 13:18 con il file sul disco completo. Si ricarica
+            // solo a scheda visibile: nascosta nessuno guarda, e con Supabase
+            // acceso ogni ?history=true e' la giornata intera di egress.
+            const ultimo = ultimoPuntoRef.current;
+            if (data.sourceTime && ultimo && document.visibilityState === 'visible'
+                && secondiDa(data.sourceTime) - secondiDa(ultimo) > 45
+                && await caricaStoricoRef.current?.()) {
+                setLastUpdate(timeStr);
+                setStatus('live');
+                return;
+            }
+
             setDataPoints((prev) => {
                 const newPoint: DataPoint = {
-                    time: timeStr,
+                    // L'ora della riga del poller, non quella del browser: e' la
+                    // stessa che usa lo storico, quindi i due si cuciono senza
+                    // doppioni quando lo si ricarica.
+                    time: data.sourceTime ?? timeStr,
                     vix: data.vix,
                     esf: data.esf,
                     spx: data.spx,
@@ -1112,7 +1250,10 @@ export default function MarketPage() {
                     return prev;
                 }
                 if (data.sourceTime) lastSourceTime.current = data.sourceTime;
-                const updated = [...prev, newPoint].slice(-2000); // ~8h20m a 15s
+                // La giornata intera (00:05-23:00 a 15s sono ~5.500 punti): a
+                // 2000 il primo punto dal vivo tagliava via la mattina che lo
+                // storico aveva appena caricato.
+                const updated = [...prev, newPoint].slice(-6000);
                 persistDataPoints(updated);
                 return updated;
             });
@@ -1187,6 +1328,43 @@ export default function MarketPage() {
         );
     }, []);
 
+    // La giornata dal server, al posto di quello che c'e' nel grafico.
+    const caricaStorico = useCallback(async (): Promise<boolean> => {
+        try {
+            const res = await fetch('/api/market?history=true', { cache: 'no-store' });
+            if (!res.ok) return false;
+            const data = await res.json();
+            if (!data.history || data.history.length === 0) return false;
+            const history = data.history as DataPoint[];
+            setDataPoints(history);
+            const firstValid = history.find(p => p.esf !== null);
+            if (firstValid) setFirstEsfValue(firstValid.esf);
+            setLastUpdate(history[history.length - 1].time);
+            persistDataPoints(history);
+            backfillRangeCalc(history as unknown as Record<string, unknown>[]);
+            // Il prossimo poll restituisce l'ultima riga gia' nello storico.
+            lastSourceTime.current = history[history.length - 1].time;
+            return true;
+        } catch {
+            return false;
+        }
+    }, [persistDataPoints, backfillRangeCalc]);
+    caricaStoricoRef.current = caricaStorico;
+
+    useEffect(() => {
+        ultimoPuntoRef.current = dataPoints.length > 0 ? dataPoints[dataPoints.length - 1].time : null;
+    }, [dataPoints]);
+
+    // Tornando sulla scheda si interroga subito, cosi' il buco si chiude
+    // senza aspettare il prossimo giro dell'intervallo.
+    useEffect(() => {
+        const alRitorno = () => {
+            if (document.visibilityState === 'visible' && intervalRef.current) fetchData();
+        };
+        document.addEventListener('visibilitychange', alRitorno);
+        return () => document.removeEventListener('visibilitychange', alRitorno);
+    }, [fetchData]);
+
     // ---- Main mount logic ----
     useEffect(() => {
         if (!isAuthorized) return;
@@ -1226,23 +1404,10 @@ export default function MarketPage() {
                 } catch { }
             }
 
-            // Also fetch yfinance history to fill in any gaps (even if we have cache)
-            try {
-                const res = await fetch('/api/market?history=true', { cache: 'no-store' });
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.history && data.history.length > 0) {
-                        const history = data.history as DataPoint[];
-                        setDataPoints(history);
-                        const firstValid = history.find(p => p.esf !== null);
-                        if (firstValid) setFirstEsfValue(firstValid.esf);
-                        setLastUpdate(history[history.length - 1].time);
-                        persistDataPoints(history);
-                        setStatus(isInTradingHours() ? 'live' : 'paused');
-                        backfillRangeCalc(history as unknown as Record<string, unknown>[]);
-                    }
-                }
-            } catch { }
+            // Lo storico del server copre comunque i buchi della cache.
+            if (await caricaStorico()) {
+                setStatus(isInTradingHours() ? 'live' : 'paused');
+            }
 
             // Start polling only within trading hours
             if (isInTradingHours()) {
@@ -1637,6 +1802,11 @@ export default function MarketPage() {
             delete chart.options.scales['y-left'].max;
             delete chart.options.scales['y-right'].min;
             delete chart.options.scales['y-right'].max;
+            const finestra = finestraLive(dataPoints);
+            if (finestra) {
+                chart.options.scales.x.min = finestra[0];
+                chart.options.scales.x.max = finestra[1];
+            }
 
             setIsLocked(false);
             chart.update();
@@ -1826,6 +1996,8 @@ export default function MarketPage() {
                     padding: 8,
                 },
                 grid: { display: false },
+                // Spazio per le colonne SPX e % disegnate da spxAxisPlugin.
+                afterFit: (scale: any) => { scale.width += SPX_COL + PCT_COL; },
             },
         },
     }), [updateZoomState]);
@@ -2256,7 +2428,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin]}
+                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">
