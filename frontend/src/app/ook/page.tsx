@@ -476,8 +476,8 @@ export default function OokPage() {
                 {ranges && (
                     <div className="bg-slate-900/40 border border-slate-700/50 rounded p-2 mb-3">
                         <div className="text-[11px] text-slate-400">
-                            R1: <span className="text-red-400 font-semibold">{ranges.r1Up.toFixed(2)}</span> / <span className="text-red-400 font-semibold">{ranges.r1Down.toFixed(2)}</span> &nbsp;&nbsp;
-                            R2: <span className="text-yellow-400 font-semibold">{ranges.r2Up.toFixed(2)}</span> / <span className="text-yellow-400 font-semibold">{ranges.r2Down.toFixed(2)}</span> &nbsp;&nbsp;
+                            R1: <span className="text-yellow-400 font-semibold">{ranges.r2Up.toFixed(2)}</span> / <span className="text-yellow-400 font-semibold">{ranges.r2Down.toFixed(2)}</span> &nbsp;&nbsp;
+                            R2: <span className="text-red-400 font-semibold">{ranges.r1Up.toFixed(2)}</span> / <span className="text-red-400 font-semibold">{ranges.r1Down.toFixed(2)}</span> &nbsp;&nbsp;
                             R3: <span className="text-purple-400 font-semibold">{ranges.r3Up.toFixed(2)}</span> / <span className="text-purple-400 font-semibold">{ranges.r3Down.toFixed(2)}</span>
                         </div>
                     </div>

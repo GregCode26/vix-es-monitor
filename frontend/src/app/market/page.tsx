@@ -19,6 +19,7 @@ import annotationPlugin from 'chartjs-plugin-annotation';
 import 'chartjs-adapter-date-fns';
 import { Line } from 'react-chartjs-2';
 import { leggiRefLines, salvaRefLines, leggiVisibilita, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import { majorGamma, RigaGamma } from '@/lib/majorGamma';
 import AiSignalPanel from '@/components/AiSignalPanel';
 
 ChartJS.register(
@@ -57,7 +58,21 @@ const scaleBackgroundPlugin = {
             ctx.fillRect(chartArea.left, s.top, chartArea.right - chartArea.left, height - s.top);
         }
         ctx.restore();
-    }
+    },
+    // Linea bianca verticale fra il grafico e le scale dei prezzi a destra.
+    afterDraw: (chart: any) => {
+        const { ctx, chartArea } = chart;
+        if (!chartArea) return;
+        const x = Math.round(chartArea.right) + 0.5;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, chartArea.top);
+        ctx.lineTo(x, chartArea.bottom);
+        ctx.stroke();
+        ctx.restore();
+    },
 };
 
 // Current Price Tags Plugin - Draws the yellow/blue tags on Y axes
@@ -106,9 +121,60 @@ const priceTagPlugin = {
         const esfVal = data.datasets[0].data[lastIdx];
         const vixVal = data.datasets[1].data[lastIdx];
 
-        if (esfVal !== null) drawTag('y-right', esfVal, '#facc15'); // Yellow for ES
+        // Il prezzo corrente di ES non ha piu' il cartellino: lo segna una
+        // linea bianca orizzontale attraverso le tre scale a destra.
+        if (esfVal !== null && scales['y-right']) {
+            const y = Math.round(scales['y-right'].getPixelForValue(esfVal)) + 0.5;
+            ctx.save();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(chart.chartArea.right, y);
+            ctx.lineTo(scales['y-right'].right, y);
+            ctx.stroke();
+            ctx.restore();
+        }
         if (vixVal !== null) drawTag('y-left', vixVal, '#3b82f6', '#fff'); // Blue for VIX
     }
+};
+
+/**
+ * Il nome delle linee orizzontali (range R1/R2/R3, GEX+ e GEX-) sul bordo
+ * sinistro del grafico, dove l'occhio comincia a leggere. Le etichette dei
+ * range le prepara l'effetto di aggiornamento in `chart.$etichette`; quelle
+ * del GEX si leggono qui dai dataset a gradini, al primo punto visibile,
+ * perche' il livello cambia nel pomeriggio e a sinistra vale quello di allora.
+ */
+const etichetteSinistraPlugin = {
+    id: 'etichetteSinistra',
+    afterDatasetsDraw: (chart: any) => {
+        const scala = chart.scales['y-right'];
+        const area = chart.chartArea;
+        if (!scala || !area) return;
+        const voci: { valore: number; testo: string; colore: string }[] = [...(chart.$etichette ?? [])];
+        const xMin = Math.max(0, Math.ceil(chart.scales.x?.min ?? 0));
+        for (const [indice, testo] of [[6, 'GEX+'], [7, 'GEX-']] as const) {
+            const ds = chart.data.datasets[indice];
+            if (!ds || ds.hidden) continue;
+            const valore = (ds.data as (number | null)[]).slice(xMin).find((v) => v !== null && v !== undefined);
+            if (valore !== undefined && valore !== null) voci.push({ valore, testo, colore: ds.borderColor });
+        }
+        const { ctx } = chart;
+        ctx.save();
+        ctx.font = 'bold 10px Arial';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        for (const v of voci) {
+            const y = scala.getPixelForValue(v.valore);
+            if (y < area.top || y > area.bottom) continue;
+            const w = ctx.measureText(v.testo).width + 8;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+            ctx.fillRect(area.left + 4, y - 7, w, 14);
+            ctx.fillStyle = v.colore;
+            ctx.fillText(v.testo, area.left + 8, y);
+        }
+        ctx.restore();
+    },
 };
 
 // Custom crosshair plugin
@@ -288,6 +354,37 @@ const spxAxisPlugin = {
         // regola del passo se lo zoom e' largo.
         const apertura: number | null | undefined = chart.$aperturaSpx;
         if (apertura) {
+            // Una barra nella colonna %, dallo 0 al prezzo corrente: verde in
+            // trasparenza se sopra l'apertura, rossa se sotto.
+            const serie = chart.data.datasets[0].data;
+            const ora = serie[serie.length - 1];
+            if (ora !== null && ora !== undefined) {
+                const clamp = (y: number) => Math.min(chartArea.bottom, Math.max(chartArea.top, y));
+                const y0 = clamp(scale.getPixelForValue(apertura + basis));
+                const y1 = clamp(scale.getPixelForValue(ora));
+                const sopra = ora - basis >= apertura;
+                ctx.fillStyle = sopra ? 'rgba(34, 197, 94, 0.22)' : 'rgba(239, 68, 68, 0.22)';
+                ctx.fillRect(scale.right - PCT_COL, Math.min(y0, y1), PCT_COL, Math.abs(y1 - y0));
+                // Le spike della candela del giorno: massimo e minimo SPX dalle
+                // 15:30, un'ombra sottile al centro della colonna che esce dal
+                // corpo. Verde la parte sopra lo 0, rossa quella sotto.
+                const massimo: number | null | undefined = chart.$maxSpx;
+                const minimo: number | null | undefined = chart.$minSpx;
+                if (massimo !== null && massimo !== undefined && minimo !== null && minimo !== undefined) {
+                    const yMax = clamp(scale.getPixelForValue(massimo + basis));
+                    const yMin = clamp(scale.getPixelForValue(minimo + basis));
+                    const xc = Math.round(scale.right - PCT_COL / 2) + 0.5;
+                    ctx.lineWidth = 2;
+                    if (yMax < y0) {
+                        ctx.strokeStyle = 'rgba(34, 197, 94, 0.8)';
+                        ctx.beginPath(); ctx.moveTo(xc, yMax); ctx.lineTo(xc, y0); ctx.stroke();
+                    }
+                    if (yMin > y0) {
+                        ctx.strokeStyle = 'rgba(239, 68, 68, 0.8)';
+                        ctx.beginPath(); ctx.moveTo(xc, y0); ctx.lineTo(xc, yMin); ctx.stroke();
+                    }
+                }
+            }
             const pxPerPct = pxPerPunto * apertura / 100;
             const passoPct = [0.1, 0.2, 0.5, 1, 2, 5].find((p) => p * pxPerPct >= 14) ?? 10;
             const pctDi = (es: number) => ((es - basis) / apertura - 1) * 100;
@@ -303,26 +400,6 @@ const spxAxisPlugin = {
             }
         }
 
-        // I cartellini del prezzo corrente, come quello giallo di ES.
-        const ultimi = chart.data.datasets[0].data;
-        const es = ultimi[ultimi.length - 1];
-        if (es !== null && es !== undefined) {
-            const y = scale.getPixelForValue(es);
-            const cartellino = (text: string, destra: number, colore: string) => {
-                const w = ctx.measureText(text).width + 8;
-                ctx.fillStyle = colore;
-                ctx.fillRect(destra - w, y - 10, w, 20);
-                ctx.fillStyle = '#000';
-                ctx.textAlign = 'center';
-                ctx.fillText(text, destra - w / 2, y);
-            };
-            ctx.font = 'bold 11px Arial';
-            cartellino((es - basis).toFixed(2), xSpx + 4, '#22c55e');
-            if (apertura) {
-                const pct = ((es - basis) / apertura - 1) * 100;
-                cartellino(`${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`, scale.right, pct < 0 ? '#ef4444' : '#94a3b8');
-            }
-        }
         ctx.restore();
     },
 };
@@ -421,6 +498,16 @@ export default function MarketPage() {
      * basis non si somma. Vanno con la linea verde, non con quella di ES.
      */
     const [mostraRangeSpxOb, setMostraRangeSpxOb] = useState(true);
+    /**
+     * Major Pos / Neg Gamma nel tempo, gli stessi livelli di /spx-gamma (base
+     * OI, `majorGamma`), presi da /api/gex e non ricalcolati: la `serie` del
+     * primo caricamento -- il profilo ogni 2 minuti dall'inizio della
+     * raccolta -- ricostruisce il pomeriggio anche dopo un refresh, poi ogni
+     * giro aggiunge il profilo corrente. Strike SPX: sul grafico si spostano
+     * del basis, come la linea SPX.
+     */
+    const [mostraGamma, setMostraGamma] = useState(true);
+    const [tracciaGamma, setTracciaGamma] = useState<{ time: string; maxPos: number | null; maxNeg: number | null }[]>([]);
   const [activeTab, setActiveTab] = useState<'market'|'gex'>('market');
 
     const [pluginsReady, setPluginsReady] = useState(false);
@@ -519,6 +606,8 @@ export default function MarketPage() {
             if (savedSpx !== null) setMostraSpx(savedSpx === 'true');
             const savedSpxOb = localStorage.getItem('marketShowRangeSpxOb');
             if (savedSpxOb !== null) setMostraRangeSpxOb(savedSpxOb === 'true');
+            const savedGamma = localStorage.getItem('marketShowMajorGamma');
+            if (savedGamma !== null) setMostraGamma(savedGamma === 'true');
         }
     }, [router]);
 
@@ -535,6 +624,47 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowSpx', String(mostraSpx));
     }, [mostraSpx]);
+
+    useEffect(() => {
+        localStorage.setItem('marketShowMajorGamma', String(mostraGamma));
+    }, [mostraGamma]);
+
+    // Traccia dei Major Gamma. Il primo giro senza `since` porta la `serie`
+    // (~110 KB a fine sessione, una volta sola); dopo, `since` + `flow=0`
+    // porta solo gli snapshot nuovi, come chiede il budget di egress di
+    // Supabase. Il 503 della mattina (il poller dei volumi parte alle 13:30)
+    // non e' un errore: si riprova al giro dopo.
+    useEffect(() => {
+        if (!isAuthorized) return;
+        let ultimo: string | null = null;
+        let vivo = true;
+        const giro = async () => {
+            try {
+                const url = ultimo ? `/api/gex?flow=0&since=${ultimo}` : '/api/gex?flow=0';
+                const res = await fetch(url);
+                if (!res.ok || !vivo) return;
+                const j = await res.json();
+                if (!ultimo) {
+                    const strikes: number[] = j.strikes ?? [];
+                    const voci = (j.serie ?? []).map((f: { time: string; gex: number[]; gexOi: number[] }) => {
+                        const righe: RigaGamma[] = strikes.map((strike, i) => ({ strike, gex: f.gex[i], gexOi: f.gexOi[i] }));
+                        return { time: f.time, ...majorGamma(righe, 'gexOi') };
+                    });
+                    if (j.lastTime && (j.profile ?? []).length > 0) {
+                        voci.push({ time: j.lastTime, ...majorGamma(j.profile, 'gexOi') });
+                    }
+                    setTracciaGamma(voci);
+                } else if (j.lastTime && (j.profile ?? []).length > 0) {
+                    const voce = { time: j.lastTime as string, ...majorGamma(j.profile, 'gexOi') };
+                    setTracciaGamma((prev) => [...prev, voce]);
+                }
+                if (j.lastTime) ultimo = j.lastTime;
+            } catch { /* rete giu': si riprova al giro dopo */ }
+        };
+        giro();
+        const id = setInterval(giro, 30000);
+        return () => { vivo = false; clearInterval(id); };
+    }, [isAuthorized]);
 
     useEffect(() => {
         localStorage.setItem('marketShowRangeSpxOb', String(mostraRangeSpxOb));
@@ -804,6 +934,12 @@ export default function MarketPage() {
         // Apertura del cash: il primo SPX dalle 15:30, lo 0 della colonna %.
         chart.$aperturaSpx = dataPoints.find((d) => d.time >= APERTURA_USA
             && d.spx !== null && d.spx !== undefined)?.spx ?? null;
+        // Massimo e minimo SPX del cash, le spike della candela nella colonna %.
+        const spxCash = dataPoints
+            .filter((d) => d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined)
+            .map((d) => d.spx as number);
+        chart.$maxSpx = spxCash.length ? Math.max(...spxCash) : null;
+        chart.$minSpx = spxCash.length ? Math.min(...spxCash) : null;
         const suScalaSpx = (v: number) => v + (basisSpx ?? 0);
 
         // SPX: solo da mercato aperto. Prima delle 15:30 il valore che arriva
@@ -814,6 +950,24 @@ export default function MarketPage() {
                 (d) => (d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined
                     ? suScalaSpx(d.spx) : null));
             chart.data.datasets[5].hidden = !mostraSpx;
+        }
+
+        // Major Gamma: per ogni punto del grafico l'ultima voce della traccia
+        // non successiva, spostata del basis. Prima della prima voce niente.
+        if (chart.data.datasets[7]) {
+            const pos: (number | null)[] = [];
+            const neg: (number | null)[] = [];
+            let j = -1;
+            for (const d of dataPoints) {
+                while (j + 1 < tracciaGamma.length && tracciaGamma[j + 1].time <= d.time) j++;
+                const v = j >= 0 ? tracciaGamma[j] : null;
+                pos.push(v && v.maxPos !== null && basisSpx !== null ? suScalaSpx(v.maxPos) : null);
+                neg.push(v && v.maxNeg !== null && basisSpx !== null ? suScalaSpx(v.maxNeg) : null);
+            }
+            chart.data.datasets[6].data = pos;
+            chart.data.datasets[7].data = neg;
+            chart.data.datasets[6].hidden = !mostraGamma;
+            chart.data.datasets[7].hidden = !mostraGamma;
         }
         
         // Ported from logica.zip: Add Cone datasets
@@ -834,21 +988,29 @@ export default function MarketPage() {
             // Mattina: tratteggiata. Sono i livelli delle 10:35, calcolati
             // sulla chain ES quando l'America dorme ancora: restano un
             // riferimento, ma non sono quelli su cui si sta scambiando.
-            { key: 'r1Down', color: '#ef4444', dash: [6, 3] },
-            { key: 'r2Down', color: '#f97316', dash: [6, 3] },
-            { key: 'r3Down', color: '#facc15', dash: [6, 3] },
-            { key: 'r1Up', color: '#3b82f6', dash: [6, 3] },
-            { key: 'r2Up', color: '#06b6d4', dash: [6, 3] },
-            { key: 'r3Up', color: '#10b981', dash: [6, 3] },
+            { key: 'r1Down', color: '#facc15', dash: [6, 3] },
+            { key: 'r2Down', color: '#fef08a', dash: [6, 3] },
+            { key: 'r3Down', color: '#ca8a04', dash: [6, 3] },
+            { key: 'r1Up', color: '#2563eb', dash: [6, 3] },
+            { key: 'r2Up', color: '#38bdf8', dash: [6, 3] },
+            { key: 'r3Up', color: '#1e40af', dash: [6, 3] },
             // Opening Bell: continua, perche' a mercato aperto e' quella che
             // conta e la linea piena e' quella che l'occhio segue.
-            { key: 'r1DownOb', color: '#ef4444', dash: [] },
-            { key: 'r2DownOb', color: '#f97316', dash: [] },
-            { key: 'r3DownOb', color: '#facc15', dash: [] },
-            { key: 'r1UpOb', color: '#3b82f6', dash: [] },
-            { key: 'r2UpOb', color: '#06b6d4', dash: [] },
-            { key: 'r3UpOb', color: '#10b981', dash: [] },
+            { key: 'r1DownOb', color: '#facc15', dash: [] },
+            { key: 'r2DownOb', color: '#fef08a', dash: [] },
+            { key: 'r3DownOb', color: '#ca8a04', dash: [] },
+            { key: 'r1UpOb', color: '#2563eb', dash: [] },
+            { key: 'r2UpOb', color: '#38bdf8', dash: [] },
+            { key: 'r3UpOb', color: '#1e40af', dash: [] },
         ];
+
+        // Nome mostrato di un range dalla sua chiave: r2 (il piu' vicino) e'
+        // R1, r1 e' R2 -- vedi CLAUDE.md.
+        const nomeRange = (key: string) => {
+            const n = ({ '1': '2', '2': '1', '3': '3' } as Record<string, string>)[key[1]];
+            return `R${n}${key.includes('Up') ? '↑' : '↓'}`;
+        };
+        const etichette: { valore: number; testo: string; colore: string }[] = [];
 
         baseConfigs.forEach(({ key, color, dash }) => {
             const val = refLines[key as keyof ReferenceLines];
@@ -857,6 +1019,7 @@ export default function MarketPage() {
                     type: 'line', yMin: parseFloat(val), yMax: parseFloat(val),
                     yScaleID: 'y-right', borderColor: color, borderWidth: 2, borderDash: dash,
                 };
+                etichette.push({ valore: parseFloat(val), testo: `${nomeRange(key)}${key.endsWith('Ob') ? ' OB' : ''}`, colore: color });
             }
         });
 
@@ -871,12 +1034,12 @@ export default function MarketPage() {
             const daIdx = dataPoints.findIndex((d) => d.time >= OB_SNAPSHOT);
             if (daIdx >= 0) {
                 const spxConfigs = [
-                    { key: 'r1Down', color: '#ef4444', label: 'R1↓ SPX' },
-                    { key: 'r2Down', color: '#f97316', label: 'R2↓ SPX' },
-                    { key: 'r3Down', color: '#facc15', label: 'R3↓ SPX' },
-                    { key: 'r1Up', color: '#3b82f6', label: 'R1↑ SPX' },
-                    { key: 'r2Up', color: '#06b6d4', label: 'R2↑ SPX' },
-                    { key: 'r3Up', color: '#10b981', label: 'R3↑ SPX' },
+                    { key: 'r1Down', color: '#facc15', label: 'R2↓ SPX' },
+                    { key: 'r2Down', color: '#fef08a', label: 'R1↓ SPX' },
+                    { key: 'r3Down', color: '#ca8a04', label: 'R3↓ SPX' },
+                    { key: 'r1Up', color: '#2563eb', label: 'R2↑ SPX' },
+                    { key: 'r2Up', color: '#38bdf8', label: 'R1↑ SPX' },
+                    { key: 'r3Up', color: '#1e40af', label: 'R3↑ SPX' },
                 ] as const;
                 spxConfigs.forEach(({ key, color, label }) => {
                     const val = suScalaSpx(obResults[key] - obResults.basis);
@@ -890,18 +1053,14 @@ export default function MarketPage() {
                         borderColor: color,
                         borderWidth: 1.5,
                         borderDash: [2, 2],
-                        label: {
-                            display: true,
-                            content: label,
-                            position: 'start',
-                            backgroundColor: 'rgba(15, 23, 42, 0.75)',
-                            color,
-                            font: { size: 9, weight: 'bold' },
-                        },
                     };
+                    // Il nome sta a sinistra con gli altri (etichetteSinistraPlugin).
+                    etichette.push({ valore: val, testo: label, colore: color });
                 });
             }
         }
+
+        chart.$etichette = etichette;
 
         // Divergence boxes
         if (showDivergences) {
@@ -985,6 +1144,20 @@ export default function MarketPage() {
             const es = fascia(esfValues, 0.70, 0.30);
             const vix = fascia(vixValuesAuto, 0.30, 0.25);
 
+            // I Major Gamma correnti devono stare dentro la scala: a 50 punti
+            // dal prezzo il Neg finiva sul bordo basso e non si vedeva. La
+            // scala si allunga solo quanto serve, la fascia di ES resta.
+            if (es && mostraGamma) {
+                const livelli = [chart.data.datasets[6]?.data, chart.data.datasets[7]?.data]
+                    .map((serie) => serie?.[xMaxIdx])
+                    .filter((v): v is number => typeof v === 'number');
+                const margine = (es[1] - es[0]) * 0.04;
+                for (const v of livelli) {
+                    if (v - margine < es[0]) es[0] = v - margine;
+                    if (v + margine > es[1]) es[1] = v + margine;
+                }
+            }
+
             if (!yRightLocked && es) {
                 chart.options.scales['y-right'].min = es[0];
                 chart.options.scales['y-right'].max = es[1];
@@ -1026,7 +1199,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma]);
 
     // ---- Plugins (zoom) ----
     useEffect(() => {
@@ -1890,6 +2063,28 @@ export default function MarketPage() {
                 yAxisID: 'y-right',
                 fill: false,
             },
+            {
+                // Major Pos / Neg Gamma, a gradini: lo strike resta quello
+                // finche' il profilo non ne indica un altro.
+                label: 'Major Pos Gamma',
+                data: [] as (number | null)[],
+                borderColor: '#00ff66',
+                borderWidth: 4,
+                pointRadius: 0,
+                stepped: true,
+                yAxisID: 'y-right',
+                fill: false,
+            },
+            {
+                label: 'Major Neg Gamma',
+                data: [] as (number | null)[],
+                borderColor: '#ff2d55',
+                borderWidth: 4,
+                pointRadius: 0,
+                stepped: true,
+                yAxisID: 'y-right',
+                fill: false,
+            },
         ],
     }), []);
 
@@ -1996,6 +2191,23 @@ export default function MarketPage() {
                     padding: 8,
                 },
                 grid: { display: false },
+                // Prezzi tondi piu' fitti di quelli di Chart.js: dove metteva
+                // 7810, 7820 qui c'e' anche 7815. Il passo e' il piu' piccolo
+                // fra 1, 2.5, 5, 10, 25... che lascia almeno 28 px fra due
+                // etichette. Rifacendo i tick cadono anche quelle spurie sui
+                // bordi (7823,5) che compaiono con min/max impostati a mano.
+                afterBuildTicks: (scale: any) => {
+                    const range = scale.max - scale.min;
+                    const altezza = scale.height > 0 ? scale.height : 600;
+                    if (!(range > 0)) return;
+                    const passo = [0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500]
+                        .find((p) => (altezza / range) * p >= 28) ?? 1000;
+                    const ticks = [];
+                    for (let i = Math.ceil(scale.min / passo); i * passo <= scale.max; i++) {
+                        ticks.push({ value: i * passo });
+                    }
+                    scale.ticks = ticks;
+                },
                 // Spazio per le colonne SPX e % disegnate da spxAxisPlugin.
                 afterFit: (scale: any) => { scale.width += SPX_COL + PCT_COL; },
             },
@@ -2103,6 +2315,17 @@ export default function MarketPage() {
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraSpx ? '◉' : '◌'} SPX
+                        </button>
+
+                        {/* Major Pos / Neg Gamma, dalla pagina GEX */}
+                        <button
+                            onClick={() => setMostraGamma((v) => !v)}
+                            title={mostraGamma ? 'Nascondi Major Pos/Neg Gamma' : 'Mostra Major Pos/Neg Gamma (come /spx-gamma, base OI) nel pomeriggio'}
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraGamma
+                                ? 'bg-lime-600/30 text-lime-300 border-lime-500/50 hover:bg-lime-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraGamma ? '◉' : '◌'} Major Gamma
                         </button>
 
                         {/* I sei livelli dell'Opening Bell in termini SPX */}
@@ -2283,29 +2506,29 @@ export default function MarketPage() {
 
                                             {/* Range levels - ES prices */}
                                             <div className="grid grid-cols-3 gap-1.5 text-xs mt-2">
+                                                <div className="bg-sky-900/20 rounded px-2 py-1.5 border border-sky-400/20">
+                                                    <span className="text-sky-400 font-bold">R1 Up</span>
+                                                    <span className="float-right text-sky-300 font-mono">{results.r2Up.toFixed(2)}</span>
+                                                </div>
                                                 <div className="bg-blue-900/20 rounded px-2 py-1.5 border border-blue-500/20">
-                                                    <span className="text-blue-400 font-bold">R1 Up</span>
-                                                    <span className="float-right text-blue-300 font-mono">{results.r1Up.toFixed(2)}</span>
+                                                    <span className="text-blue-500 font-bold">R2 Up</span>
+                                                    <span className="float-right text-blue-400 font-mono">{results.r1Up.toFixed(2)}</span>
                                                 </div>
-                                                <div className="bg-cyan-900/20 rounded px-2 py-1.5 border border-cyan-500/20">
-                                                    <span className="text-cyan-400 font-bold">R2 Up</span>
-                                                    <span className="float-right text-cyan-300 font-mono">{results.r2Up.toFixed(2)}</span>
+                                                <div className="bg-blue-950/40 rounded px-2 py-1.5 border border-blue-800/40">
+                                                    <span className="text-blue-700 font-bold">R3 Up</span>
+                                                    <span className="float-right text-blue-600 font-mono">{results.r3Up.toFixed(2)}</span>
                                                 </div>
-                                                <div className="bg-green-900/20 rounded px-2 py-1.5 border border-green-500/20">
-                                                    <span className="text-green-400 font-bold">R3 Up</span>
-                                                    <span className="float-right text-green-300 font-mono">{results.r3Up.toFixed(2)}</span>
+                                                <div className="bg-yellow-900/20 rounded px-2 py-1.5 border border-yellow-200/20">
+                                                    <span className="text-yellow-200 font-bold">R1 Down</span>
+                                                    <span className="float-right text-yellow-100 font-mono">{results.r2Down.toFixed(2)}</span>
                                                 </div>
-                                                <div className="bg-red-900/20 rounded px-2 py-1.5 border border-red-500/20">
-                                                    <span className="text-red-400 font-bold">R1 Down</span>
-                                                    <span className="float-right text-red-300 font-mono">{results.r1Down.toFixed(2)}</span>
+                                                <div className="bg-yellow-900/20 rounded px-2 py-1.5 border border-yellow-400/20">
+                                                    <span className="text-yellow-400 font-bold">R2 Down</span>
+                                                    <span className="float-right text-yellow-300 font-mono">{results.r1Down.toFixed(2)}</span>
                                                 </div>
-                                                <div className="bg-orange-900/20 rounded px-2 py-1.5 border border-orange-500/20">
-                                                    <span className="text-orange-400 font-bold">R2 Down</span>
-                                                    <span className="float-right text-orange-300 font-mono">{results.r2Down.toFixed(2)}</span>
-                                                </div>
-                                                <div className="bg-yellow-900/20 rounded px-2 py-1.5 border border-yellow-500/20">
-                                                    <span className="text-yellow-400 font-bold">R3 Down</span>
-                                                    <span className="float-right text-yellow-300 font-mono">{results.r3Down.toFixed(2)}</span>
+                                                <div className="bg-yellow-900/20 rounded px-2 py-1.5 border border-yellow-600/20">
+                                                    <span className="text-yellow-600 font-bold">R3 Down</span>
+                                                    <span className="float-right text-yellow-500 font-mono">{results.r3Down.toFixed(2)}</span>
                                                 </div>
                                             </div>
 
@@ -2334,18 +2557,18 @@ export default function MarketPage() {
                         <h3 className="text-lg font-semibold mb-4 text-slate-200">Reference Lines (ES=F)</h3>
                         <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
                             {([
-                                { key: 'r1Down', label: 'R1 Down', colorClass: 'text-red-400', ringClass: 'focus:ring-red-500/50' },
-                                { key: 'r1DownOb', label: 'R1 Down OB', colorClass: 'text-red-400/70', ringClass: 'focus:ring-red-500/50' },
-                                { key: 'r2Down', label: 'R2 Down', colorClass: 'text-orange-400', ringClass: 'focus:ring-orange-500/50' },
-                                { key: 'r2DownOb', label: 'R2 Down OB', colorClass: 'text-orange-400/70', ringClass: 'focus:ring-orange-500/50' },
-                                { key: 'r3Down', label: 'R3 Down', colorClass: 'text-yellow-400', ringClass: 'focus:ring-yellow-500/50' },
-                                { key: 'r3DownOb', label: 'R3 Down OB', colorClass: 'text-yellow-400/70', ringClass: 'focus:ring-yellow-500/50' },
-                                { key: 'r1Up', label: 'R1 Up', colorClass: 'text-blue-400', ringClass: 'focus:ring-blue-500/50' },
-                                { key: 'r1UpOb', label: 'R1 Up OB', colorClass: 'text-blue-400/70', ringClass: 'focus:ring-blue-500/50' },
-                                { key: 'r2Up', label: 'R2 Up', colorClass: 'text-cyan-400', ringClass: 'focus:ring-cyan-500/50' },
-                                { key: 'r2UpOb', label: 'R2 Up OB', colorClass: 'text-cyan-400/70', ringClass: 'focus:ring-cyan-500/50' },
-                                { key: 'r3Up', label: 'R3 Up', colorClass: 'text-green-400', ringClass: 'focus:ring-green-500/50' },
-                                { key: 'r3UpOb', label: 'R3 Up OB', colorClass: 'text-green-400/70', ringClass: 'focus:ring-green-500/50' },
+                                { key: 'r2Down', label: 'R1 Down', colorClass: 'text-yellow-200', ringClass: 'focus:ring-yellow-200/50' },
+                                { key: 'r2DownOb', label: 'R1 Down OB', colorClass: 'text-yellow-200/70', ringClass: 'focus:ring-yellow-200/50' },
+                                { key: 'r1Down', label: 'R2 Down', colorClass: 'text-yellow-400', ringClass: 'focus:ring-yellow-400/50' },
+                                { key: 'r1DownOb', label: 'R2 Down OB', colorClass: 'text-yellow-400/70', ringClass: 'focus:ring-yellow-400/50' },
+                                { key: 'r3Down', label: 'R3 Down', colorClass: 'text-yellow-600', ringClass: 'focus:ring-yellow-600/50' },
+                                { key: 'r3DownOb', label: 'R3 Down OB', colorClass: 'text-yellow-600/70', ringClass: 'focus:ring-yellow-600/50' },
+                                { key: 'r2Up', label: 'R1 Up', colorClass: 'text-sky-400', ringClass: 'focus:ring-sky-400/50' },
+                                { key: 'r2UpOb', label: 'R1 Up OB', colorClass: 'text-sky-400/70', ringClass: 'focus:ring-sky-400/50' },
+                                { key: 'r1Up', label: 'R2 Up', colorClass: 'text-blue-500', ringClass: 'focus:ring-blue-500/50' },
+                                { key: 'r1UpOb', label: 'R2 Up OB', colorClass: 'text-blue-500/70', ringClass: 'focus:ring-blue-500/50' },
+                                { key: 'r3Up', label: 'R3 Up', colorClass: 'text-blue-700', ringClass: 'focus:ring-blue-700/50' },
+                                { key: 'r3UpOb', label: 'R3 Up OB', colorClass: 'text-blue-700/70', ringClass: 'focus:ring-blue-700/50' },
                             ] as const).map(({ key, label, colorClass, ringClass }) => (
                                 <div key={key} className="bg-slate-900/30 p-2 rounded-lg border border-slate-700/30">
                                     <div className="flex items-center justify-between mb-1">
@@ -2428,7 +2651,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin]}
+                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">

@@ -550,13 +550,17 @@ export default function GexPage() {
     // questa pagina non li guardava proprio -- da cui "non vedo i range
     // riportati", che era esattamente vero per due terzi di loro.
     //
-    // La gerarchia resta leggibile con lo spessore: R1 piena e marcata, R2 e
-    // R3 progressivamente piu' sottili e scariche. Le OB restano tratteggiate.
+    // La gerarchia resta leggibile con lo spessore: r1 piena e marcata, r2 e
+    // r3 progressivamente piu' sottili e scariche (le chiavi, non i nomi: vedi
+    // NOME_RANGE). Le OB restano tratteggiate.
+    const NOME_RANGE = { 1: 2, 2: 1, 3: 3 } as const;
     const baseConfigs = (['', 'Ob'] as const).flatMap((suffix) =>
       ([1, 2, 3] as const).flatMap((livello) =>
         (['Up', 'Down'] as const).map((verso) => ({
           key: `r${livello}${verso}${suffix}`,
-          label: `R${livello}${verso === 'Up' ? '↑' : '↓'}${suffix ? ' OB' : ''}`,
+          // Il nome mostrato non e' il numero della chiave: r2 (straddle/sqrt3,
+          // il piu' vicino) si chiama R1 e r1 (straddle) R2.
+          label: `R${NOME_RANGE[livello]}${verso === 'Up' ? '↑' : '↓'}${suffix ? ' OB' : ''}`,
           color: verso === 'Up'
             ? ['#3b82f6', '#60a5fa', '#93c5fd'][livello - 1]
             : ['#ef4444', '#f87171', '#fca5a5'][livello - 1],

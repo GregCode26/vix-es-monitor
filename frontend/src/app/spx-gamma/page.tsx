@@ -18,6 +18,7 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
+import { majorGamma } from '@/lib/majorGamma';
 
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false });
 
@@ -221,16 +222,7 @@ export default function SpxGammaPage() {
     /** Livelli di riferimento, tutti dedotti dal profilo vero. */
     const livelli = useMemo(() => {
         if (profile.length === 0) return { maxPos: null, maxNeg: null };
-        let maxPos: ProfileRow | null = null;
-        let maxNeg: ProfileRow | null = null;
-        for (const r of profile) {
-            if (r[chiave] > 0 && (!maxPos || r[chiave] > maxPos[chiave])) maxPos = r;
-            if (r[chiave] < 0 && (!maxNeg || r[chiave] < maxNeg[chiave])) maxNeg = r;
-        }
-        return {
-            maxPos: maxPos?.strike ?? null,
-            maxNeg: maxNeg?.strike ?? null,
-        };
+        return majorGamma(profile, chiave);
     }, [profile, chiave]);
 
     const prezzoOra = spotData.length > 0 ? spotData[spotData.length - 1][1] : null;

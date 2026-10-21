@@ -260,11 +260,11 @@ namespace GregDashboard
         }
 
         private static readonly (string chiave, Color colore, string nome)[] RANGE = {
-            ("r1Down", ColorTranslator.FromHtml("#ef4444"), "R1↓"),
-            ("r2Down", ColorTranslator.FromHtml("#f97316"), "R2↓"),
+            ("r1Down", ColorTranslator.FromHtml("#ef4444"), "R2↓"),
+            ("r2Down", ColorTranslator.FromHtml("#f97316"), "R1↓"),
             ("r3Down", ColorTranslator.FromHtml("#facc15"), "R3↓"),
-            ("r1Up", ColorTranslator.FromHtml("#3b82f6"), "R1↑"),
-            ("r2Up", ColorTranslator.FromHtml("#06b6d4"), "R2↑"),
+            ("r1Up", ColorTranslator.FromHtml("#3b82f6"), "R2↑"),
+            ("r2Up", ColorTranslator.FromHtml("#06b6d4"), "R1↑"),
             ("r3Up", ColorTranslator.FromHtml("#10b981"), "R3↑"),
         };
 
