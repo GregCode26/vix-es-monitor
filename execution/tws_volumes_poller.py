@@ -29,6 +29,10 @@ START_HOUR = 8  # 14:30 Italian = 8:30 Eastern inside IBKR usually, but let's us
 # Assuming local machine is CET
 START_TIME_MINUTES = 13 * 60 + 30  # Adjusted for immediate testing
 END_TIME_MINUTES = 22 * 60  # 22:00
+# Quanti strike puo' allontanarsi lo spot dal centro della catena prima che la
+# sessione si chiuda per ricentrarla: 8 strike da 5 punti = 40 punti, e ne
+# restano almeno 10 dal lato verso cui si muove.
+RICENTRA_DOPO_STRIKE = 8
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -496,6 +500,25 @@ def main():
                 # Sanitize NaN for JSON
                 if current_spx != current_spx:
                     current_spx = None
+
+                # Catena da ricentrare. Gli strike si scelgono una volta, a
+                # inizio sessione, attorno al prezzo di quel momento -- che
+                # prima delle 15:30 e' la chiusura di ieri. Il 22/10/2026 la
+                # sessione e' partita a mezzanotte su 7757, lo SPX ha aperto
+                # a 7685 ed e' sceso a 7650, sotto lo strike piu' basso
+                # seguito (7665): mancavano tutti gli strike sotto il prezzo,
+                # dove sta l'open interest delle put, e la "put wall" usciva
+                # sempre sullo strike seguito piu' vicino, sopra il prezzo.
+                # Solo con un prezzo vero (marketPrice), non con la chiusura:
+                # chiudere la sessione la riapre fra 30s attorno allo spot, e
+                # tide e Lee-Ready riprendono dagli snapshot gia' salvati.
+                spot_vero = spx_ticker.marketPrice()
+                if spot_vero and spot_vero == spot_vero:
+                    idx_spot = min(range(len(sorted_strikes)), key=lambda i: abs(sorted_strikes[i] - spot_vero))
+                    if abs(idx_spot - atm_strike_idx) > RICENTRA_DOPO_STRIKE:
+                        print(f"SPX a {spot_vero}, catena centrata su {sorted_strikes[atm_strike_idx]} "
+                              f"({strikes[0]}-{strikes[-1]}): chiudo la sessione per ricentrarla.", flush=True)
+                        return
 
                 # Check for 15:30 open (9:30 EST)
                 is_opening_snapshot = False

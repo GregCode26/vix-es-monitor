@@ -499,8 +499,10 @@ export default function MarketPage() {
      */
     const [mostraRangeSpxOb, setMostraRangeSpxOb] = useState(true);
     /**
-     * Major Pos / Neg Gamma nel tempo, gli stessi livelli di /spx-gamma (base
-     * OI, `majorGamma`), presi da /api/gex e non ricalcolati: la `serie` del
+     * Major Pos / Neg Gamma nel tempo, gli stessi livelli di /gex sulla base
+     * Volume (il suo default; `majorGamma` con `gex`, non `gexOi`: si vuole il
+     * flusso di oggi, non le posizioni di ieri sera), presi da /api/gex e non
+     * ricalcolati: la `serie` del
      * primo caricamento -- il profilo ogni 2 minuti dall'inizio della
      * raccolta -- ricostruisce il pomeriggio anche dopo un refresh, poi ogni
      * giro aggiunge il profilo corrente. Strike SPX: sul grafico si spostano
@@ -637,8 +639,18 @@ export default function MarketPage() {
     useEffect(() => {
         if (!isAuthorized) return;
         let ultimo: string | null = null;
+        let giorno = getTodayKey();
         let vivo = true;
         const giro = async () => {
+            // Pagina rimasta aperta oltre la mezzanotte: la traccia e' di
+            // ieri, e `since` con l'ultimo orario di ieri (~22:00) non
+            // restituirebbe niente di oggi fino a quell'ora, lasciando sul
+            // grafico i livelli di ieri. Si riparte da zero, con la serie.
+            if (getTodayKey() !== giorno) {
+                giorno = getTodayKey();
+                ultimo = null;
+                setTracciaGamma([]);
+            }
             try {
                 const url = ultimo ? `/api/gex?flow=0&since=${ultimo}` : '/api/gex?flow=0';
                 const res = await fetch(url);
@@ -648,14 +660,14 @@ export default function MarketPage() {
                     const strikes: number[] = j.strikes ?? [];
                     const voci = (j.serie ?? []).map((f: { time: string; gex: number[]; gexOi: number[] }) => {
                         const righe: RigaGamma[] = strikes.map((strike, i) => ({ strike, gex: f.gex[i], gexOi: f.gexOi[i] }));
-                        return { time: f.time, ...majorGamma(righe, 'gexOi') };
+                        return { time: f.time, ...majorGamma(righe, 'gex') };
                     });
                     if (j.lastTime && (j.profile ?? []).length > 0) {
-                        voci.push({ time: j.lastTime, ...majorGamma(j.profile, 'gexOi') });
+                        voci.push({ time: j.lastTime, ...majorGamma(j.profile, 'gex') });
                     }
                     setTracciaGamma(voci);
                 } else if (j.lastTime && (j.profile ?? []).length > 0) {
-                    const voce = { time: j.lastTime as string, ...majorGamma(j.profile, 'gexOi') };
+                    const voce = { time: j.lastTime as string, ...majorGamma(j.profile, 'gex') };
                     setTracciaGamma((prev) => [...prev, voce]);
                 }
                 if (j.lastTime) ultimo = j.lastTime;
@@ -1601,6 +1613,13 @@ export default function MarketPage() {
                     setDataPoints([]);
                     setFirstEsfValue(null);
                     setLastUpdate('');
+                    // Anche range e Range Calc sono di ieri: valgono per la
+                    // giornata del loro straddle, e lo stato in memoria
+                    // verrebbe risalvato con la data di oggi.
+                    setRefLines((prev) => Object.fromEntries(
+                        Object.keys(prev).map((k) => [k, ''])) as unknown as ReferenceLines);
+                    setRangeCalcMorning(emptyCalcInput);
+                    setRangeCalcOb(emptyCalcInput);
 
                     // Start polling
                     if (intervalRef.current) clearInterval(intervalRef.current);
@@ -2320,7 +2339,7 @@ export default function MarketPage() {
                         {/* Major Pos / Neg Gamma, dalla pagina GEX */}
                         <button
                             onClick={() => setMostraGamma((v) => !v)}
-                            title={mostraGamma ? 'Nascondi Major Pos/Neg Gamma' : 'Mostra Major Pos/Neg Gamma (come /spx-gamma, base OI) nel pomeriggio'}
+                            title={mostraGamma ? 'Nascondi Major Pos/Neg Gamma' : 'Mostra Major Pos/Neg Gamma (come /gex, base Volume) nel pomeriggio'}
                             className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraGamma
                                 ? 'bg-lime-600/30 text-lime-300 border-lime-500/50 hover:bg-lime-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
