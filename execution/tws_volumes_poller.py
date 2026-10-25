@@ -37,6 +37,8 @@ RICENTRA_DOPO_STRIKE = 8
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'volumes')
+# Ultimo bid/ask di ogni contratto seguito, per i vertical di /operativita.
+QUOTE_FILE = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'catena', 'quote.json')
 
 def ensure_data_dir():
     if not os.path.exists(DATA_DIR):
@@ -269,6 +271,38 @@ _supabase_client = None
 # migrazione riparte da sola senza riavviare il poller.
 _colonna_tide_manca_dal = None
 _RIPROVA_COLONNA_TIDE_SEC = 600
+
+def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers):
+    """Sovrascrive QUOTE_FILE con il bid/ask attuale di ogni strike.
+
+    Solo l'ultima fotografia e solo in locale: serve al costo dei vertical in
+    tempo reale (/api/verticali), non alla storia, e su Supabase 37 strike x 4
+    prezzi ogni 10 s sarebbero egress senza motivo. Nessuna linea di market
+    data in piu': sono gli stessi ticker da cui si leggono i volumi.
+    """
+    # IBKR manda -1 quando un lato non c'e'; 0 invece e' un bid vero, sulle
+    # put lontane, e senza di lui il vertical sparirebbe.
+    def prezzo(x):
+        return round(float(x), 2) if x is not None and x == x and x >= 0 else None
+
+    righe = {}
+    for item in option_tickers:
+        t = item["ticker"]
+        r = righe.setdefault(item["strike"], {"strike": item["strike"]})
+        lato = 'c' if item["right"] == 'C' else 'p'
+        r[lato + "Bid"] = prezzo(t.bid)
+        r[lato + "Ask"] = prezzo(t.ask)
+    dati = {"date": date_key, "time": time_str, "spot": spot, "expiry": scadenza,
+            "strikes": [righe[k] for k in sorted(righe)]}
+    try:
+        os.makedirs(os.path.dirname(QUOTE_FILE), exist_ok=True)
+        temp_file = QUOTE_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(dati, f, separators=(',', ':'))
+        os.replace(temp_file, QUOTE_FILE)
+    except Exception as e:
+        print(f"Error writing {QUOTE_FILE}: {e}")
+
 
 def push_snapshot_to_supabase(date_key, snapshot):
     """Inserisce il singolo snapshot appena prodotto (~1,8 KB).
@@ -603,6 +637,7 @@ def main():
                 
                 append_to_session_file(today_key, snapshot)
                 push_snapshot_to_supabase(today_key, snapshot)
+                scrivi_quote(today_key, time_str, current_spx, target_exp, option_tickers)
 
                 # Le sottoscrizioni si spengono da sole, e in silenzio.
                 #

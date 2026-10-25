@@ -318,36 +318,35 @@ def main():
 
     # 3. Select ATM and nearby strikes (ATM ± 2 default)
     sorted_strikes = sorted(chain.strikes)
-    atm_strike_idx = min(range(len(sorted_strikes)), key=lambda i: abs(sorted_strikes[i] - spx_price))
-
-    # Default: ± 2 strikes
     strike_range = 2
-    start_idx = max(0, atm_strike_idx - strike_range)
-    end_idx = min(len(sorted_strikes), atm_strike_idx + strike_range + 1)
-
-    selected_strikes = sorted_strikes[start_idx:end_idx]
-    print(f"Selected strikes: {selected_strikes}")
 
     # 5. Subscribe to option tickers (bid/ask/IV)
     option_tickers = []
-    contracts = []
 
-    for strike in selected_strikes:
-        c_call = Option('SPX', target_exp, strike, 'C', 'CBOE', multiplier='100', tradingClass=chain.tradingClass)
-        c_put = Option('SPX', target_exp, strike, 'P', 'CBOE', multiplier='100', tradingClass=chain.tradingClass)
-        contracts.extend([c_call, c_put])
+    def centra(idx):
+        """Segue gli strike ATM +/- strike_range attorno a sorted_strikes[idx].
 
-    qualified = ib.qualifyContracts(*contracts)
-    print(f"Qualified {len(qualified)} option contracts.")
+        Toglie le sottoscrizioni uscite dalla finestra e aggiunge le nuove:
+        quelle che restano non si toccano, cosi' non perdono i dati gia' arrivati.
+        """
+        voluti = set(sorted_strikes[max(0, idx - strike_range):idx + strike_range + 1])
+        for item in [it for it in option_tickers if it["strike"] not in voluti]:
+            ib.cancelMktData(item["ticker"].contract)
+            option_tickers.remove(item)
+        presenti = {it["strike"] for it in option_tickers}
+        contracts = []
+        for strike in sorted(voluti - presenti):
+            contracts.append(Option('SPX', target_exp, strike, 'C', 'CBOE', multiplier='100', tradingClass=chain.tradingClass))
+            contracts.append(Option('SPX', target_exp, strike, 'P', 'CBOE', multiplier='100', tradingClass=chain.tradingClass))
+        for c in ib.qualifyContracts(*contracts):
+            # Request IV (code 106 includes modelGreeks)
+            ticker = ib.reqMktData(c, '106', False, False)
+            option_tickers.append({"strike": c.strike, "right": c.right, "ticker": ticker})
+        option_tickers.sort(key=lambda it: (it["strike"], it["right"]))
+        print(f"Selected strikes: {sorted(voluti)}")
 
-    for c in qualified:
-        # Request IV (code 106 includes modelGreeks)
-        ticker = ib.reqMktData(c, '106', False, False)
-        option_tickers.append({
-            "strike": c.strike,
-            "right": c.right,
-            "ticker": ticker
-        })
+    centro_idx = min(range(len(sorted_strikes)), key=lambda i: abs(sorted_strikes[i] - spx_price))
+    centra(centro_idx)
 
     print("Subscribed to option data. Starting poller loop...")
     ib.sleep(3)
@@ -399,6 +398,24 @@ def main():
                     if spx_price == spx_price:
                         print(f"[{time_str}] SPX: {spx_price}")
                     last_atm_update = timestamp
+
+                    # Gli strike si scelgono all'avvio attorno al prezzo di quel
+                    # momento, che prima delle 15:30 e' la chiusura di ieri: il
+                    # 23/10/2026 erano 7655-7675 con lo SPX sceso a 7648, tutti
+                    # sopra lo spot, e "ATM" e "wing" non erano piu' tali. Con
+                    # +/-2 strike basta un movimento di 5 punti per uscire, quindi
+                    # si sposta la finestra qui, senza chiudere la sessione (che
+                    # costerebbe 30s di buco e la storia delle variazioni). Solo
+                    # su un prezzo vero, e oltre 3/4 di strike dal centro, perche'
+                    # un prezzo a cavallo fra due strike non la faccia oscillare.
+                    spot_vero = spx_ticker.marketPrice()
+                    if spot_vero and spot_vero == spot_vero:
+                        idx = min(range(len(sorted_strikes)), key=lambda i: abs(sorted_strikes[i] - spot_vero))
+                        passo = abs(sorted_strikes[idx] - sorted_strikes[centro_idx]) / max(1, abs(idx - centro_idx))
+                        if idx != centro_idx and abs(spot_vero - sorted_strikes[centro_idx]) > 0.75 * passo:
+                            print(f"[{time_str}] SPX a {spot_vero}: ricentro su {sorted_strikes[idx]}")
+                            centro_idx = idx
+                            centra(centro_idx)
 
                 # Get SPX price for snapshot
                 spx_price_current = spx_ticker.marketPrice()
