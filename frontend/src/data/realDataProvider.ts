@@ -20,6 +20,7 @@
  */
 
 import { AnalysisSnapshot, CandleData, MarketRegime } from "@/types/gamma";
+import { minutiRomaDaNy } from '@/lib/orarioNy';
 
 interface PuntoMercato {
   time?: string;
@@ -160,13 +161,14 @@ export class RealDataProvider {
   }
 
   /**
-   * Anni alla scadenza 0DTE: le opzioni del giorno chiudono alle 22:00 CET.
+   * Anni alla scadenza 0DTE: le opzioni del giorno chiudono alle 16:00 di New
+   * York (22:00 italiane, 21:00 quando le ore legali non coincidono).
    *
    * Il pavimento di cinque minuti evita che, nell'ultimo quarto d'ora, T -> 0
    * faccia esplodere IV e gamma verso l'infinito.
    */
   private tempoAScadenza(tsMs: number): number {
-    const scadenza = this.todayMs + 22 * 3600000;
+    const scadenza = this.todayMs + minutiRomaDaNy('16:00') * 60000;
     const secondi = Math.max(300, (scadenza - tsMs) / 1000);
     return secondi / (365 * 24 * 3600);
   }

@@ -11,7 +11,7 @@ except ImportError:
     print("Error: ib_insync is not installed. Please run 'pip install ib_insync'.")
     sys.exit(1)
 
-from poller_session import esegui_a_oltranza, registra_connessione
+from poller_session import esegui_a_oltranza, registra_connessione, minuti_locali_da_ny
 import smile
 
 try:
@@ -26,10 +26,11 @@ except ImportError:
 
 # Configuration
 POLL_INTERVAL = 10  # seconds
-START_HOUR = 8  # 14:30 Italian = 8:30 Eastern inside IBKR usually, but let's use local machine time
-# Assuming local machine is CET
-START_TIME_MINUTES = 13 * 60 + 30  # Adjusted for immediate testing
-END_TIME_MINUTES = 22 * 60  # 22:00
+# Finestra di raccolta in ora di New York (7:30-16:00, cioe' 13:30-22:00
+# italiane quasi tutto l'anno): si converte ogni giro con
+# `minuti_locali_da_ny`, perche' le due ore legali non cambiano lo stesso giorno.
+START_NY = (7, 30)
+END_NY = (16, 0)
 # Quanti strike puo' allontanarsi lo spot dal centro della catena prima che la
 # sessione si chiuda per ricentrarla: 8 strike da 5 punti = 40 punti, e ne
 # restano almeno 10 dal lato verso cui si muove.
@@ -538,7 +539,9 @@ def main():
         # Current time in minutes since midnight
         minutes_since_midnight = now.hour * 60 + now.minute
         
-        is_active = START_TIME_MINUTES <= minutes_since_midnight <= END_TIME_MINUTES
+        start_minutes = minuti_locali_da_ny(*START_NY)
+        end_minutes = minuti_locali_da_ny(*END_NY)
+        is_active = start_minutes <= minutes_since_midnight <= end_minutes
 
         if is_active:
             if timestamp - last_poll >= POLL_INTERVAL:
@@ -575,9 +578,9 @@ def main():
                               f"({strikes[0]}-{strikes[-1]}): chiudo la sessione per ricentrarla.", flush=True)
                         return
 
-                # Check for 15:30 open (9:30 EST)
+                # Apertura del cash, 9:30 a New York
                 is_opening_snapshot = False
-                if not open_spx_captured and now.hour == 15 and now.minute >= 30:
+                if not open_spx_captured and minutes_since_midnight >= minuti_locali_da_ny(9, 30):
                     is_opening_snapshot = True
                     open_spx_captured = True
                     print(f"Captured SPX Opening Price at {time_str}: {current_spx}")
@@ -688,7 +691,7 @@ def main():
                 last_poll = timestamp
         else:
             if now.second % 30 == 0:
-                print(f"[{now.strftime('%H:%M:%S')}] Outside active hours ({START_TIME_MINUTES//60}:{START_TIME_MINUTES%60} to {END_TIME_MINUTES//60}:{END_TIME_MINUTES%60}). Waiting...")
+                print(f"[{now.strftime('%H:%M:%S')}] Outside active hours ({start_minutes//60}:{start_minutes%60:02d} to {end_minutes//60}:{end_minutes%60:02d}). Waiting...")
         
         ib.sleep(1)
 

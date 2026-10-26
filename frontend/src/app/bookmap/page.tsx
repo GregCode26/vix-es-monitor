@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { Chart as ChartJS, registerables, type Scale, type ScriptableContext } from 'chart.js';
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import { oraRomaDaNy } from '@/lib/orarioNy';
 
 ChartJS.register(...registerables);
 
@@ -2042,7 +2043,7 @@ export default function BookmapPage() {
               }`}
               title={
                 quantiRange === 0
-                  ? "Range Opening Bell non ancora disponibili: arrivano dopo le 15:35"
+                  ? `Range Opening Bell non ancora disponibili: arrivano dopo le ${oraRomaDaNy('09:35').slice(0, 5)}`
                   : mostraRange
                     ? "Nascondi i range ES dell'Opening Bell"
                     : "Mostra i range ES dell'Opening Bell"

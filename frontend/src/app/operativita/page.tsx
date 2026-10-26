@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
 import type { Lato, Vertical } from '../api/verticali/route';
 import { leggiRefLines, leggiVisibilita } from '@/lib/refLines';
+import { oraRomaDaNy } from '@/lib/orarioNy';
 
 const REFRESH_MS = 10000;
 const VERDE = '#34d399';
@@ -365,7 +366,7 @@ export default function OperativitaPage() {
             <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-3 text-xs tabular-nums">
                 {marcatori.length === 0 ? (
-                  <span className="text-slate-600">VWAP e range OB non ancora disponibili (i range arrivano dopo le 15:35)</span>
+                  <span className="text-slate-600">VWAP e range OB non ancora disponibili (i range arrivano dopo le {oraRomaDaNy('09:35').slice(0, 5)})</span>
                 ) : (
                   [...marcatori].sort((a, b) => b.valore - a.valore).map((m) => (
                     <span key={m.etichetta} className="text-slate-400">

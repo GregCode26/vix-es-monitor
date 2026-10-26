@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
+import { oraRomaDaNy } from '@/lib/orarioNy';
 
 // Initialize Supabase client
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
@@ -118,7 +119,7 @@ function calcolaRange(storico: PuntoStorico[]) {
             { c: 'esCallBid', ca: 'esCallAsk', p: 'esPutBid', pa: 'esPutAsk' },
         ),
         ob: livelliDa(
-            puntoAllOra(storico, '15:35:00', ['callBid', 'callAsk', 'putBid', 'putAsk']),
+            puntoAllOra(storico, oraRomaDaNy('09:35'), ['callBid', 'callAsk', 'putBid', 'putAsk']),
             { c: 'callBid', ca: 'callAsk', p: 'putBid', pa: 'putAsk' },
         ),
     };

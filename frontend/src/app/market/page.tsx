@@ -20,6 +20,7 @@ import 'chartjs-adapter-date-fns';
 import { Line } from 'react-chartjs-2';
 import { leggiRefLines, salvaRefLines, leggiVisibilita, REF_LINES_VIS_KEY } from '@/lib/refLines';
 import { majorGamma, RigaGamma } from '@/lib/majorGamma';
+import { minutiRomaDaNy, oraRomaDaNy } from '@/lib/orarioNy';
 import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
 import AiSignalPanel from '@/components/AiSignalPanel';
 
@@ -313,8 +314,10 @@ interface RangeCalcInput {
  * nello stesso formato 'HH:MM:SS' di `DataPoint.time`: cosi' il confronto e'
  * un confronto fra stringhe e non serve ricostruire una data.
  */
-const APERTURA_USA = '15:30:00';
-const OB_SNAPSHOT = '15:35:00';
+// Funzioni e non costanti: in ora di Roma cambiano nelle settimane in cui
+// l'ora legale italiana e quella americana non coincidono (vedi orarioNy).
+const aperturaUsa = () => oraRomaDaNy('09:30');
+const obSnapshot = () => oraRomaDaNy('09:35');
 
 /**
  * Accanto a ogni prezzo ES dell'asse destro, in verde, il prezzo SPX
@@ -429,7 +432,7 @@ function finestraLive(points: DataPoint[]): [number, number] | null {
 }
 
 function basisEsSpx(points: DataPoint[]): number | null {
-    const validi = points.filter((d) => d.time >= APERTURA_USA
+    const validi = points.filter((d) => d.time >= aperturaUsa()
         && d.esf !== null && d.spx !== null && d.spx !== undefined);
     if (validi.length === 0) return null;
     const fine = secondi(validi[validi.length - 1].time);
@@ -996,11 +999,11 @@ export default function MarketPage() {
             chart.$smileVisibile = mostraSmileRef.current;
         }
         // Apertura del cash: il primo SPX dalle 15:30, lo 0 della colonna %.
-        chart.$aperturaSpx = dataPoints.find((d) => d.time >= APERTURA_USA
+        chart.$aperturaSpx = dataPoints.find((d) => d.time >= aperturaUsa()
             && d.spx !== null && d.spx !== undefined)?.spx ?? null;
         // Massimo e minimo SPX del cash, le spike della candela nella colonna %.
         const spxCash = dataPoints
-            .filter((d) => d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined)
+            .filter((d) => d.time >= aperturaUsa() && d.spx !== null && d.spx !== undefined)
             .map((d) => d.spx as number);
         chart.$maxSpx = spxCash.length ? Math.max(...spxCash) : null;
         chart.$minSpx = spxCash.length ? Math.min(...spxCash) : null;
@@ -1011,7 +1014,7 @@ export default function MarketPage() {
         // finta.
         if (chart.data.datasets[5]) {
             chart.data.datasets[5].data = dataPoints.map(
-                (d) => (d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined
+                (d) => (d.time >= aperturaUsa() && d.spx !== null && d.spx !== undefined
                     ? suScalaSpx(d.spx) : null));
             chart.data.datasets[5].hidden = !mostraSpx;
         }
@@ -1095,7 +1098,7 @@ export default function MarketPage() {
         // l'ora dello scatto da cui sono ricavati: prima di allora non
         // esistevano.
         if (mostraRangeSpxOb && obResults) {
-            const daIdx = dataPoints.findIndex((d) => d.time >= OB_SNAPSHOT);
+            const daIdx = dataPoints.findIndex((d) => d.time >= obSnapshot());
             if (daIdx >= 0) {
                 const spxConfigs = [
                     { key: 'r1Down', color: '#facc15', label: 'R2↓ SPX' },
@@ -1192,7 +1195,7 @@ export default function MarketPage() {
             // vicina a ES ma non coincide (il basis si muove nella seduta):
             // conta anche lei, o potrebbe finire oltre il bordo.
             const esfValues = visiblePoints
-                .flatMap(d => [d.esf, mostraSpx && d.time >= APERTURA_USA && d.spx !== null && d.spx !== undefined ? suScalaSpx(d.spx) : null])
+                .flatMap(d => [d.esf, mostraSpx && d.time >= aperturaUsa() && d.spx !== null && d.spx !== undefined ? suScalaSpx(d.spx) : null])
                 .filter((v): v is number => v !== null && v !== undefined);
             const vixValuesAuto = visiblePoints.map(d => d.vix).filter((v): v is number => v !== null);
             // `quota` = dove cade il centro dei dati, da 0 (fondo) a 1 (cima);
@@ -1426,7 +1429,7 @@ export default function MarketPage() {
                 const minutiOra = hours * 60 + minutes;
                 const FINESTRA = 30;
                 const MATTINA = 10 * 60 + 35;
-                const POMERIGGIO = 15 * 60 + 35;
+                const POMERIGGIO = minutiRomaDaNy('09:35');
 
                 if (minutiOra >= MATTINA && minutiOra <= MATTINA + FINESTRA) {
                     // Straddle dalla chain ES: alle 10:35 CET sono le 04:35 a
@@ -1559,7 +1562,7 @@ export default function MarketPage() {
             setRangeCalcMorning,
         );
         applica(
-            findAt('15:35:00', ['callBid', 'callAsk', 'putBid', 'putAsk']),
+            findAt(obSnapshot(), ['callBid', 'callAsk', 'putBid', 'putAsk']),
             { call: 'callBid', callA: 'callAsk', put: 'putBid', putA: 'putAsk' },
             setRangeCalcOb,
         );
@@ -2409,7 +2412,7 @@ export default function MarketPage() {
                         {/* L'indice SPX, da mercato aperto, sulla scala di ES */}
                         <button
                             onClick={() => setMostraSpx((v) => !v)}
-                            title={mostraSpx ? "Nascondi la linea SPX (dalle 15:30)" : "Mostra la linea SPX dalle 15:30, sulla scala destra"}
+                            title={mostraSpx ? `Nascondi la linea SPX (dalle ${aperturaUsa().slice(0, 5)})` : `Mostra la linea SPX dalle ${aperturaUsa().slice(0, 5)}, sulla scala destra`}
                             className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraSpx
                                 ? 'bg-green-600/30 text-green-300 border-green-500/50 hover:bg-green-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
@@ -2431,7 +2434,7 @@ export default function MarketPage() {
                         {/* I sei livelli dell'Opening Bell in termini SPX */}
                         <button
                             onClick={() => setMostraRangeSpxOb((v) => !v)}
-                            title={mostraRangeSpxOb ? "Nascondi i range SPX dell'Opening Bell" : "Mostra i range SPX dell'Opening Bell, dalle 15:35"}
+                            title={mostraRangeSpxOb ? "Nascondi i range SPX dell'Opening Bell" : `Mostra i range SPX dell'Opening Bell, dalle ${obSnapshot().slice(0, 5)}`}
                             className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraRangeSpxOb
                                 ? 'bg-emerald-600/30 text-emerald-300 border-emerald-500/50 hover:bg-emerald-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
@@ -2515,7 +2518,7 @@ export default function MarketPage() {
                     const activeInput = rangeCalcTab === 'morning' ? rangeCalcMorning : rangeCalcOb;
                     const setActiveInput = rangeCalcTab === 'morning' ? setRangeCalcMorning : setRangeCalcOb;
                     const results = rangeCalcTab === 'morning' ? morningResults : obResults;
-                    const sessionLabel = rangeCalcTab === 'morning' ? 'Morning 10:35' : 'Opening Bell 15:35';
+                    const sessionLabel = rangeCalcTab === 'morning' ? 'Morning 10:35' : `Opening Bell ${obSnapshot().slice(0, 5)}`;
 
                     return (
                         <div className="bg-slate-800/80 backdrop-blur-sm border border-purple-500/30 rounded-xl p-5 mb-4">

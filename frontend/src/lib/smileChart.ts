@@ -17,6 +17,8 @@
  * Nessuna linea orizzontale, per ora: niente +-1/2 sigma ne' IV MIN sul grafico.
  */
 
+import { oraRomaDaNy } from './orarioNy';
+
 export const SMILE_COL = 180;
 
 export interface DatiSmile {
@@ -138,7 +140,7 @@ export const smilePlugin = {
         ctx.textAlign = 'left';
 
         const messaggio = !dati ? 'Smile: in attesa dei dati'
-            : basis == null ? 'Smile: in attesa della basis ES-SPX (15:30)' : null;
+            : basis == null ? `Smile: in attesa della basis ES-SPX (${oraRomaDaNy('09:30').slice(0, 5)})` : null;
         if (messaggio || !dati) {
             ctx.fillStyle = '#64748b';
             ctx.fillText(messaggio ?? '', x0 + 6, chartArea.top + 6);

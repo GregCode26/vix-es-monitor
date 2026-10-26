@@ -14,7 +14,7 @@ except ImportError:
 
 from supabase import create_client, Client
 
-from poller_session import esegui_a_oltranza, registra_connessione
+from poller_session import esegui_a_oltranza, registra_connessione, minuti_locali_da_ny
 
 # Load environment variables
 load_dotenv()
@@ -57,9 +57,10 @@ def read_session_file(date_key):
         print(f"Error reading file {file_path}: {e}")
         return []
 
-# Ora in cui si fissa il cono, in minuti da mezzanotte, e per quanto ancora
-# si accetta di fissarlo se a quell'istante preciso mancavano i dati.
-CONO_MINUTI = 15 * 60 + 35
+# Ora in cui si fissa il cono, le 9:35 di New York (15:35 italiane, 14:35 le
+# settimane in cui le ore legali non coincidono), e per quanto ancora si
+# accetta di fissarlo se a quell'istante preciso mancavano i dati.
+CONO_NY = (9, 35)
 CONO_TOLLERANZA_MIN = 30
 
 
@@ -566,7 +567,8 @@ def main():
                 # spacciato per quello dell'apertura.
                 if cone_up is None and atm_iv and atm_iv > 0:
                     minuti_ora = now.hour * 60 + now.minute
-                    if CONO_MINUTI <= minuti_ora <= CONO_MINUTI + CONO_TOLLERANZA_MIN:
+                    cono_minuti = minuti_locali_da_ny(*CONO_NY)
+                    if cono_minuti <= minuti_ora <= cono_minuti + CONO_TOLLERANZA_MIN:
                         move = atm_iv * esf * 0.052  # sqrt(1/365)
                         cone_up = round(esf + move, 2)
                         cone_down = round(esf - move, 2)

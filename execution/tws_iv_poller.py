@@ -18,7 +18,7 @@ except ImportError:
     print("Error: ib_insync is not installed. Please run 'pip install ib_insync'.")
     sys.exit(1)
 
-from poller_session import esegui_a_oltranza, registra_connessione
+from poller_session import esegui_a_oltranza, registra_connessione, minuti_locali_da_ny
 
 try:
     from dotenv import load_dotenv
@@ -31,8 +31,10 @@ except ImportError:
     print("WARNING: supabase/dotenv non disponibili, si scrive solo su file locale.")
 
 POLL_INTERVAL = 5  # seconds - raccogliamo IV ogni 5 secondi
-START_TIME_MINUTES = 13 * 60 + 30  # 13:30 CET
-END_TIME_MINUTES = 22 * 60  # 22:00
+# Finestra in ora di New York (7:30-16:00 = 13:30-22:00 italiane quasi tutto
+# l'anno), convertita a ogni giro: vedi `minuti_locali_da_ny`.
+START_NY = (7, 30)
+END_NY = (16, 0)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'iv-monitor')
@@ -383,7 +385,7 @@ def main():
         timestamp = now.timestamp()
         minutes_since_midnight = now.hour * 60 + now.minute
 
-        is_active = START_TIME_MINUTES <= minutes_since_midnight <= END_TIME_MINUTES
+        is_active = minuti_locali_da_ny(*START_NY) <= minutes_since_midnight <= minuti_locali_da_ny(*END_NY)
 
         if is_active:
             if timestamp - last_poll >= POLL_INTERVAL:

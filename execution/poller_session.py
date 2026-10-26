@@ -24,6 +24,9 @@ connessione nuova e la catena del giorno nuovo.
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+NEW_YORK = ZoneInfo('America/New_York')
 
 # Connessione della sessione in corso, da chiudere prima di aprirne un'altra:
 # senza questo TWS si ritrova un client fantasma per ogni tentativo.
@@ -32,6 +35,21 @@ _connessione = None
 
 def giorno_corrente() -> str:
     return datetime.now().strftime('%Y-%m-%d')
+
+
+def minuti_locali_da_ny(ore: int, minuti: int) -> int:
+    """Un orario di New York di oggi, in minuti da mezzanotte sull'ora di questo PC.
+
+    Gli orari del cash (apertura 9:30, range alle 9:35, chiusura 16:00) sono
+    di New York, e Italia e Stati Uniti non cambiano ora lo stesso giorno: fra
+    l'ultima domenica di ottobre e la prima di novembre (e due-tre settimane
+    a marzo) il cash apre alle 14:30 italiane e non alle 15:30. Scritti fissi
+    in ora italiana, quei giorni la finestra e il range erano un'ora avanti.
+    """
+    oggi = datetime.now(NEW_YORK)
+    ny = oggi.replace(hour=ore, minute=minuti, second=0, microsecond=0)
+    locale = ny.astimezone()
+    return locale.hour * 60 + locale.minute
 
 
 # Codici che TWS manda a ogni connessione per dire che va tutto bene: se si

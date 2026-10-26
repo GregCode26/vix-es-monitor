@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Chart as ChartJS, registerables, type ChartDataset, type Scale } from 'chart.js';
+import { oraRomaDaNy } from '@/lib/orarioNy';
 
 ChartJS.register(...registerables);
 
@@ -51,8 +52,8 @@ const SERIE_STEP_SEC = 120;
 /** Le "fette" del confronto: 10, 20 e 30 minuti fa. */
 const FETTA_SEC = 600;
 /** Ora (italiana) del breakeven dello straddle: quella del range OB, cioe' le 9:35 di New York. */
-const ORA_STRADDLE = '15:35:00';
-const CHIUSURA = '22:00:00';
+const oraStraddle = () => oraRomaDaNy('09:35');
+const chiusura = () => oraRomaDaNy('16:00');
 
 function secondi(hhmmss: string): number {
   const [h, m, sec] = hhmmss.split(':').map(Number);
@@ -478,10 +479,10 @@ export default function MarketTidePage() {
     // Straddle: il cono parte dal prezzo delle 15:35 e arriva ai breakeven
     // alla chiusura; i breakeven sono le stesse due quote, piatte.
     const livello = (verso: 'up' | 'down') => points.map((p) => {
-      if (!breakeven || straddle === 'nessuna' || p.time < ORA_STRADDLE) return null;
+      if (!breakeven || straddle === 'nessuna' || p.time < oraStraddle()) return null;
       const arrivo = breakeven[verso];
       if (straddle === 'breakeven') return arrivo;
-      const quota = (secondi(p.time) - secondi(ORA_STRADDLE)) / (secondi(CHIUSURA) - secondi(ORA_STRADDLE));
+      const quota = (secondi(p.time) - secondi(oraStraddle())) / (secondi(chiusura()) - secondi(oraStraddle()));
       return breakeven.spot + (arrivo - breakeven.spot) * Math.min(1, quota);
     });
     (cp.data.datasets[3] as ChartDataset<'line'>).data = livello('up');
