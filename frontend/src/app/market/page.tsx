@@ -487,7 +487,7 @@ export default function MarketPage() {
      * dallo straddle si ricavano: quelle sono annotazioni orizzontali ferme,
      * queste seguono il prezzo per tutta la sessione.
      */
-    const [mostraStraddle, setMostraStraddle] = useState(true);
+    const [mostraStraddle, setMostraStraddle] = useState(false);
     /**
      * La curva dello smile SPX 0DTE nella colonna a destra (lib/smileChart).
      * Dati e visibilita' passano anche da ref, perche' il grafico si ricrea
@@ -503,14 +503,14 @@ export default function MarketPage() {
      * prezzo o sulla chiusura di ieri, cioe' una riga piatta che non e' un
      * prezzo di oggi.
      */
-    const [mostraSpx, setMostraSpx] = useState(true);
+    const [mostraSpx, setMostraSpx] = useState(false);
     const [mostraAi, setMostraAi] = useState(false);
     /**
      * Gli stessi livelli R1/R2/R3 dell'Opening Bell, ma in termini SPX: il
      * calcolo parte dallo SPX e ci somma il basis per portarli su ES, qui il
      * basis non si somma. Vanno con la linea verde, non con quella di ES.
      */
-    const [mostraRangeSpxOb, setMostraRangeSpxOb] = useState(true);
+    const [mostraRangeSpxOb, setMostraRangeSpxOb] = useState(false);
     /**
      * Major Pos / Neg Gamma nel tempo, gli stessi livelli di /gex sulla base
      * Volume (il suo default; `majorGamma` con `gex`, non `gexOi`: si vuole il
@@ -544,13 +544,15 @@ export default function MarketPage() {
         r3UpOb: '',
         r1UpOb: '',
     });
+    // Di default solo i range dell'Opening Bell; quelli del mattino spenti
+    // (scelta dell'utente, 26/10/2026, come tutti i default qui sopra).
     const [refLineVisibility, setRefLineVisibility] = useState<RefLineVisibility>({
-        r1Down: true,
-        r2Down: true,
-        r3Down: true,
-        r2Up: true,
-        r3Up: true,
-        r1Up: true,
+        r1Down: false,
+        r2Down: false,
+        r3Down: false,
+        r2Up: false,
+        r3Up: false,
+        r1Up: false,
         r1DownOb: true,
         r2DownOb: true,
         r3DownOb: true,
