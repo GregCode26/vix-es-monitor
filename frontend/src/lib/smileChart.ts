@@ -14,7 +14,8 @@
  * - frecce = convexity ladder: arancio da sinistra = taker corti di
  *   convessita' (gamma netta < 0), azzurra da destra = taker lunghi.
  *
- * Nessuna linea orizzontale, per ora: niente +-1/2 sigma ne' IV MIN sul grafico.
+ * - linee orizzontali su tutto il grafico: Spot +-1 sigma (tratteggio lungo),
+ *   +-2 sigma (puntinato) e il vertice IV MIN (viola, piena).
  */
 
 import { oraRomaDaNy } from './orarioNy';
@@ -41,6 +42,9 @@ const VERDE = '#22c55e';
 const ROSSO = '#ef4444';
 const ARANCIO = '#f59e0b';
 const AZZURRO = '#22d3ee';
+const COLORE_1S = 'rgba(226, 232, 240, 0.55)';
+const COLORE_2S = 'rgba(148, 163, 184, 0.45)';
+const COLORE_VERTICE = 'rgba(192, 132, 252, 0.8)';
 const RAGGIO = 4;
 const FRECCIA_MAX_PX = 40;
 const FRECCIA_MIN_PX = 8;
@@ -88,6 +92,29 @@ function pallino(ctx: CanvasRenderingContext2D, x: number, y: number, colore: st
         ctx.fillStyle = colore;
         ctx.fill();
     }
+}
+
+/**
+ * Una linea orizzontale su tutto il grafico e sulla colonna, con l'etichetta
+ * a destra nella colonna. Tratteggiata e trasparente: passa sopra ES e VIX.
+ */
+function lineaLivello(ctx: CanvasRenderingContext2D, x0: number, x1: number, y: number,
+    colore: string, tratto: number[], etichetta: string) {
+    ctx.save();
+    ctx.strokeStyle = colore;
+    ctx.lineWidth = 1;
+    ctx.setLineDash(tratto);
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = '9px Arial';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = colore;
+    ctx.fillText(etichetta, x1 - 3, y - 1);
+    ctx.restore();
 }
 
 /** Regime, IV ATM, vertice e z-score in alto nella colonna: testo su fondo scuro, sopra la curva. */
@@ -174,6 +201,28 @@ export const smilePlugin = {
         const xDi = (iv: number) => x0 + MARGINE_X + ((iv - ivMin) / (ivMax - ivMin)) * (x1 - x0 - 2 * MARGINE_X);
         const em = s.em ?? 0;
         const oltre2s = (strike: number) => em > 0 && Math.abs(strike - dati.spot) > 2 * em;
+
+        // Livelli orizzontali (sezioni 3 e 6): Spot +-1 sigma e +-2 sigma, e
+        // il vertice IV MIN. Prezzi SPX, portati su ES con la basis come la curva.
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(chartArea.left, chartArea.top, x1 - chartArea.left, chartArea.bottom - chartArea.top);
+        ctx.clip();
+        const livelli: [number, string, number[], string][] = [];
+        if (em > 0) {
+            livelli.push(
+                [dati.spot + 2 * em, COLORE_2S, [2, 4], '+2σ'],
+                [dati.spot + em, COLORE_1S, [6, 4], '+1σ'],
+                [dati.spot - em, COLORE_1S, [6, 4], '−1σ'],
+                [dati.spot - 2 * em, COLORE_2S, [2, 4], '−2σ'],
+            );
+        }
+        if (s.vertice) livelli.push([s.vertice.strike, COLORE_VERTICE, [], 'IV MIN']);
+        for (const [prezzo, colore, tratto, nome] of livelli) {
+            const y = yDi(prezzo);
+            if (dentro(y)) lineaLivello(ctx, chartArea.left, x1, y, colore, tratto, `${nome} ${prezzo.toFixed(1)}`);
+        }
+        ctx.restore();
 
         ctx.beginPath();
         ctx.rect(x0 - FRECCIA_MAX_PX - 12, chartArea.top, x1 - x0 + FRECCIA_MAX_PX + 12, chartArea.bottom - chartArea.top);

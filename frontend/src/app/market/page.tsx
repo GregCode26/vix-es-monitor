@@ -1466,6 +1466,24 @@ export default function MarketPage() {
                 return;
             }
 
+            // Il poller scrive ogni 15 secondi, qui si interroga ogni 5: senza
+            // questo controllo lo stesso punto verrebbe appeso tre volte. Si
+            // continua a interrogare a 5 secondi perche' costa poco (~180 byte)
+            // e fa comparire il dato nuovo subito.
+            //
+            // Il controllo sta fuori dall'updater di setDataPoints, che deve
+            // restare puro: React (in dev, StrictMode) lo esegue due volte, e
+            // con il ref aggiornato li' dentro la seconda trovava il punto gia'
+            // "visto" e lo scartava. Nessun punto dal vivo entrava nel grafico,
+            // e ogni ~45 s il controllo del buco qui sopra riscaricava la
+            // giornata intera (~790 KB, da Supabase se acceso; 26/10/2026).
+            if (data.sourceTime && data.sourceTime === lastSourceTime.current) {
+                setLastUpdate(timeStr);
+                setStatus('live');
+                return;
+            }
+            if (data.sourceTime) lastSourceTime.current = data.sourceTime;
+
             setDataPoints((prev) => {
                 const newPoint: DataPoint = {
                     // L'ora della riga del poller, non quella del browser: e' la
@@ -1482,14 +1500,7 @@ export default function MarketPage() {
                 if (prev.length === 0 && data.esf !== null) {
                     setFirstEsfValue(data.esf);
                 }
-                // Il poller scrive ogni 15 secondi, qui si interroga ogni 5:
-                // senza questo controllo lo stesso punto verrebbe appeso tre
-                // volte. Si continua a interrogare a 5 secondi perche' costa
-                // poco (~180 byte) e fa comparire il dato nuovo subito.
-                if (data.sourceTime && data.sourceTime === lastSourceTime.current) {
-                    return prev;
-                }
-                if (data.sourceTime) lastSourceTime.current = data.sourceTime;
+                if (prev.length > 0 && prev[prev.length - 1].time === newPoint.time) return prev;
                 // La giornata intera (00:05-23:00 a 15s sono ~5.500 punti): a
                 // 2000 il primo punto dal vivo tagliava via la mattina che lo
                 // storico aveva appena caricato.
