@@ -15,7 +15,8 @@
  *   convessita' (gamma netta < 0), azzurra da destra = taker lunghi.
  *
  * - linee orizzontali su tutto il grafico: Spot +-1 sigma (tratteggio lungo),
- *   +-2 sigma (puntinato) e il vertice IV MIN (viola, piena).
+ *   +-2 sigma (puntinato) e il vertice IV MIN (viola, piena), che non e'
+ *   orizzontale: segue nel tempo i cambi di strike del vertice, a gradini.
  */
 
 import { oraRomaDaNy } from './orarioNy';
@@ -34,6 +35,8 @@ export interface DatiSmile {
         base: 'storico' | 'provvisoria' | 'in raccolta';
         z: { tilt: number | null; curv: number | null; ivAtm: number | null } | null;
         regime: string | null;
+        /** [ora 'HH:MM:SS' italiana, strike] a ogni cambio del vertice, in ordine. */
+        storiaVertice?: [string, number][];
     };
     punti: { strike: number; callIv: number | null; putIv: number | null; ivOtm: number | null; conv: number | null }[];
 }
@@ -114,6 +117,56 @@ function lineaLivello(ctx: CanvasRenderingContext2D, x0: number, x1: number, y: 
     ctx.textBaseline = 'bottom';
     ctx.fillStyle = colore;
     ctx.fillText(etichetta, x1 - 3, y - 1);
+    ctx.restore();
+}
+
+/** L'indice della prima etichetta dell'asse x (ore 'HH:MM:SS' in ordine) >= t. */
+function indiceOra(etichette: string[], t: string): number {
+    let lo = 0;
+    let hi = etichette.length;
+    while (lo < hi) {
+        const m = (lo + hi) >> 1;
+        if (etichette[m] < t) lo = m + 1;
+        else hi = m;
+    }
+    return lo;
+}
+
+/**
+ * Il vertice IV MIN nel tempo: a gradini, ogni tratto sullo strike che era il
+ * vertice da quell'ora al cambio successivo, l'ultimo fino alla colonna con
+ * l'etichetta. Tutta la storia e' portata su ES con la basis di adesso: e'
+ * lenta, e quella di ogni ora passata non c'e' qui.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- l'istanza Chart.js
+function storiaVertice(chart: any, ctx: CanvasRenderingContext2D, storia: [string, number][],
+    yDi: (strike: number) => number, x1: number) {
+    const etichette: string[] = chart.data.labels ?? [];
+    const asseX = chart.scales.x;
+    if (storia.length === 0 || etichette.length === 0 || !asseX) return;
+    ctx.save();
+    ctx.strokeStyle = COLORE_VERTICE;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    storia.forEach(([t, strike], i) => {
+        const x = Math.max(asseX.getPixelForValue(Math.min(indiceOra(etichette, t), etichette.length - 1)), chart.chartArea.left);
+        const y = yDi(strike);
+        if (i === 0) {
+            ctx.moveTo(x, y);
+        } else {
+            ctx.lineTo(x, yDi(storia[i - 1][1]));
+            ctx.lineTo(x, y);
+        }
+    });
+    const ultimo = storia[storia.length - 1][1];
+    const y = yDi(ultimo);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+    ctx.font = '9px Arial';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = COLORE_VERTICE;
+    ctx.fillText(`IV MIN ${ultimo.toFixed(1)}`, x1 - 3, y - 1);
     ctx.restore();
 }
 
@@ -217,7 +270,8 @@ export const smilePlugin = {
                 [dati.spot - 2 * em, COLORE_2S, [2, 4], '−2σ'],
             );
         }
-        if (s.vertice) livelli.push([s.vertice.strike, COLORE_VERTICE, [], 'IV MIN']);
+        if (s.storiaVertice?.length) storiaVertice(chart, ctx, s.storiaVertice, yDi, x1);
+        else if (s.vertice) livelli.push([s.vertice.strike, COLORE_VERTICE, [], 'IV MIN']);
         for (const [prezzo, colore, tratto, nome] of livelli) {
             const y = yDi(prezzo);
             if (dentro(y)) lineaLivello(ctx, chartArea.left, x1, y, colore, tratto, `${nome} ${prezzo.toFixed(1)}`);

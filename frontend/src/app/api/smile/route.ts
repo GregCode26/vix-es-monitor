@@ -237,7 +237,15 @@ export async function GET() {
     // stesso esito, quindi si ricostruisce sulle ultime letture di oggi.
     const dirSmile = path.join(dati, 'smile');
     const passato = storico(dirSmile, date);
-    const oggi = senzaRipetute(leggiNdjson(path.join(dirSmile, `${date}.ndjson`)));
+    const letture = leggiNdjson(path.join(dirSmile, `${date}.ndjson`));
+    const oggi = senzaRipetute(letture);
+    // La storia del vertice IV MIN per la linea viola: solo i cambi di strike
+    // (~60 in una sessione), con l'ora italiana delle etichette del grafico.
+    const storiaVertice: [string, number][] = [];
+    for (const o of letture) {
+        const strike = o.vertice?.strike;
+        if (o.t && strike != null && strike !== storiaVertice[storiaVertice.length - 1]?.[1]) storiaVertice.push([o.t, strike]);
+    }
     let confermato: Regime | null = null;
     let precedente: Regime | null = null;
     let ultimo: ReturnType<typeof zScore> | null = null;
@@ -271,6 +279,7 @@ export async function GET() {
             // In raccolta non c'e' regime; senza due letture uguali di fila, nemmeno.
             regime: ultimo.base === 'in raccolta' ? null : confermato,
             regimeGrezzo: grezzo,
+            storiaVertice,
         },
         punti,
     });
