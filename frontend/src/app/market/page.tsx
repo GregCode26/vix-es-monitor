@@ -20,6 +20,7 @@ import 'chartjs-adapter-date-fns';
 import { Line } from 'react-chartjs-2';
 import { leggiRefLines, salvaRefLines, leggiVisibilita, REF_LINES_VIS_KEY } from '@/lib/refLines';
 import { majorGamma, RigaGamma } from '@/lib/majorGamma';
+import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
 import AiSignalPanel from '@/components/AiSignalPanel';
 
 ChartJS.register(
@@ -485,6 +486,15 @@ export default function MarketPage() {
      */
     const [mostraStraddle, setMostraStraddle] = useState(true);
     /**
+     * La curva dello smile SPX 0DTE nella colonna a destra (lib/smileChart).
+     * Dati e visibilita' passano anche da ref, perche' il grafico si ricrea
+     * quando arrivano i primi punti e le proprieta' messe sull'istanza
+     * vecchia andrebbero perse.
+     */
+    const [mostraSmile, setMostraSmile] = useState(true);
+    const smileRef = useRef<DatiSmile | null>(null);
+    const mostraSmileRef = useRef(true);
+    /**
      * L'indice SPX sulla scala destra, quella di ES. Solo da mercato aperto:
      * prima delle 15:30 l'indice non stampa e il poller ripiega sull'ultimo
      * prezzo o sulla chiusura di ieri, cioe' una riga piatta che non e' un
@@ -604,6 +614,8 @@ export default function MarketPage() {
             if (savedDiv !== null) setShowDivergences(savedDiv === 'true');
             const savedStr = localStorage.getItem('marketShowStraddle');
             if (savedStr !== null) setMostraStraddle(savedStr === 'true');
+            const savedSmile = localStorage.getItem('marketShowSmile');
+            if (savedSmile !== null) setMostraSmile(savedSmile === 'true');
             const savedSpx = localStorage.getItem('marketShowSpx');
             if (savedSpx !== null) setMostraSpx(savedSpx === 'true');
             const savedSpxOb = localStorage.getItem('marketShowRangeSpxOb');
@@ -621,6 +633,42 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowStraddle', String(mostraStraddle));
     }, [mostraStraddle]);
+
+    // Smile: la colonna si apre o si chiude (larghezza dell'asse y-smile) e,
+    // finche' e' aperta, /api/smile si rilegge ogni 10 s (~3 KB, solo locale).
+    useEffect(() => {
+        localStorage.setItem('marketShowSmile', String(mostraSmile));
+        mostraSmileRef.current = mostraSmile;
+        const chart = chartRef.current;
+        if (chart) {
+            chart.$smileVisibile = mostraSmile;
+            chart.update('none');
+        }
+        if (!mostraSmile) return;
+        let attivo = true;
+        const carica = async () => {
+            try {
+                const res = await fetch('/api/smile', { cache: 'no-store' });
+                const json = res.ok ? await res.json() : null;
+                if (!attivo) return;
+                smileRef.current = json && json.local !== false && json.punti ? json : null;
+            } catch (e) {
+                console.error('Smile fetch failed:', e);
+                if (attivo) smileRef.current = null;
+            }
+            const c = chartRef.current;
+            if (c) {
+                c.$smile = smileRef.current;
+                c.draw();
+            }
+        };
+        carica();
+        const id = setInterval(carica, 10000);
+        return () => {
+            attivo = false;
+            clearInterval(id);
+        };
+    }, [mostraSmile]);
 
 
     useEffect(() => {
@@ -943,6 +991,10 @@ export default function MarketPage() {
         // non su quella di ES.
         const basisSpx = basisEsSpx(dataPoints) ?? obResults?.basis ?? null;
         chart.$basisSpx = basisSpx;
+        chart.$smile = smileRef.current;
+        if (chart.$smileVisibile !== mostraSmileRef.current) {
+            chart.$smileVisibile = mostraSmileRef.current;
+        }
         // Apertura del cash: il primo SPX dalle 15:30, lo 0 della colonna %.
         chart.$aperturaSpx = dataPoints.find((d) => d.time >= APERTURA_USA
             && d.spx !== null && d.spx !== undefined)?.spx ?? null;
@@ -2229,6 +2281,23 @@ export default function MarketPage() {
                 },
                 // Spazio per le colonne SPX e % disegnate da spxAxisPlugin.
                 afterFit: (scale: any) => { scale.width += SPX_COL + PCT_COL; },
+                // Dopo y-smile: e' quella con il peso piu' alto a stare piu'
+                // lontana dall'area del grafico.
+                weight: 1,
+            },
+            // Asse vuoto: riserva la colonna fra il grafico e la scala dei
+            // prezzi in cui smilePlugin disegna la curva (larga 0 se spenta).
+            'y-smile': {
+                type: 'linear' as const,
+                position: 'right' as const,
+                display: true,
+                weight: 0,
+                min: 0,
+                max: 1,
+                ticks: { display: false },
+                grid: { display: false, drawTicks: false },
+                border: { display: false },
+                afterFit: (scale: any) => { scale.width = scale.chart.$smileVisibile ? SMILE_COL : 0; },
             },
         },
     }), [updateZoomState]);
@@ -2313,6 +2382,17 @@ export default function MarketPage() {
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraAi ? '◉' : '◌'} AI Signal
+                        </button>
+
+                        {/* La curva dello smile SPX 0DTE a destra del grafico */}
+                        <button
+                            onClick={() => setMostraSmile((v) => !v)}
+                            title={mostraSmile ? 'Nascondi la curva dello smile' : 'Mostra la curva dello smile SPX 0DTE'}
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraSmile
+                                ? 'bg-cyan-600/30 text-cyan-300 border-cyan-500/50 hover:bg-cyan-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraSmile ? '◉' : '◌'} Smile
                         </button>
 
                         {/* Le due linee del cono */}
@@ -2671,7 +2751,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin]}
+                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">

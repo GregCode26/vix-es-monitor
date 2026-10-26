@@ -12,6 +12,7 @@ except ImportError:
     sys.exit(1)
 
 from poller_session import esegui_a_oltranza, registra_connessione
+import smile
 
 try:
     from dotenv import load_dotenv
@@ -39,6 +40,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'volumes')
 # Ultimo bid/ask di ogni contratto seguito, per i vertical di /operativita.
 QUOTE_FILE = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'catena', 'quote.json')
+# Una lettura dello smile per riga, per gli z-score di /api/smile (vedi smile.py).
+SMILE_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'smile')
 
 def ensure_data_dir():
     if not os.path.exists(DATA_DIR):
@@ -272,13 +275,14 @@ _supabase_client = None
 _colonna_tide_manca_dal = None
 _RIPROVA_COLONNA_TIDE_SEC = 600
 
-def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers):
-    """Sovrascrive QUOTE_FILE con il bid/ask attuale di ogni strike.
+def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers, gamma, lee_ready):
+    """Sovrascrive QUOTE_FILE con l'ultima fotografia di ogni strike, e accoda la lettura dello smile.
 
-    Solo l'ultima fotografia e solo in locale: serve al costo dei vertical in
-    tempo reale (/api/verticali), non alla storia, e su Supabase 37 strike x 4
-    prezzi ogni 10 s sarebbero egress senza motivo. Nessuna linea di market
-    data in piu': sono gli stessi ticker da cui si leggono i volumi.
+    Per strike: bid/ask, IV e delta di call e put, gamma e i conti Lee-Ready.
+    Servono al costo dei vertical (/api/verticali) e allo smile con il
+    convexity ladder (/api/smile). Solo l'ultima fotografia e solo in locale:
+    su Supabase sarebbe egress senza motivo. Nessuna linea di market data in
+    piu': sono gli stessi ticker da cui si leggono i volumi.
     """
     # IBKR manda -1 quando un lato non c'e'; 0 invece e' un bid vero, sulle
     # put lontane, e senza di lui il vertical sparirebbe.
@@ -292,8 +296,18 @@ def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers):
         lato = 'c' if item["right"] == 'C' else 'p'
         r[lato + "Bid"] = prezzo(t.bid)
         r[lato + "Ask"] = prezzo(t.ask)
+        g = t.modelGreeks
+        iv = g.impliedVol if g else None
+        delta = g.delta if g else None
+        r[lato + "Iv"] = round(float(iv), 6) if iv is not None and iv == iv else None
+        r[lato + "Delta"] = round(float(delta), 6) if delta is not None and delta == delta else None
+    for k, r in righe.items():
+        r["gamma"] = gamma.get(k)
+        r.update(lee_ready.riga(k))
+    strikes = [righe[k] for k in sorted(righe)]
+    lettura = smile.lettura(strikes, spot, scadenza)
     dati = {"date": date_key, "time": time_str, "spot": spot, "expiry": scadenza,
-            "strikes": [righe[k] for k in sorted(righe)]}
+            "smile": lettura, "strikes": strikes}
     try:
         os.makedirs(os.path.dirname(QUOTE_FILE), exist_ok=True)
         temp_file = QUOTE_FILE + ".tmp"
@@ -302,6 +316,13 @@ def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers):
         os.replace(temp_file, QUOTE_FILE)
     except Exception as e:
         print(f"Error writing {QUOTE_FILE}: {e}")
+    if lettura:
+        try:
+            os.makedirs(SMILE_DIR, exist_ok=True)
+            with open(os.path.join(SMILE_DIR, f"{date_key}.ndjson"), 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"t": time_str, **lettura}, separators=(',', ':')) + "\n")
+        except Exception as e:
+            print(f"Error writing smile reading: {e}")
 
 
 def push_snapshot_to_supabase(date_key, snapshot):
@@ -637,7 +658,8 @@ def main():
                 
                 append_to_session_file(today_key, snapshot)
                 push_snapshot_to_supabase(today_key, snapshot)
-                scrivi_quote(today_key, time_str, current_spx, target_exp, option_tickers)
+                scrivi_quote(today_key, time_str, current_spx, target_exp, option_tickers,
+                             {k: v["gamma"] for k, v in volume_by_strike.items()}, lee_ready)
 
                 # Le sottoscrizioni si spengono da sole, e in silenzio.
                 #
