@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
-import type { Lato, Vertical } from '../api/verticali/route';
+import type { Blocco, Lato, Vertical } from '../api/verticali/route';
 import { leggiRefLines, leggiVisibilita } from '@/lib/refLines';
 import { oraRomaDaNy } from '@/lib/orarioNy';
 
@@ -13,6 +13,8 @@ const GIALLO = '#facc15';
 const VIOLA = '#a855f7';
 /** Finche' alle 15:35 non c'e' lo straddle i range non esistono: si richiedono ogni minuto. */
 const RANGE_RETRY_MS = 60_000;
+/** Quanti blocchi mostrare nella lista, dal piu' recente. */
+const BLOCCHI_IN_LISTA = 15;
 
 /**
  * I range OB come li dà /api/market (`range.ob`): in prezzi ES, cioè SPX delle
@@ -57,28 +59,27 @@ interface Risposta {
   spot?: number | null;
   expiry?: string;
   verticali: Vertical[];
+  /** Se il rilevamento dei vertical sui singoli trade e' attivo. */
+  rilevamento?: boolean;
+  blocchi?: Blocco[];
 }
 
-/** Uno dei quattro vertical di una coppia di strike, con il prezzo al naturale. */
-interface Scelta {
-  nome: string;
-  k1: number;
-  k2: number;
-  prezzo: number;
-  costo: number;
-  distanza: number;
+type Soglia = '100' | '250' | '500' | '1000';
+
+/** Il nome del vertical dal lato e dal verso: comprare la call e' un bull call, venderla un bear call. */
+function nomeBlocco(b: Blocco): string {
+  if (b.verso === 'incerto') return b.lato === 'C' ? 'Call vertical' : 'Put vertical';
+  if (b.lato === 'C') return b.verso === 'comprato' ? 'Bull call' : 'Bear call';
+  return b.verso === 'comprato' ? 'Bear put' : 'Bull put';
 }
 
-const dollari = (punti: number) => `${Math.round(punti * 100)} $`;
-
-/** Il piu' economico da eseguire; a parita' di costo il piu' vicino allo spot. */
-function migliore(scelte: Scelta[]): Scelta | null {
-  let best: Scelta | null = null;
-  for (const s of scelte) {
-    if (!best || s.costo < best.costo - 1e-9 || (Math.abs(s.costo - best.costo) < 1e-9 && s.distanza < best.distanza)) best = s;
-  }
-  return best;
+/** Rialzista o ribassista: bull call e bull put salgono, bear put e bear call scendono. */
+function coloreBlocco(b: Blocco): string {
+  if (b.verso === 'incerto') return '#94a3b8';
+  return (b.lato === 'C') === (b.verso === 'comprato') ? VERDE : ROSSO;
 }
+
+const migliaia = (n: number) => n.toLocaleString('it-IT');
 
 function Selettore<T extends string>({ titolo, valore, opzioni, onChange }: {
   titolo: string;
@@ -104,42 +105,23 @@ function Selettore<T extends string>({ titolo, valore, opzioni, onChange }: {
   );
 }
 
-function Scheda({ titolo, sottotitolo, prezzo, scelta, colore }: {
-  titolo: string;
-  sottotitolo: string;
-  prezzo: 'debito' | 'credito';
-  scelta: Scelta | null;
-  colore: string;
-}) {
-  return (
-    <div className="rounded-xl border border-slate-800 bg-[#111216] p-4">
-      <div className="text-xs text-slate-500 uppercase tracking-wider">{titolo}</div>
-      <div className="text-[11px] text-slate-600 mb-2">{sottotitolo}</div>
-      {scelta ? (
-        <>
-          <div className="text-xl font-bold" style={{ color: colore }}>
-            {scelta.nome} {scelta.k1}/{scelta.k2}
-          </div>
-          <div className="text-sm text-slate-400 tabular-nums mt-1">
-            {prezzo} {scelta.prezzo.toFixed(2)} · costo{' '}
-            <span className="text-white">{dollari(scelta.costo)}</span> a contratto ({((scelta.costo / 5) * 100).toFixed(1)}% dell&apos;ampiezza)
-          </div>
-        </>
-      ) : (
-        <div className="text-sm text-slate-600">—</div>
-      )}
-    </div>
-  );
-}
-
-function CellaLato({ l, piuEconomico }: { l: Lato | null; piuEconomico: boolean }) {
-  if (!l) return <td colSpan={4} className="px-2 py-1 text-center text-slate-700">—</td>;
+/** Mid e contratti di vertical eseguiti oggi su un lato, comprati in verde e venduti in rosso. */
+function CellaLato({ l, grossi }: { l: Lato | null; grossi: number }) {
+  if (!l) return <td colSpan={3} className="px-2 py-1 text-center text-slate-700 border-l border-slate-800">—</td>;
   return (
     <>
-      <td className="px-2 py-1 text-right">{l.debito.toFixed(2)}</td>
-      <td className="px-2 py-1 text-right">{l.credito.toFixed(2)}</td>
-      <td className="px-2 py-1 text-right text-slate-500">{l.mid.toFixed(2)}</td>
-      <td className={`px-2 py-1 text-right font-bold ${piuEconomico ? 'text-emerald-400' : 'text-slate-400'}`}>{dollari(l.costo)}</td>
+      <td className="px-2 py-1 text-right text-white border-l border-slate-800">{l.mid.toFixed(2)}</td>
+      <td className="px-2 py-1 text-right" style={{ color: l.vol?.comprati ? VERDE : undefined }}>
+        {l.vol ? migliaia(l.vol.comprati) : '—'}
+      </td>
+      <td className="px-2 py-1 text-right" style={{ color: l.vol?.venduti ? ROSSO : undefined }}>
+        {l.vol ? migliaia(l.vol.venduti) : '—'}
+        {grossi > 0 && (
+          <span className="ml-1.5 px-1 rounded bg-amber-400 text-black text-[10px] font-bold" title="Blocchi sopra la soglia">
+            ×{grossi}
+          </span>
+        )}
+      </td>
     </>
   );
 }
@@ -155,6 +137,7 @@ export default function OperativitaPage() {
   const [dati, setDati] = useState<Risposta | null>(null);
   const [errore, setErrore] = useState<string | null>(null);
   const [banda, setBanda] = useState<'20' | '30' | '50'>('30');
+  const [soglia, setSoglia] = useState<Soglia>('1000');
   // Catena finta dalla route (?sim=1), per vedere la pagina a mercato chiuso.
   const [sim, setSim] = useState(false);
   // Dall'ultima riga di /api/market: VWAP di ES e base ES - SPX del momento.
@@ -289,22 +272,14 @@ export default function OperativitaPage() {
     return { righe: vs.slice(i - n, i + n + 1), atm: vs[i].k1 };
   }, [dati, spot, banda]);
 
-  const { long, short } = useMemo(() => {
-    const debito: Scelta[] = [];
-    const credito: Scelta[] = [];
-    for (const v of righe) {
-      const distanza = Math.abs((v.k1 + v.k2) / 2 - (spot ?? 0));
-      if (v.call) {
-        debito.push({ nome: 'Bull call', k1: v.k1, k2: v.k2, prezzo: v.call.debito, costo: v.call.costo, distanza });
-        credito.push({ nome: 'Bear call', k1: v.k1, k2: v.k2, prezzo: v.call.credito, costo: v.call.costo, distanza });
-      }
-      if (v.put) {
-        debito.push({ nome: 'Bear put', k1: v.k1, k2: v.k2, prezzo: v.put.debito, costo: v.put.costo, distanza });
-        credito.push({ nome: 'Bull put', k1: v.k1, k2: v.k2, prezzo: v.put.credito, costo: v.put.costo, distanza });
-      }
-    }
-    return { long: migliore(debito), short: migliore(credito) };
-  }, [righe, spot]);
+  // I blocchi sopra la soglia: la lista dal piu' recente, e quanti per vertical e lato.
+  const { grossi, perVertical } = useMemo(() => {
+    const min = Number(soglia);
+    const tutti = (dati?.blocchi ?? []).filter((b) => b.size >= min).sort((a, b) => (a.t < b.t ? 1 : -1));
+    const conta = new Map<string, number>();
+    for (const b of tutti) conta.set(`${b.k1}${b.lato}`, (conta.get(`${b.k1}${b.lato}`) ?? 0) + 1);
+    return { grossi: tutti, perVertical: conta };
+  }, [dati, soglia]);
 
   if (!autorizzato) return null;
 
@@ -315,7 +290,7 @@ export default function OperativitaPage() {
           <div>
             <h1 className="text-2xl font-bold text-white">Operatività</h1>
             <p className="text-xs text-slate-500">
-              SPX 0DTE · vertical da 5 punti, costo di esecuzione al naturale · solo locale
+              SPX 0DTE · vertical da 5 punti: mid e contratti eseguiti · solo locale
               {dati?.time && <> · quotazioni delle {dati.time}{dati.expiry && <>, scadenza {dati.expiry}</>}</>}
               {spot != null && <> · SPX {spot.toFixed(2)}</>}
             </p>
@@ -323,7 +298,7 @@ export default function OperativitaPage() {
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSim((v) => !v)}
-              title="Catena finta (Black-Scholes), per vedere la pagina a mercato chiuso"
+              title="Catena e blocchi finti, per vedere la pagina a mercato chiuso"
               className={`px-3 py-1.5 text-xs font-bold rounded-lg border ${sim
                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 hover:bg-amber-500/30'
                 : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'}`}
@@ -341,7 +316,7 @@ export default function OperativitaPage() {
 
         {sim && (
           <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 mb-3 text-xs text-amber-300">
-            Dati simulati: catena Black-Scholes a 3 ore dalla scadenza, IV 19%, spot che oscilla attorno a 7648, VWAP e range OB (straddle di 28 punti) inventati. Non sono quotazioni di mercato.
+            Dati simulati: catena Black-Scholes a 3 ore dalla scadenza, IV 19%, spot che oscilla attorno a 7648, blocchi di vertical, VWAP e range OB (straddle di 28 punti) inventati. Non sono dati di mercato.
           </div>
         )}
 
@@ -358,9 +333,38 @@ export default function OperativitaPage() {
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
-              <Scheda titolo="Long più economico" sottotitolo="bull call o bear put" prezzo="debito" scelta={long} colore={VERDE} />
-              <Scheda titolo="Short più economico" sottotitolo="bear call o bull put" prezzo="credito" scelta={short} colore={ROSSO} />
+            <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4 mb-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-xs">
+                <div>
+                  <div className="text-slate-500 uppercase tracking-wider">Blocchi di vertical</div>
+                  <div className="text-[11px] text-slate-600">le due gambe nello stesso istante, stessa size; verso dal prezzo fra credito e debito</div>
+                </div>
+                <Selettore
+                  titolo="Almeno"
+                  valore={soglia}
+                  opzioni={[['100', '100'], ['250', '250'], ['500', '500'], ['1000', '1000']]}
+                  onChange={setSoglia}
+                />
+              </div>
+              {!dati?.rilevamento ? (
+                <div className="text-sm text-slate-600 py-2">Rilevamento dei vertical non ancora attivo: per ora ci sono solo i prezzi.</div>
+              ) : grossi.length === 0 ? (
+                <div className="text-sm text-slate-600 py-2">Nessun vertical da {migliaia(Number(soglia))} contratti o più, oggi.</div>
+              ) : (
+                <table className="w-full text-xs tabular-nums">
+                  <tbody>
+                    {grossi.slice(0, BLOCCHI_IN_LISTA).map((b, i) => (
+                      <tr key={`${b.t}-${b.k1}-${b.lato}-${i}`} className="border-t border-slate-800/60">
+                        <td className="px-2 py-1 text-slate-500">{b.t}</td>
+                        <td className="px-2 py-1 font-bold" style={{ color: coloreBlocco(b) }}>{nomeBlocco(b)}</td>
+                        <td className="px-2 py-1 text-white font-semibold">{b.k1}/{b.k2}</td>
+                        <td className="px-2 py-1 text-right text-white font-bold">{migliaia(b.size)}</td>
+                        <td className="px-2 py-1 text-right text-slate-400">a {b.prezzo.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
 
             <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">
@@ -391,20 +395,18 @@ export default function OperativitaPage() {
                     <tr className="text-slate-500">
                       <th className="px-2 py-1 text-left" rowSpan={2}>Strike</th>
                       <th className="px-2 py-1 text-right" rowSpan={2}>Dallo spot</th>
-                      <th className="px-2 py-1 text-center border-l border-slate-800" colSpan={4}>Call · long bull call / short bear call</th>
-                      <th className="px-2 py-1 text-center border-l border-slate-800" colSpan={4}>Put · long bear put / short bull put</th>
+                      <th className="px-2 py-1 text-center border-l border-slate-800" colSpan={3}>Call vertical</th>
+                      <th className="px-2 py-1 text-center border-l border-slate-800" colSpan={3}>Put vertical</th>
                     </tr>
                     <tr className="text-slate-600">
-                      {['Debito', 'Credito', 'Mid', 'Costo', 'Debito', 'Credito', 'Mid', 'Costo'].map((t, i) => (
-                        <th key={i} className={`px-2 py-1 text-right ${i % 4 === 0 ? 'border-l border-slate-800' : ''}`}>{t}</th>
+                      {['Mid', 'Comprati', 'Venduti', 'Mid', 'Comprati', 'Venduti'].map((t, i) => (
+                        <th key={i} className={`px-2 py-1 text-right ${i % 3 === 0 ? 'border-l border-slate-800' : ''}`}>{t}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {[...righe].reverse().map((v) => {
                       const centro = (v.k1 + v.k2) / 2 - (spot ?? 0);
-                      const callMeno = v.call != null && (v.put == null || v.call.costo < v.put.costo);
-                      const putMeno = v.put != null && (v.call == null || v.put.costo < v.call.costo);
                       const isAtm = v.k1 === atm;
                       return (
                         <tr
@@ -430,8 +432,8 @@ export default function OperativitaPage() {
                           <td className="px-2 py-1 text-right" style={{ color: isAtm ? GIALLO : centro >= 0 ? VERDE : ROSSO }}>
                             {isAtm && spot != null ? `SPX ${spot.toFixed(2)}` : `${centro >= 0 ? '+' : ''}${centro.toFixed(1)}`}
                           </td>
-                          <CellaLato l={v.call} piuEconomico={callMeno} />
-                          <CellaLato l={v.put} piuEconomico={putMeno} />
+                          <CellaLato l={v.call} grossi={perVertical.get(`${v.k1}C`) ?? 0} />
+                          <CellaLato l={v.put} grossi={perVertical.get(`${v.k1}P`) ?? 0} />
                         </tr>
                       );
                     })}
@@ -439,9 +441,9 @@ export default function OperativitaPage() {
                 </table>
               </div>
               <p className="text-[11px] text-slate-600 mt-2">
-                Costo = metà del bid/ask delle due gambe, a contratto: è uguale per il long e lo short sugli stessi strike.
-                In verde il lato più economico fra call e put, che danno la stessa esposizione (bull call = bull put, bear put = bear call).
-                Un ordine combo spesso si esegue dentro il naturale: il costo reale può essere più basso.
+                Mid = mid della gamba cara meno mid dell&apos;altra. Comprati/venduti = contratti di vertical eseguiti oggi su
+                quelle due gambe: vicino al debito comprati (bull call, bear put), vicino al credito venduti (bear call, bull put).
+                ×N = blocchi sopra la soglia.
               </p>
             </div>
           </>

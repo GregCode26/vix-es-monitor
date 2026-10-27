@@ -13,6 +13,7 @@ except ImportError:
 
 from poller_session import esegui_a_oltranza, registra_connessione, minuti_locali_da_ny
 import smile
+from verticali_blocchi import RilevaVerticali
 
 try:
     from dotenv import load_dotenv
@@ -43,6 +44,8 @@ DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'volumes')
 QUOTE_FILE = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'catena', 'quote.json')
 # Una lettura dello smile per riga, per gli z-score di /api/smile (vedi smile.py).
 SMILE_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'smile')
+# I vertical eseguiti riconosciuti dai singoli trade, per /api/verticali (vedi verticali_blocchi.py).
+VERTICALI_DIR = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'verticali')
 
 def ensure_data_dir():
     if not os.path.exists(DATA_DIR):
@@ -497,10 +500,11 @@ def main():
         # Request data without volume limits if possible, we just need generic ticks (100) or short volume
         # Option Volume is usually included by default in reqMktData
         # 100 = Option Volume, 101 = Option Open Interest, 106 = Option
-        # Implied Volatility (porta con se' i modelGreeks, e quindi il gamma).
+        # Implied Volatility (porta con se' i modelGreeks, e quindi il gamma),
+        # 233 = RTVolume (ogni trade con prezzo e size, per i vertical).
         # Tutto sulle stesse linee di market data gia' impegnate: nessun
         # abbonamento in piu'.
-        ticker = ib.reqMktData(c, '100,101,106', False, False)
+        ticker = ib.reqMktData(c, '100,101,106,233', False, False)
         option_tickers.append({"strike": c.strike, "right": c.right, "ticker": ticker})
 
     # Il tide parte dai totali gia' salvati oggi, poi ascolta ogni aggiornamento
@@ -516,6 +520,8 @@ def main():
     lee_ready = LeeReady()
     lee_ready.riprendi(_session_cache["snapshots"])
     ib.pendingTickersEvent += lee_ready.su_tickers
+    rileva_verticali = RilevaVerticali(VERTICALI_DIR)
+    ib.pendingTickersEvent += rileva_verticali.su_tickers
 
     print("Subscribed. Starting poller loop...")
 
@@ -697,7 +703,13 @@ def main():
         else:
             if now.second % 30 == 0:
                 print(f"[{now.strftime('%H:%M:%S')}] Outside active hours ({start_minutes//60}:{start_minutes%60:02d} to {end_minutes//60}:{end_minutes%60:02d}). Waiting...")
-        
+
+        # Ogni secondo, non ogni 10: i trade si accoppiano entro mezzo secondo.
+        try:
+            rileva_verticali.elabora(time.time(), get_today_key())
+        except Exception as e:
+            print(f"Vertical detection error: {e}")
+
         ib.sleep(1)
 
 if __name__ == "__main__":
