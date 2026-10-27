@@ -88,7 +88,7 @@ const priceTagPlugin = {
             const scale = scales[axisId];
             if (!scale) return;
             const y = scale.getPixelForValue(value);
-            const text = axisId === 'y-right' ? value.toLocaleString() : value.toFixed(2);
+            const text = value.toFixed(2);
             
             ctx.save();
             ctx.font = 'bold 12px Arial';
@@ -123,8 +123,10 @@ const priceTagPlugin = {
         const esfVal = data.datasets[0].data[lastIdx];
         const vixVal = data.datasets[1].data[lastIdx];
 
-        // Il prezzo corrente di ES non ha piu' il cartellino: lo segna una
-        // linea bianca orizzontale attraverso le tre scale a destra.
+        // Il prezzo corrente di ES: una linea bianca orizzontale attraverso le
+        // colonne a destra e, sulla colonna ES, il cartellino giallo col
+        // valore (tolto in 29dd388, rimesso il 27/10/2026: con la colonna
+        // dello smile in mezzo la sola linea non diceva piu' a che prezzo).
         if (esfVal !== null && scales['y-right']) {
             const y = Math.round(scales['y-right'].getPixelForValue(esfVal)) + 0.5;
             ctx.save();
@@ -135,6 +137,7 @@ const priceTagPlugin = {
             ctx.lineTo(scales['y-right'].right, y);
             ctx.stroke();
             ctx.restore();
+            drawTag('y-right', esfVal, '#facc15');
         }
         if (vixVal !== null) drawTag('y-left', vixVal, '#3b82f6', '#fff'); // Blue for VIX
     }
@@ -427,8 +430,28 @@ function finestraLive(points: DataPoint[]): [number, number] | null {
     if (points.length === 0) return null;
     const fine = points.length - 1;
     const da = secondi(points[fine].time) - FINESTRA_LIVE_SEC;
-    const inizio = points.findIndex((d) => secondi(d.time) >= da);
-    return [Math.max(0, inizio), fine];
+    const inizio = Math.max(0, points.findIndex((d) => secondi(d.time) >= da));
+    return [inizio, fine + margineDestro(fine - inizio)];
+}
+
+/**
+ * Spazio vuoto a destra dell'ultimo punto, il 6% della vista: senza, la
+ * linea finiva incollata alla colonna dello smile e il prezzo non si vedeva
+ * avanzare (27/10/2026). L'asse x e' a categorie, quindi lo spazio sono
+ * etichette in piu' con le ore future, a passi di 15 s come il poller.
+ */
+const margineDestro = (punti: number) => Math.max(4, Math.round(punti * 0.06));
+const PASSO_FUTURO_SEC = 15;
+function etichetteConFuturo(points: DataPoint[], fino: number): string[] {
+    const etichette = points.map((d) => d.time);
+    if (points.length === 0) return etichette;
+    const ultimo = secondi(points[points.length - 1].time);
+    for (let i = 1; points.length - 1 + i <= Math.ceil(fino); i++) {
+        const s = (ultimo + i * PASSO_FUTURO_SEC) % 86400;
+        const p = (n: number) => String(n).padStart(2, '0');
+        etichette.push(`${p(Math.floor(s / 3600))}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}`);
+    }
+    return etichette;
 }
 
 function basisEsSpx(points: DataPoint[]): number | null {
@@ -1140,17 +1163,18 @@ export default function MarketPage() {
         chart.options.plugins.annotation.annotations = newAnnotations;
 
         // Determine independent locks & handle Auto-Scroll
+        // L'ultimo punto vero, non l'ultima etichetta: dopo ci sono quelle
+        // future del margine destro.
         const prevMax = chart.scales.x.max;
-        const prevDataLen = chart.data.labels.length - 1; 
-        const isAtEnd = prevMax >= prevDataLen - 1; // Within 1 point of the end
+        const prevUltimo = chart.data.datasets[0].data.length - 1;
+        const isAtEnd = prevMax >= prevUltimo - 1; // Within 1 point of the end
 
-        chart.data.labels = dataPoints.map((d) => d.time);
         const newDataLen = dataPoints.length;
 
         // Auto-scroll logic: If we were at the end, shift the window forward
         if (!panLibRef.current && isAtEnd && (isZoomedRef.current || manualZoomRef.current) && manualLimitsRef.current?.x) {
             const currentRange = manualLimitsRef.current.x[1] - manualLimitsRef.current.x[0];
-            const newMax = newDataLen - 1;
+            const newMax = newDataLen - 1 + margineDestro(currentRange);
             const newMin = Math.max(0, newMax - currentRange);
             manualLimitsRef.current.x = [newMin, newMax];
         }
@@ -1173,6 +1197,7 @@ export default function MarketPage() {
                 delete chart.options.scales.x.max;
             }
         }
+        chart.data.labels = etichetteConFuturo(dataPoints, chart.options.scales.x.max ?? 0);
 
         // Determine visible window indices for adaptive scaling
         // Dalle opzioni appena impostate, non da chart.scales: quelle sono
@@ -2066,6 +2091,7 @@ export default function MarketPage() {
             if (finestra) {
                 chart.options.scales.x.min = finestra[0];
                 chart.options.scales.x.max = finestra[1];
+                chart.data.labels = etichetteConFuturo(dataPoints, finestra[1]);
             }
 
             setIsLocked(false);
