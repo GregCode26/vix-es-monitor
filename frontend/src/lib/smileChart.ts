@@ -8,7 +8,8 @@
  * curva non si disegna. Le x sono l'IV: piu' a sinistra = IV piu' bassa = piu'
  * spazio di movimento, piu' a destra = il livello respinge.
  *
- * - linea grigia sulla IV OTM (put sotto lo spot, call da lo spot in su);
+ * - linea grigia sulla IV OTM (put sotto lo spot, call da lo spot in su), in
+ *   media a 3 strike perche' non segua il rumore di uno solo;
  * - pallino verde = IV della call, rosso = IV della put; quello del lato non
  *   OTM resta staccato dalla curva; vuoto oltre +-2 sigma;
  * - frecce = convexity ladder: arancio da sinistra = taker corti di
@@ -35,10 +36,21 @@ export interface DatiSmile {
         base: 'storico' | 'provvisoria' | 'in raccolta';
         z: { tilt: number | null; curv: number | null; ivAtm: number | null } | null;
         regime: string | null;
+        /** Dalle 15:15 ET il regime non si calcola: l'IV a ridosso della scadenza e' rumore. */
+        sospeso?: boolean;
+        /** Una IV a 25 delta presa fuori dai contratti che la racchiudono. */
+        est25?: boolean;
+        /** Secondi da cui l'IV ATM non cambia. */
+        ivFermaSec?: number;
         /** [ora 'HH:MM:SS' italiana, strike] a ogni cambio del vertice, in ordine. */
         storiaVertice?: [string, number][];
     };
-    punti: { strike: number; callIv: number | null; putIv: number | null; ivOtm: number | null; conv: number | null }[];
+    punti: {
+        strike: number; callIv: number | null; putIv: number | null; ivOtm: number | null;
+        /** IV OTM in media a 3 strike, per la linea; assente prima della v2 di /api/smile. */
+        ivLiscia?: number | null;
+        conv: number | null;
+    }[];
 }
 
 const VERDE = '#22c55e';
@@ -174,7 +186,8 @@ function storiaVertice(chart: any, ctx: CanvasRenderingContext2D, storia: [strin
 function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], x0: number, x1: number, top: number) {
     const righe: [string, string, string][] = [];
     righe.push(['bold 11px Arial', s.regime ? COLORE_REGIME[s.regime] ?? '#cbd5e1' : '#64748b',
-        s.regime ?? (s.base === 'in raccolta' ? 'IN RACCOLTA' : 'IN CONFERMA')]);
+        s.regime ?? (s.sospeso ? `SOSPESO dalle ${oraRomaDaNy('15:15').slice(0, 5)}`
+            : s.base === 'in raccolta' ? 'IN RACCOLTA' : 'IN CONFERMA')]);
     if (s.ivAtm != null) {
         righe.push(['10px Arial', '#94a3b8', `IV ATM ${s.ivAtm.toFixed(1)}%${s.em != null ? ` · 1σ ${s.em.toFixed(1)}` : ''}`]);
     }
@@ -188,6 +201,11 @@ function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], x0: 
         righe.push(['10px Arial', '#64748b',
             `z tilt ${f(s.z.tilt)} curv ${f(s.z.curv)} atm ${f(s.z.ivAtm)}${s.base === 'provvisoria' ? ' (prov.)' : ''}`]);
     }
+    // Avvisi sulla qualita' del dato: 25 delta fuori catena, IV che non si muove.
+    const avvisi: string[] = [];
+    if (s.est25) avvisi.push('25Δ estrapolata');
+    if ((s.ivFermaSec ?? 0) >= 60) avvisi.push(`IV ferma da ${Math.round((s.ivFermaSec as number) / 60)}'`);
+    if (avvisi.length) righe.push(['10px Arial', ARANCIO, avvisi.join(' · ')]);
     ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
     ctx.fillRect(x0, top, x1 - x0, 8 + righe.length * 13);
     ctx.textBaseline = 'top';
@@ -292,7 +310,7 @@ export const smilePlugin = {
         ctx.lineWidth = 1.2;
         ctx.beginPath();
         punti.forEach((p, i) => {
-            const x = xDi(p.ivOtm as number);
+            const x = xDi(p.ivLiscia ?? (p.ivOtm as number));
             const y = yDi(p.strike);
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);

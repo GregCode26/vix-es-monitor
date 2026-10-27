@@ -16,6 +16,15 @@ export const dynamic = 'force-dynamic';
  * convexity ladder per le frecce: la gamma netta dei taker per strike, cioe'
  * il `gexLr` di /api/gex con il segno opposto (lui e' il lato dei dealer).
  *
+ * Dalla versione 2 delle letture (27/10/2026, vedi smile.py) il regime lavora
+ * su Tilt e Curv in % dell'IV ATM, con isteresi (si entra a |z| >= 1, si esce
+ * sotto 0,5) e una conferma a maggioranza su CONFERMA_SEC, non su 2 letture di fila
+ * (erano 20 s, e 40 cambi di regime in 80 minuti). Le letture della versione
+ * 1 restano nei file ma non entrano negli z-score: hanno un'altra IV.
+ * Dalle 15:15 ET il regime si sospende: a pochi minuti dalla scadenza l'IV
+ * 0DTE e' fatta di prezzi da pochi tick (il 26/10 l'IV ATM e' risalita da 11
+ * a 16 e il Tilt e' andato sotto zero).
+ *
  * Solo locale e solo oggi, come /api/verticali.
  */
 
@@ -25,6 +34,9 @@ interface RigaQuote {
     pAsk?: number | null;
     cIv?: number | null;
     pIv?: number | null;
+    /** Le IV in % usate dalla lettura (smile.py v2): dal mid, o il ripiego sui modelGreeks. */
+    cIvS?: number | null;
+    pIvS?: number | null;
     gamma?: number | null;
     cb?: number;
     cs?: number;
@@ -33,6 +45,7 @@ interface RigaQuote {
 }
 
 interface Lettura {
+    v?: number;
     t?: string;
     tEt: string;
     spot: number;
@@ -40,6 +53,10 @@ interface Lettura {
     em: number;
     tilt: number | null;
     curv: number | null;
+    tiltN?: number | null;
+    curvN?: number | null;
+    est25?: boolean;
+    ivProprie?: number;
     put25: number | null;
     call25: number | null;
     vertice: { strike: number; iv: number; sigma: number | null } | null;
@@ -62,6 +79,8 @@ export interface PuntoSmile {
     putIv: number | null;
     /** La linea della curva: put sotto lo spot, call da lo spot in su. */
     ivOtm: number | null;
+    /** IV OTM in media mobile a 3 strike: la linea della curva, i pallini restano sui valori veri. */
+    ivLiscia: number | null;
     /** Gamma netta dei taker in $M per 1%: > 0 taker lunghi di convessita', < 0 corti. */
     conv: number | null;
 }
@@ -69,12 +88,29 @@ export interface PuntoSmile {
 export type Regime = 'PIATTA + VOL ALTA' | 'PIATTA + VOL BASSA' | 'RIALZISTA' | 'RIBASSISTA' | 'RANGE A C' | 'PIATTA' | 'NEUTRO';
 
 const SOGLIA = 1.0;
-const MIN_SD = { tilt: 0.3, curv: 0.2, ivAtm: 0.5 };
+/** Sotto questa soglia un regime gia' confermato si lascia. */
+const SOGLIA_USCITA = 0.5;
+/**
+ * Conferma: un regime diventa quello confermato quando e' il grezzo in almeno
+ * QUOTA_CONFERMA delle letture degli ultimi CONFERMA_SEC. Non "90 s di fila":
+ * con il rumore delle IV il grezzo salta una lettura ogni tanto, e cosi' non si
+ * confermava mai niente.
+ */
+const CONFERMA_SEC = 90;
+const QUOTA_CONFERMA = 0.7;
+/** Da quest'ora ET il regime si sospende. */
+const FINE_REGIME_ET = '15:15:00';
+const VERSIONE = 2;
+/**
+ * Minimi della dev. std. Tilt e Curv sono in % dell'IV ATM: 0,3 e 0,2 punti
+ * di vol dell'originale su un'IV ATM di 15-20.
+ */
+const MIN_SD = { tiltN: 1.5, curvN: 1.0, ivAtm: 0.5 };
 const FASCIA_SEC = 15 * 60;
 const GIORNI_STORICO = 30;
 const CONTRACT_SIZE = 100;
-/** Letture di oggi su cui ricostruire la conferma del regime. */
-const LETTURE_REGIME = 60;
+/** Letture di oggi su cui ricostruire isteresi e conferma del regime (30 min a una ogni 10 s). */
+const LETTURE_REGIME = 180;
 
 function getTodayKey() {
     const now = new Date();
@@ -120,6 +156,8 @@ function senzaRipetute(letture: Lettura[]): Lettura[] {
     });
 }
 
+const versione2 = (l: Lettura) => (l.v ?? 1) >= VERSIONE;
+
 // I giorni passati non cambiano piu': si leggono una volta.
 const cacheGiorni = new Map<string, Lettura[]>();
 
@@ -133,13 +171,14 @@ function storico(dir: string, oggi: string): { giorno: string; l: Lettura }[] {
     }
     return file.sort().slice(-GIORNI_STORICO).flatMap((f) => {
         const giorno = f.slice(0, 10);
-        if (!cacheGiorni.has(giorno)) cacheGiorni.set(giorno, senzaRipetute(leggiNdjson(path.join(dir, f))));
+        if (!cacheGiorni.has(giorno)) cacheGiorni.set(giorno, senzaRipetute(leggiNdjson(path.join(dir, f)).filter(versione2)));
         return cacheGiorni.get(giorno)!.map((l) => ({ giorno, l }));
     });
 }
 
-type Misura = 'tilt' | 'curv' | 'ivAtm';
+type Misura = 'tiltN' | 'curvN' | 'ivAtm';
 type Base = 'storico' | 'provvisoria' | 'in raccolta';
+type Z = { tilt: number | null; curv: number | null; ivAtm: number | null };
 
 /** z = (x - media) / max(dev. std. di popolazione, minSd). */
 function z(x: number | null, valori: number[], minSd: number): number | null {
@@ -152,9 +191,10 @@ function z(x: number | null, valori: number[], minSd: number): number | null {
 /**
  * Sezione 7. La base di confronto di una lettura: i giorni passati alla stessa
  * ora ET +-15 min (almeno 3 giorni e 15 letture), altrimenti le letture di
- * oggi dell'ultima ora (almeno 10), altrimenti niente.
+ * oggi dell'ultima ora prima di questa (almeno 10), altrimenti niente. La
+ * lettura stessa non entra nella sua base: smorzerebbe il proprio z.
  */
-function zScore(l: Lettura, passato: { giorno: string; l: Lettura }[], oggi: Lettura[]) {
+function zScore(l: Lettura, passato: { giorno: string; l: Lettura }[], oggi: Lettura[]): { base: Base; z: Z | null } {
     const t = secondi(l.tEt);
     const vicini = passato.filter((p) => Math.abs(secondi(p.l.tEt) - t) <= FASCIA_SEC);
     let base: Base = 'in raccolta';
@@ -163,7 +203,7 @@ function zScore(l: Lettura, passato: { giorno: string; l: Lettura }[], oggi: Let
         base = 'storico';
         campione = vicini.map((p) => p.l);
     } else {
-        const ora = oggi.filter((o) => secondi(o.tEt) <= t && secondi(o.tEt) > t - 3600);
+        const ora = oggi.filter((o) => secondi(o.tEt) < t && secondi(o.tEt) > t - 3600);
         if (ora.length >= 10) {
             base = 'provvisoria';
             campione = ora;
@@ -174,23 +214,35 @@ function zScore(l: Lettura, passato: { giorno: string; l: Lettura }[], oggi: Let
     return {
         base,
         z: {
-            tilt: z(l.tilt, di('tilt'), MIN_SD.tilt),
-            curv: z(l.curv, di('curv'), MIN_SD.curv),
+            tilt: z(l.tiltN ?? null, di('tiltN'), MIN_SD.tiltN),
+            curv: z(l.curvN ?? null, di('curvN'), MIN_SD.curvN),
             ivAtm: z(l.ivAtm, di('ivAtm'), MIN_SD.ivAtm),
         },
     };
 }
 
-/** Sezione 8: le regole in ordine, vince la prima vera. */
-function regime(zs: { tilt: number | null; curv: number | null; ivAtm: number | null }): Regime {
-    const { tilt, curv, ivAtm } = zs;
-    if (curv != null && curv <= -SOGLIA && ivAtm != null && ivAtm >= SOGLIA) return 'PIATTA + VOL ALTA';
-    if (curv != null && curv <= -SOGLIA && ivAtm != null && ivAtm <= -SOGLIA / 2) return 'PIATTA + VOL BASSA';
-    if (tilt != null && tilt >= SOGLIA) return 'RIALZISTA';
-    if (tilt != null && tilt <= -SOGLIA) return 'RIBASSISTA';
-    if (curv != null && curv >= SOGLIA) return 'RANGE A C';
-    if (curv != null && curv <= -SOGLIA) return 'PIATTA';
-    return 'NEUTRO';
+/** La condizione di ogni regime a soglia `s`; NEUTRO e' quando nessun'altra vale. */
+function vale(r: Regime, { tilt, curv, ivAtm }: Z, s: number): boolean {
+    switch (r) {
+        case 'PIATTA + VOL ALTA': return curv != null && curv <= -s && ivAtm != null && ivAtm >= s;
+        case 'PIATTA + VOL BASSA': return curv != null && curv <= -s && ivAtm != null && ivAtm <= -s / 2;
+        case 'RIALZISTA': return tilt != null && tilt >= s;
+        case 'RIBASSISTA': return tilt != null && tilt <= -s;
+        case 'RANGE A C': return curv != null && curv >= s;
+        case 'PIATTA': return curv != null && curv <= -s;
+        default: return false;
+    }
+}
+
+const ORDINE: Regime[] = ['PIATTA + VOL ALTA', 'PIATTA + VOL BASSA', 'RIALZISTA', 'RIBASSISTA', 'RANGE A C', 'PIATTA'];
+
+/**
+ * Sezione 8: le regole in ordine, vince la prima vera. Con isteresi: il
+ * regime confermato resta finche' la sua condizione vale a SOGLIA_USCITA.
+ */
+function regime(zs: Z, confermato: Regime | null): Regime {
+    if (confermato && confermato !== 'NEUTRO' && vale(confermato, zs, SOGLIA_USCITA)) return confermato;
+    return ORDINE.find((r) => vale(r, zs, SOGLIA)) ?? 'NEUTRO';
 }
 
 /** Gamma netta dei taker su uno strike, in $M per 1% (stesse unita' di /api/gex). */
@@ -223,22 +275,40 @@ export async function GET() {
         return NextResponse.json({ error: 'Smile non calcolabile: mancano lo spot o le IV vicino all\'ATM' }, { status: 503 });
     }
     const spot = q.spot;
+    const r2 = (x: number | null | undefined) => (x == null ? null : Math.round(x * 100) / 100);
 
     const punti: PuntoSmile[] = q.strikes
         .filter((r) => Math.abs(r.strike - spot) <= l.range)
         .map((r) => {
-            const callIv = valida(r.cIv, r.cAsk);
-            const putIv = valida(r.pIv, r.pAsk);
+            // cIvS/pIvS ci sono dalla versione 2 di smile.py; prima, i modelGreeks.
+            const callIv = r.cIvS !== undefined ? r2(r.cIvS) : valida(r.cIv, r.cAsk);
+            const putIv = r.pIvS !== undefined ? r2(r.pIvS) : valida(r.pIv, r.pAsk);
             const ivOtm = r.strike < spot ? putIv ?? callIv : callIv ?? putIv;
-            return { strike: r.strike, callIv, putIv, ivOtm, conv: convessita(r, spot) };
-        });
+            return { strike: r.strike, callIv, putIv, ivOtm, ivLiscia: null, conv: convessita(r, spot) };
+        })
+        .sort((a, b) => a.strike - b.strike);
+    const conIv = punti.filter((p) => p.ivOtm != null);
+    conIv.forEach((p, i) => {
+        const vicini = conIv.slice(Math.max(0, i - 1), i + 2).map((v) => v.ivOtm as number);
+        p.ivLiscia = r2(vicini.reduce((a, b) => a + b, 0) / vicini.length);
+    });
 
-    // Z-score e regime: la conferma vuole 2 letture nuove consecutive con lo
-    // stesso esito, quindi si ricostruisce sulle ultime letture di oggi.
+    // Z-score e regime: isteresi e conferma dipendono dalle letture prima,
+    // quindi si ricostruiscono sulle ultime letture di oggi.
     const dirSmile = path.join(dati, 'smile');
-    const passato = storico(dirSmile, date);
     const letture = leggiNdjson(path.join(dirSmile, `${date}.ndjson`));
-    const oggi = senzaRipetute(letture);
+    const oggi = senzaRipetute(letture.filter(versione2));
+    const finestra = oggi.slice(-LETTURE_REGIME);
+    // Del passato serve solo la fascia della finestra +-15 min.
+    const inizio = finestra.length ? secondi(finestra[0].tEt) - FASCIA_SEC : 0;
+    const passato = storico(dirSmile, date).filter((p) => secondi(p.l.tEt) >= inizio);
+    // Da quanto l'IV ATM non cambia: se IBKR smette di aggiornare si vede.
+    let ivFermaSec = 0;
+    const ultima = letture[letture.length - 1];
+    if (ultima) {
+        const diversa = [...letture].reverse().find((o) => o.ivAtm !== ultima.ivAtm);
+        if (diversa) ivFermaSec = secondi(ultima.tEt) - secondi(diversa.tEt);
+    }
     // La storia del vertice IV MIN per la linea viola: solo i cambi di strike
     // (~60 in una sessione), con l'ora italiana delle etichette del grafico.
     const storiaVertice: [string, number][] = [];
@@ -247,19 +317,25 @@ export async function GET() {
         if (o.t && strike != null && strike !== storiaVertice[storiaVertice.length - 1]?.[1]) storiaVertice.push([o.t, strike]);
     }
     let confermato: Regime | null = null;
-    let precedente: Regime | null = null;
     let ultimo: ReturnType<typeof zScore> | null = null;
     let grezzo: Regime | null = null;
-    for (const o of oggi.slice(-LETTURE_REGIME)) {
+    const recenti: [number, Regime | null][] = [];
+    for (const o of finestra) {
         const zs = zScore(o, passato, oggi);
         ultimo = zs;
-        grezzo = zs.z ? regime(zs.z) : null;
-        if (grezzo && grezzo === precedente && grezzo !== confermato) confermato = grezzo;
-        precedente = grezzo;
+        grezzo = zs.z ? regime(zs.z, confermato) : null;
+        const t = secondi(o.tEt);
+        recenti.push([t, grezzo]);
+        while (t - recenti[0][0] > CONFERMA_SEC) recenti.shift();
+        // Serve una finestra piena: con le prime letture la maggioranza e' di poche.
+        if (t - recenti[0][0] < CONFERMA_SEC - 10) continue;
+        const conti = new Map<Regime, number>();
+        for (const [, r] of recenti) if (r) conti.set(r, (conti.get(r) ?? 0) + 1);
+        for (const [r, n] of conti) if (r !== confermato && n >= QUOTA_CONFERMA * recenti.length) confermato = r;
     }
     if (!ultimo) ultimo = zScore(l, passato, oggi);
+    const sospeso = l.tEt >= FINE_REGIME_ET;
 
-    const r2 = (x: number | null | undefined) => (x == null ? null : Math.round(x * 100) / 100);
     return NextResponse.json({
         date,
         local: true,
@@ -271,14 +347,21 @@ export async function GET() {
             em: r2(l.em),
             tilt: r2(l.tilt),
             curv: r2(l.curv),
+            tiltN: r2(l.tiltN),
+            curvN: r2(l.curvN),
+            est25: l.est25 ?? false,
+            ivProprie: l.ivProprie ?? null,
+            ivFermaSec,
+            versione: l.v ?? 1,
             put25: r2(l.put25),
             call25: r2(l.call25),
             vertice: l.vertice,
             base: ultimo.base,
             z: ultimo.z && { tilt: r2(ultimo.z.tilt), curv: r2(ultimo.z.curv), ivAtm: r2(ultimo.z.ivAtm) },
-            // In raccolta non c'e' regime; senza due letture uguali di fila, nemmeno.
-            regime: ultimo.base === 'in raccolta' ? null : confermato,
-            regimeGrezzo: grezzo,
+            // In raccolta non c'e' regime; finche' nessuno ha la maggioranza, nemmeno.
+            regime: ultimo.base === 'in raccolta' || sospeso ? null : confermato,
+            regimeGrezzo: sospeso ? null : grezzo,
+            sospeso,
             storiaVertice,
         },
         punti,

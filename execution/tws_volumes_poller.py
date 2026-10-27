@@ -306,7 +306,12 @@ def scrivi_quote(date_key, time_str, spot, scadenza, option_tickers, gamma, lee_
         r["gamma"] = gamma.get(k)
         r.update(lee_ready.riga(k))
     strikes = [righe[k] for k in sorted(righe)]
-    lettura = smile.lettura(strikes, spot, scadenza)
+    righe_smile, lettura = smile.calcola(strikes, spot, scadenza)
+    # Le IV in % con cui e' stata fatta la lettura (dal mid, o il ripiego sui
+    # modelGreeks): la curva di /api/smile disegna queste, non cIv/pIv.
+    for r, s in zip(strikes, righe_smile):
+        r["cIvS"] = round(s["callIv"], 4) if s["callIv"] is not None else None
+        r["pIvS"] = round(s["putIv"], 4) if s["putIv"] is not None else None
     dati = {"date": date_key, "time": time_str, "spot": spot, "expiry": scadenza,
             "smile": lettura, "strikes": strikes}
     try:
