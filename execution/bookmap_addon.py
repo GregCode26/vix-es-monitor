@@ -18,6 +18,9 @@ Bookmap a meta' sessione non lo riporta a zero.
 "a": [...]}), entro LIVELLI_BOOK tick dal migliore e solo da MIN_CONTRATTI_BOOK in
 su: la pagina li disegna come le linee orizzontali della heatmap di Bookmap.
 Il filtro serve al peso: tutti i livelli sarebbero ~1 KB al secondo in piu'.
+Oltre, fino a LIVELLI_BOOK_LONTANI tick, solo da MIN_CONTRATTI_LONTANI in su
+(la soglia minima di /bookmap e di Quantower): con 30 tick soli un muro a 15-20
+punti dal prezzo, visibile in Bookmap, non arrivava (27/10/2026, 7750 con ES a 7731).
 
 `addB`/`remB` (e `addA`/`remA` per gli ask) sono i contratti limit aggiunti e
 tolti in quel secondo entro LIVELLI_FLUSSO livelli dal migliore, contati a ogni
@@ -88,6 +91,8 @@ LIVELLI_DEFAULT = 10
 MAX_IN_CODA = 3600
 LIVELLI_BOOK = 30
 MIN_CONTRATTI_BOOK = 20
+LIVELLI_BOOK_LONTANI = 120
+MIN_CONTRATTI_LONTANI = 50
 LIVELLI_FLUSSO = 5
 LIVELLI_OFI = 15
 # Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
@@ -338,13 +343,13 @@ def livelli_book(lato, migliore, verso, info):
     if migliore is None:
         return []
     righe = []
-    for i in range(LIVELLI_BOOK):
+    for i in range(LIVELLI_BOOK_LONTANI):
         livello = migliore + verso * i
         size = lato.get(livello)
         if not size:
             continue
         contratti = size / info["granularita"]
-        if contratti >= MIN_CONTRATTI_BOOK:
+        if contratti >= (MIN_CONTRATTI_BOOK if i < LIVELLI_BOOK else MIN_CONTRATTI_LONTANI):
             righe.append([round(livello * info["pips"], 2), round(contratti)])
     return righe
 
