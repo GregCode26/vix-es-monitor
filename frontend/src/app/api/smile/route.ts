@@ -255,6 +255,19 @@ function convessita(r: RigaQuote, spot: number): number | null {
 const valida = (iv: number | null | undefined, ask: number | null | undefined) =>
     iv != null && iv > 0 && iv <= 5 && ask != null && ask > 0 ? Math.round(iv * 10000) / 100 : null;
 
+/**
+ * La storia del vertice IV MIN per la linea viola: solo i cambi di strike
+ * (~60 in una sessione), con l'ora italiana delle etichette del grafico.
+ */
+function storiaDelVertice(letture: Lettura[]): [string, number][] {
+    const storia: [string, number][] = [];
+    for (const o of letture) {
+        const strike = o.vertice?.strike;
+        if (o.t && strike != null && strike !== storia[storia.length - 1]?.[1]) storia.push([o.t, strike]);
+    }
+    return storia;
+}
+
 export async function GET() {
     const date = getTodayKey();
     if (process.env.VERCEL) {
@@ -270,9 +283,36 @@ export async function GET() {
     if (q.date !== date) {
         return NextResponse.json({ error: `Ultima catena del ${q.date}: oggi il poller non ha ancora scritto` }, { status: 503 });
     }
+    const dirSmile = path.join(dati, 'smile');
+    const letture = leggiNdjson(path.join(dirSmile, `${date}.ndjson`));
+    const storiaVertice = storiaDelVertice(letture);
     const l = q.smile;
     if (!l || q.spot == null) {
-        return NextResponse.json({ error: 'Smile non calcolabile: mancano lo spot o le IV vicino all\'ATM' }, { status: 503 });
+        // Dopo la chiusura lo smile non si calcola piu', ma la traccia del
+        // vertice IV MIN della giornata resta sul grafico (28/10/2026: alle
+        // 21:00 spariva con tutto il resto).
+        const fine = letture[letture.length - 1];
+        if (!fine || storiaVertice.length === 0) {
+            return NextResponse.json({ error: 'Smile non calcolabile: mancano lo spot o le IV vicino all\'ATM' }, { status: 503 });
+        }
+        return NextResponse.json({
+            date,
+            local: true,
+            time: q.time,
+            spot: fine.spot,
+            expiry: q.expiry,
+            smile: {
+                ivAtm: null, em: null, tilt: null, curv: null,
+                vertice: fine.vertice ?? null,
+                base: 'in raccolta',
+                z: null,
+                regime: null,
+                sospeso: true,
+                chiuso: true,
+                storiaVertice,
+            },
+            punti: [],
+        });
     }
     const spot = q.spot;
     const r2 = (x: number | null | undefined) => (x == null ? null : Math.round(x * 100) / 100);
@@ -295,8 +335,6 @@ export async function GET() {
 
     // Z-score e regime: isteresi e conferma dipendono dalle letture prima,
     // quindi si ricostruiscono sulle ultime letture di oggi.
-    const dirSmile = path.join(dati, 'smile');
-    const letture = leggiNdjson(path.join(dirSmile, `${date}.ndjson`));
     const oggi = senzaRipetute(letture.filter(versione2));
     const finestra = oggi.slice(-LETTURE_REGIME);
     // Del passato serve solo la fascia della finestra +-15 min.
@@ -308,13 +346,6 @@ export async function GET() {
     if (ultima) {
         const diversa = [...letture].reverse().find((o) => o.ivAtm !== ultima.ivAtm);
         if (diversa) ivFermaSec = secondi(ultima.tEt) - secondi(diversa.tEt);
-    }
-    // La storia del vertice IV MIN per la linea viola: solo i cambi di strike
-    // (~60 in una sessione), con l'ora italiana delle etichette del grafico.
-    const storiaVertice: [string, number][] = [];
-    for (const o of letture) {
-        const strike = o.vertice?.strike;
-        if (o.t && strike != null && strike !== storiaVertice[storiaVertice.length - 1]?.[1]) storiaVertice.push([o.t, strike]);
     }
     let confermato: Regime | null = null;
     let ultimo: ReturnType<typeof zScore> | null = null;

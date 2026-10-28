@@ -38,6 +38,8 @@ export interface DatiSmile {
         regime: string | null;
         /** Dalle 15:15 ET il regime non si calcola: l'IV a ridosso della scadenza e' rumore. */
         sospeso?: boolean;
+        /** Dopo la chiusura: niente curva, resta solo la traccia del vertice. */
+        chiuso?: boolean;
         /** Una IV a 25 delta presa fuori dai contratti che la racchiudono. */
         est25?: boolean;
         /** Secondi da cui l'IV ATM non cambia. */
@@ -186,7 +188,7 @@ function storiaVertice(chart: any, ctx: CanvasRenderingContext2D, storia: [strin
 function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], x0: number, x1: number, top: number) {
     const righe: [string, string, string][] = [];
     righe.push(['bold 11px Arial', s.regime ? COLORE_REGIME[s.regime] ?? '#cbd5e1' : '#64748b',
-        s.regime ?? (s.sospeso ? `SOSPESO dalle ${oraRomaDaNy('15:15').slice(0, 5)}`
+        s.regime ?? (s.chiuso ? 'MERCATO CHIUSO' : s.sospeso ?`SOSPESO dalle ${oraRomaDaNy('15:15').slice(0, 5)}`
             : s.base === 'in raccolta' ? 'IN RACCOLTA' : 'IN CONFERMA')]);
     if (s.ivAtm != null) {
         righe.push(['10px Arial', '#94a3b8', `IV ATM ${s.ivAtm.toFixed(1)}%${s.em != null ? ` · 1σ ${s.em.toFixed(1)}` : ''}`]);
@@ -247,14 +249,23 @@ export const smilePlugin = {
         }
 
         const s = dati.smile;
+        const b = basis as number;
+        const yDi = (strike: number) => prezzi.getPixelForValue(strike + b);
         const punti = dati.punti.filter((p) => p.ivOtm != null).sort((a, b) => a.strike - b.strike);
         if (punti.length === 0) {
+            // A mercato chiuso la curva non c'e', la traccia IV MIN della giornata si'.
+            if (s.storiaVertice?.length) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(chartArea.left, chartArea.top, x1 - chartArea.left, chartArea.bottom - chartArea.top);
+                ctx.clip();
+                storiaVertice(chart, ctx, s.storiaVertice, yDi, x1);
+                ctx.restore();
+            }
             intestazione(ctx, s, x0, x1, chartArea.top);
             ctx.restore();
             return;
         }
-        const b = basis as number;
-        const yDi = (strike: number) => prezzi.getPixelForValue(strike + b);
         const dentro = (y: number) => y >= chartArea.top && y <= chartArea.bottom;
         const xDentro = (x: number) => x >= x0 + 2 && x <= x1 - 2;
         // La scala delle IV sugli strike che si vedono, non su tutta la
