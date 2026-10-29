@@ -370,7 +370,6 @@ export default function MarketTidePage() {
       data: {
         labels: [],
         datasets: [
-          { label: 'SPX', data: [], yAxisID: 'ySpx', borderColor: GIALLO, borderWidth: 1.2, pointRadius: 0, tension: 0.2 },
           { label: 'Net Put Premium', data: [], yAxisID: 'yPremi', borderColor: ROSSO, borderWidth: 2.2, pointRadius: 0, tension: 0.2 },
           { label: 'Net Call Premium', data: [], yAxisID: 'yPremi', borderColor: VERDE, borderWidth: 2.2, pointRadius: 0, tension: 0.2 },
           { label: 'Straddle up', data: [], yAxisID: 'ySpx', borderColor: 'rgba(203, 213, 225, 0.6)', borderWidth: 1.2, borderDash: [6, 4], pointRadius: 0 },
@@ -415,7 +414,10 @@ export default function MarketTidePage() {
           pointRadius: 0,
           tension: 0.2,
           fill: { target: 'origin', above: 'rgba(52, 211, 153, 0.75)', below: 'rgba(244, 63, 94, 0.85)' },
-        }],
+        },
+        // L'SPX sovrapposto al net volume (29/10/2026, prima stava sui premi):
+        // scala propria a sinistra, sopra l'area.
+        { label: 'SPX', data: [], yAxisID: 'ySpx', borderColor: GIALLO, borderWidth: 1.4, pointRadius: 0, tension: 0.2 }],
       },
       options: {
         animation: false,
@@ -425,8 +427,8 @@ export default function MarketTidePage() {
         plugins: { legend: { display: false }, tooltip: { enabled: false } },
         scales: {
           x: asseX,
-          // Asse muto a sinistra: tiene l'area allineata a quella dei premi.
-          yVuoto: { position: 'left', afterFit: fissaLarghezza, grid: { display: false }, ticks: { display: false }, border: { display: false } },
+          // A sinistra, larga come quella dei premi: le aree restano allineate.
+          ySpx: { position: 'left', afterFit: fissaLarghezza, grace: '5%', grid: { display: false }, ticks: { color: GIALLO, maxTicksLimit: 5 } },
           yVol: {
             position: 'right',
             afterFit: fissaLarghezza,
@@ -545,11 +547,11 @@ export default function MarketTidePage() {
     if (!cp || !cv) return;
     const labels = points.map((p) => p.time.slice(0, 5));
     cp.data.labels = labels;
-    (cp.data.datasets[0] as ChartDataset<'line'>).data = points.map((p) => p.spx);
-    (cp.data.datasets[1] as ChartDataset<'line'>).data = points.map((p) => p.npp);
-    (cp.data.datasets[2] as ChartDataset<'line'>).data = points.map((p) => p.ncp);
+    (cp.data.datasets[0] as ChartDataset<'line'>).data = points.map((p) => p.npp);
+    (cp.data.datasets[1] as ChartDataset<'line'>).data = points.map((p) => p.ncp);
     cv.data.labels = labels;
     (cv.data.datasets[0] as ChartDataset<'line'>).data = points.map((p) => p.netVol);
+    (cv.data.datasets[1] as ChartDataset<'line'>).data = points.map((p) => p.spx);
 
     // Straddle: il cono parte dal prezzo delle 15:35 e arriva ai breakeven
     // alla chiusura; i breakeven sono le stesse due quote, piatte.
@@ -560,8 +562,8 @@ export default function MarketTidePage() {
       const quota = (secondi(p.time) - secondi(oraStraddle())) / (secondi(chiusura()) - secondi(oraStraddle()));
       return breakeven.spot + (arrivo - breakeven.spot) * Math.min(1, quota);
     });
-    (cp.data.datasets[3] as ChartDataset<'line'>).data = livello('up');
-    (cp.data.datasets[4] as ChartDataset<'line'>).data = livello('down');
+    (cp.data.datasets[2] as ChartDataset<'line'>).data = livello('up');
+    (cp.data.datasets[3] as ChartDataset<'line'>).data = livello('down');
 
     const ySpx = cp.options.scales?.ySpx;
     if (ySpx && scalaPrezzi) {
