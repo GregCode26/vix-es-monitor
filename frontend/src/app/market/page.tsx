@@ -22,7 +22,11 @@ import { leggiRefLines, salvaRefLines, leggiVisibilita, REF_LINES_VIS_KEY } from
 import { majorGamma, RigaGamma } from '@/lib/majorGamma';
 import { minutiRomaDaNy, oraRomaDaNy } from '@/lib/orarioNy';
 import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
-import AiSignalPanel from '@/components/AiSignalPanel';
+import AiSignalPanel, { type RispostaAi } from '@/components/AiSignalPanel';
+import {
+    CHIAVE_AUTO, PUNTO_RECENTE_MS, frecceAiPlugin, leggiFrecce, livelloToccato, prendiTurno, salvaFrecce,
+    type FrecciaAi, type LivelloTracciato,
+} from '@/lib/aiLivelli';
 
 ChartJS.register(
     CategoryScale,
@@ -562,6 +566,16 @@ export default function MarketPage() {
      */
     const [mostraSpx, setMostraSpx] = useState(false);
     const [mostraAi, setMostraAi] = useState(false);
+    /**
+     * Analisi AI automatica quando ES arriva a 1 punto da un range o da
+     * GEX+/GEX- tracciati (lib/aiLivelli.ts): freccia sul prezzo, riarmo dopo
+     * 5 minuti. `livelliTracciatiRef` lo riempie l'effetto che disegna le linee,
+     * cosi' contano solo quelle visibili.
+     */
+    const [aiAuto, setAiAuto] = useState(true);
+    const [frecceAi, setFrecceAi] = useState<FrecciaAi[]>([]);
+    const [ultimaAi, setUltimaAi] = useState<RispostaAi | null>(null);
+    const livelliTracciatiRef = useRef<LivelloTracciato[]>([]);
     /**
      * Gli stessi livelli R1/R2/R3 dell'Opening Bell, ma in termini SPX: il
      * calcolo parte dallo SPX e ci somma il basis per portarli su ES, qui il
@@ -1188,6 +1202,19 @@ export default function MarketPage() {
 
         chart.$etichette = etichette;
 
+        // I livelli che innescano l'analisi AI: i range disegnati e il GEX+/-
+        // di adesso, se mostrato.
+        const tracciati: LivelloTracciato[] = etichette.map((e) => ({ nome: e.testo, valore: e.valore }));
+        if (mostraGamma) {
+            for (const [indice, nome] of [[6, 'GEX+'], [7, 'GEX-']] as const) {
+                const serie = (chart.data.datasets[indice]?.data ?? []) as (number | null)[];
+                const v = serie[serie.length - 1];
+                if (v !== null && v !== undefined) tracciati.push({ nome, valore: v });
+            }
+        }
+        livelliTracciatiRef.current = tracciati;
+        chart.$frecceAi = frecceAi;
+
         // Divergence boxes
         if (showDivergences) {
             const divAnnotations = detectDivergences(dataPoints, livelliPerDivergenze);
@@ -1327,7 +1354,57 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi]);
+
+    // ---- Analisi AI sui livelli ----
+    useEffect(() => {
+        try {
+            setAiAuto(localStorage.getItem(CHIAVE_AUTO) !== 'false');
+        } catch { /* default acceso */ }
+        setFrecceAi(leggiFrecce(getTodayKey()));
+    }, []);
+
+    useEffect(() => {
+        if (!aiAuto || dataPoints.length === 0) return;
+        const ultimo = dataPoints[dataPoints.length - 1];
+        if (ultimo.esf === null) return;
+        // Solo sul prezzo di adesso: non sulla cache o sullo storico appena caricati.
+        const adesso = new Date();
+        const [h, m, sec] = ultimo.time.split(':').map(Number);
+        const quando = new Date(adesso);
+        quando.setHours(h, m, sec || 0, 0);
+        if (Math.abs(adesso.getTime() - quando.getTime()) > PUNTO_RECENTE_MS) return;
+        const livello = livelloToccato(ultimo.esf, livelliTracciatiRef.current);
+        if (!livello || !prendiTurno(adesso.getTime())) return;
+
+        const giorno = getTodayKey();
+        const freccia: FrecciaAi = { time: ultimo.time, esf: ultimo.esf, livello, bias: null };
+        const aggiorna = (cambia: (f: FrecciaAi) => FrecciaAi) => setFrecceAi((tutte) => {
+            const nuove = tutte.map((f) => (f.time === freccia.time ? cambia(f) : f));
+            salvaFrecce(giorno, nuove);
+            return nuove;
+        });
+        setFrecceAi((tutte) => {
+            const nuove = [...tutte, freccia];
+            salvaFrecce(giorno, nuove);
+            return nuove;
+        });
+        (async () => {
+            try {
+                const res = await fetch('/api/ai-signal', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ innesco: { livello: livello.nome, prezzoLivello: livello.valore, esf: ultimo.esf } }),
+                });
+                const json = await res.json();
+                if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+                setUltimaAi(json);
+                aggiorna((f) => ({ ...f, bias: json.segnale.bias, confidenza: json.segnale.confidenza }));
+            } catch (e) {
+                aggiorna((f) => ({ ...f, errore: (e as Error).message }));
+            }
+        })();
+    }, [dataPoints, aiAuto]);
 
     // ---- Plugins (zoom) ----
     useEffect(() => {
@@ -2459,6 +2536,18 @@ export default function MarketPage() {
                         >
                             {mostraAi ? '◉' : '◌'} AI Signal
                         </button>
+                        <button
+                            onClick={() => setAiAuto((v) => {
+                                try { localStorage.setItem(CHIAVE_AUTO, String(!v)); } catch { /* solo in memoria */ }
+                                return !v;
+                            })}
+                            title="Analisi AI automatica quando ES arriva a 1 punto da un range o da GEX+/GEX- tracciati; riarmo dopo 5 minuti"
+                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${aiAuto
+                                ? 'bg-purple-600/30 text-purple-300 border-purple-500/50 hover:bg-purple-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {aiAuto ? '◉' : '◌'} AI Livelli
+                        </button>
 
                         {/* La curva dello smile SPX 0DTE a destra del grafico */}
                         <button
@@ -2827,7 +2916,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin, crosshairPlugin]}
+                                plugins={[scaleBackgroundPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin, frecceAiPlugin, crosshairPlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">
@@ -2848,7 +2937,7 @@ export default function MarketPage() {
                         <GexPage />
                       </div>
                     )}
-                {mostraAi && <AiSignalPanel onClose={() => setMostraAi(false)} />}
+                {mostraAi && <AiSignalPanel onClose={() => setMostraAi(false)} esterno={ultimaAi} />}
                 {/* Footer */}
                 <div className="mt-4 text-center text-slate-600 text-xs">
                     Data refreshed every 5 seconds • Active window: 00:00–23:00 CET • Source: IBKR TWS

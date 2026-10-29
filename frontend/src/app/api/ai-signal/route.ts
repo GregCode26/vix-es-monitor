@@ -156,10 +156,25 @@ function viaClaudeCode(riassunto: unknown): Promise<Esito> {
     });
 }
 
+type Innesco = { livello: string; prezzoLivello: number; esf: number | null };
+
+/** Il corpo facoltativo di /market (AI Livelli): il livello a cui ES e' arrivato. */
+async function leggiInnesco(request: Request): Promise<Innesco | null> {
+    try {
+        const j = await request.json();
+        const i = j?.innesco;
+        if (!i || typeof i.livello !== 'string' || typeof i.prezzoLivello !== 'number') return null;
+        return { livello: i.livello.slice(0, 40), prezzoLivello: i.prezzoLivello, esf: typeof i.esf === 'number' ? i.esf : null };
+    } catch {
+        return null; // senza corpo: il pulsante "Analizza ora"
+    }
+}
+
 export async function POST(request: Request) {
+    const innesco = await leggiInnesco(request);
     const raccolto = await raccogli(new URL(request.url).origin);
     if (!raccolto) return NextResponse.json(NESSUN_DATO, { status: 503 });
-    const { riassunto } = raccolto;
+    const riassunto = innesco ? { ...raccolto.riassunto, innesco } : raccolto.riassunto;
 
     const conChiave = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
     let esito: Esito;
@@ -180,6 +195,7 @@ export async function POST(request: Request) {
             gex: raccolto.gex, iv: !!riassunto.ivSpx0dte, tide: !!riassunto.marketTide, hedging: raccolto.hedging,
         },
         usage: esito.usage,
+        innesco,
         segnale: esito.segnale,
     };
     try {

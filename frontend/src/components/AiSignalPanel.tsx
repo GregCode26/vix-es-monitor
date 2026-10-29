@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Bias, Segnale } from '@/lib/aiSignal';
 
-interface Risposta {
+export interface RispostaAi {
     creato: string;
     ora: string;
     esf: number | null;
@@ -11,6 +11,8 @@ interface Risposta {
     via: string;
     fonti: Record<string, boolean>;
     segnale: Segnale;
+    /** Presente quando l'analisi l'ha avviata il prezzo su un livello (/market, AI Livelli). */
+    innesco?: { livello: string; prezzoLivello: number; esf: number | null } | null;
 }
 
 const AUTO_MS = 5 * 60_000;
@@ -23,8 +25,8 @@ const COLORE: Record<Bias, string> = {
 const FRECCIA: Record<Bias, string> = { LONG: '▲', SHORT: '▼', NEUTRALE: '◆' };
 
 /** Pannello "AI Signal": chiede a /api/ai-signal un bias su ES. Solo studio. */
-export default function AiSignalPanel({ onClose }: { onClose: () => void }) {
-    const [dati, setDati] = useState<Risposta | null>(null);
+export default function AiSignalPanel({ onClose, esterno }: { onClose: () => void; esterno?: RispostaAi | null }) {
+    const [dati, setDati] = useState<RispostaAi | null>(esterno ?? null);
     const [errore, setErrore] = useState<string | null>(null);
     const [inCorso, setInCorso] = useState(false);
     const [auto, setAuto] = useState(false);
@@ -47,6 +49,11 @@ export default function AiSignalPanel({ onClose }: { onClose: () => void }) {
             setInCorso(false);
         }
     }, []);
+
+    // Un'analisi avviata da un livello sostituisce quella mostrata.
+    useEffect(() => {
+        if (esterno) setDati(esterno);
+    }, [esterno]);
 
     useEffect(() => {
         if (!auto) return;
@@ -98,6 +105,11 @@ export default function AiSignalPanel({ onClose }: { onClose: () => void }) {
                     <div className="mt-2 text-[11px] text-slate-500">
                         {dati.ora} · ES {dati.esf ?? '—'} · {s.orizzonte}
                     </div>
+                    {dati.innesco && (
+                        <div className="mt-1 text-[11px] text-purple-300">
+                            Avviata da ES a 1 punto da {dati.innesco.livello} ({dati.innesco.prezzoLivello.toFixed(2)})
+                        </div>
+                    )}
 
                     <p className="mt-3 text-slate-200">{s.sintesi}</p>
 

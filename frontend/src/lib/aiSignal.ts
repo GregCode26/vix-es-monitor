@@ -157,5 +157,6 @@ Regole:
 - Una sezione a null significa che quella fonte non ha dati ora (es. poller fermo o fuori orario): dillo nei rischi e non inventare.
 - SPX e ES differiscono per la base (ES di solito sopra SPX di qualche punto/decina di punti): converti i livelli SPX in livelli ES usando la differenza attuale tra i due, e dai i livelli in punti ES.
 - Gamma: non dedurre dai segni dei singoli strike uno Zero Gamma, un "flip" o una soglia di cambio di regime (tipo "sotto X la gamma diventa negativa e il movimento accelera"). Il profilo copre solo le 0DTE e 37 strike attorno all'ATM, e il segno è un'euristica, non un dato osservato. Il gex di flusso descrive lo scambiato di oggi, non il posizionamento: non chiamarlo regime. Usa gli strike solo come muri o magneti vicini allo spot.
+- Se c'è il campo innesco, l'analisi è partita da sola perché ES è arrivato a 1 punto da quel livello tracciato sul grafico (range R1/R2/R3 dal straddle, o GEX+/GEX- = strike di gamma positiva/negativa maggiore, in punti ES): di' nella sintesi se i dati fanno pensare che il livello tenga o venga rotto, e da' il bias di conseguenza.
 - livelli.riferimento = prezzo ES attuale; invalidazione = livello ES che smentirebbe il bias; obiettivo = livello ES plausibile. Con bias NEUTRALE puoi lasciarli a null.
 - Scrivi in italiano, conciso.`;
