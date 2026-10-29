@@ -109,8 +109,6 @@ const MIN_SD = { tiltN: 1.5, curvN: 1.0, ivAtm: 0.5 };
 const FASCIA_SEC = 15 * 60;
 const GIORNI_STORICO = 30;
 const CONTRACT_SIZE = 100;
-/** Letture di oggi su cui ricostruire isteresi e conferma del regime (30 min a una ogni 10 s). */
-const LETTURE_REGIME = 180;
 
 function getTodayKey() {
     const now = new Date();
@@ -330,6 +328,65 @@ function tracceGiorni(dati: string, oggi: string, n: number): TracciaGiorno[] {
     });
 }
 
+/**
+ * Il regime della giornata, seguito lettura per lettura. Fino al 29/10/2026
+ * si ricostruiva da zero a ogni chiamata sulle ultime 180 letture: il regime
+ * confermato ripartiva vuoto all'inizio della finestra, quindi un RIALZISTA
+ * gia' in corso "nasceva" di nuovo ~90 s dopo l'inizio di ogni finestra, a
+ * un'ora diversa ogni 10 s, e /market ci metteva un pallino ogni 30 s per
+ * tutta la durata del regime, mezz'ora in ritardo (29/10: 133 pallini per 10
+ * cambi veri). Qui ogni lettura entra una volta sola e lo stato resta fra le
+ * chiamate; `cambiRegime` e' quindi quello di tutta la giornata.
+ */
+interface StatoRegime {
+    date: string;
+    /** Letture di `oggi` gia' elaborate. */
+    n: number;
+    /** L'ultima elaborata, per riconoscere un file riscritto. */
+    tUltima: string | null;
+    confermato: Regime | null;
+    grezzo: Regime | null;
+    ultimo: ReturnType<typeof zScore> | null;
+    recenti: [number, Regime | null][];
+    cambiRegime: [string, Regime][];
+}
+
+let statoRegime: StatoRegime | null = null;
+
+function avanzaRegime(date: string, oggi: Lettura[], passato: { giorno: string; l: Lettura }[]): StatoRegime {
+    let s = statoRegime;
+    const riparti = !s || s.date !== date || oggi.length < s.n || (s.n > 0 && oggi[s.n - 1].tEt !== s.tUltima);
+    if (riparti) {
+        s = { date, n: 0, tUltima: null, confermato: null, grezzo: null, ultimo: null, recenti: [], cambiRegime: [] };
+    }
+    const st = s as StatoRegime;
+    for (; st.n < oggi.length; st.n++) {
+        const o = oggi[st.n];
+        const zs = zScore(o, passato, oggi);
+        st.ultimo = zs;
+        st.grezzo = zs.z ? regime(zs.z, st.confermato) : null;
+        const t = secondi(o.tEt);
+        st.recenti.push([t, st.grezzo]);
+        while (t - st.recenti[0][0] > CONFERMA_SEC) st.recenti.shift();
+        // Serve una finestra piena: con le prime letture la maggioranza e' di poche.
+        if (t - st.recenti[0][0] < CONFERMA_SEC - 10) continue;
+        const conti = new Map<Regime, number>();
+        for (const [, r] of st.recenti) if (r) conti.set(r, (conti.get(r) ?? 0) + 1);
+        for (const [r, n] of conti) {
+            if (r !== st.confermato && n >= QUOTA_CONFERMA * st.recenti.length) {
+                st.confermato = r;
+                // Niente pallino senza ora (letture vecchie) ne' a regime sospeso:
+                // dalle 15:15 ET la pagina non mostra il regime, i pallini erano
+                // rimasti (29/10: tre fra le 20:26 e le 20:57).
+                if (o.t && o.tEt < FINE_REGIME_ET) st.cambiRegime.push([o.t, r]);
+            }
+        }
+    }
+    st.tUltima = st.n > 0 ? oggi[st.n - 1].tEt : null;
+    statoRegime = st;
+    return st;
+}
+
 export async function GET(request: Request) {
     const date = getTodayKey();
     if (process.env.VERCEL) {
@@ -377,6 +434,8 @@ export async function GET(request: Request) {
                 regime: null,
                 sospeso: true,
                 chiuso: true,
+                // I pallini della giornata restano anche dopo la chiusura.
+                cambiRegime: avanzaRegime(date, senzaRipetute(letture.filter(versione2)), storico(dirSmile, date)).cambiRegime,
                 storiaVertice,
             },
             punti: [],
@@ -402,12 +461,9 @@ export async function GET(request: Request) {
     });
 
     // Z-score e regime: isteresi e conferma dipendono dalle letture prima,
-    // quindi si ricostruiscono sulle ultime letture di oggi.
+    // quindi si seguono su tutta la giornata, una lettura nuova per volta.
     const oggi = senzaRipetute(letture.filter(versione2));
-    const finestra = oggi.slice(-LETTURE_REGIME);
-    // Del passato serve solo la fascia della finestra +-15 min.
-    const inizio = finestra.length ? secondi(finestra[0].tEt) - FASCIA_SEC : 0;
-    const passato = storico(dirSmile, date).filter((p) => secondi(p.l.tEt) >= inizio);
+    const stato = avanzaRegime(date, oggi, storico(dirSmile, date));
     // Da quanto l'IV ATM non cambia: se IBKR smette di aggiornare si vede.
     let ivFermaSec = 0;
     const ultima = letture[letture.length - 1];
@@ -415,38 +471,8 @@ export async function GET(request: Request) {
         const diversa = [...letture].reverse().find((o) => o.ivAtm !== ultima.ivAtm);
         if (diversa) ivFermaSec = secondi(ultima.tEt) - secondi(diversa.tEt);
     }
-    let confermato: Regime | null = null;
-    let ultimo: ReturnType<typeof zScore> | null = null;
-    let grezzo: Regime | null = null;
-    const recenti: [number, Regime | null][] = [];
-    /**
-     * Quando il regime confermato e' cambiato, nella finestra ricostruita qui
-     * sopra: [ora italiana 'HH:MM:SS', regime]. /market ci mette i pallini
-     * sulla linea del prezzo, e li accumula per conto suo -- questa finestra
-     * e' mezz'ora, non la giornata, perche' ricostruire il regime su tutte le
-     * letture vorrebbe dire uno z-score per ognuna contro tutto lo storico.
-     */
-    const cambiRegime: [string, Regime][] = [];
-    for (const o of finestra) {
-        const zs = zScore(o, passato, oggi);
-        ultimo = zs;
-        grezzo = zs.z ? regime(zs.z, confermato) : null;
-        const t = secondi(o.tEt);
-        recenti.push([t, grezzo]);
-        while (t - recenti[0][0] > CONFERMA_SEC) recenti.shift();
-        // Serve una finestra piena: con le prime letture la maggioranza e' di poche.
-        if (t - recenti[0][0] < CONFERMA_SEC - 10) continue;
-        const conti = new Map<Regime, number>();
-        for (const [, r] of recenti) if (r) conti.set(r, (conti.get(r) ?? 0) + 1);
-        for (const [r, n] of conti) {
-            if (r !== confermato && n >= QUOTA_CONFERMA * recenti.length) {
-                confermato = r;
-                // `t` manca nelle letture piu' vecchie: senza ora non c'e' pallino.
-                if (o.t) cambiRegime.push([o.t, r]);
-            }
-        }
-    }
-    if (!ultimo) ultimo = zScore(l, passato, oggi);
+    const { confermato, grezzo, cambiRegime } = stato;
+    const ultimo = stato.ultimo ?? zScore(l, storico(dirSmile, date), oggi);
     const sospeso = l.tEt >= FINE_REGIME_ET;
 
     return NextResponse.json({

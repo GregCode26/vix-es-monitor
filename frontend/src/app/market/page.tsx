@@ -24,7 +24,8 @@ import { minutiRomaDaNy, oraRomaDaNy } from '@/lib/orarioNy';
 import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
 import AiSignalPanel, { type RispostaAi } from '@/components/AiSignalPanel';
 import {
-    CHIAVE_AUTO, PUNTO_RECENTE_MS, frecceAiPlugin, leggiFrecce, livelloToccato, prendiTurno, salvaFrecce,
+    CHIAVE_AUTO, FINE_GEX_NY, GEX_FERMO_MS, PUNTO_RECENTE_MS, descriviArrivo, frecceAiPlugin, leggiFrecce,
+    leggiScarichi, livelloToccato, prendiTurno, riarma, salvaFrecce, salvaScarichi,
     type FrecciaAi, type LivelloTracciato,
 } from '@/lib/aiLivelli';
 
@@ -517,9 +518,13 @@ interface SegnaleIv {
     rialzista: boolean;
 }
 
-/** I segnali valgono per la giornata, come la cache dei punti. */
+/**
+ * I segnali valgono per la giornata, come la cache dei punti. `2`: la lista
+ * salvata prima del 29/10/2026 era piena di pallini finti (vedi
+ * `avanzaRegime` in /api/smile), con la chiave nuova sparisce.
+ */
 function chiaveSegnaliIv() {
-    return `marketIvSegnali_${getTodayKey()}`;
+    return `marketIvSegnali2_${getTodayKey()}`;
 }
 
 /** Dopo un pallino il segnale e' scarico: si riarma dopo questi secondi. */
@@ -797,21 +802,19 @@ export default function MarketPage() {
                     giorno = getTodayKey();
                     setSegnaliIv([]);
                 }
-                const cambi: [string, string][] = json?.smile?.cambiRegime ?? [];
-                const nuovi = cambi.filter(([, r]) => r === 'RIALZISTA' || r === 'RIBASSISTA');
-                if (nuovi.length > 0) {
+                // cambiRegime e' quello di tutta la giornata: sostituisce la
+                // lista, non si accumula (localStorage serve solo al primo disegno).
+                const cambi: [string, string][] | undefined = json?.smile?.cambiRegime;
+                if (cambi) {
+                    const segnali = conRiarmo(cambi
+                        .filter(([, r]) => r === 'RIALZISTA' || r === 'RIBASSISTA')
+                        .map(([time, regime]) => ({ time, rialzista: regime === 'RIALZISTA' })));
                     setSegnaliIv((prec) => {
-                        const visti = new Set(prec.map((s) => s.time));
-                        const aggiunti = nuovi
-                            .filter(([t]) => !visti.has(t))
-                            .map(([time, regime]) => ({ time, rialzista: regime === 'RIALZISTA' }));
-                        if (aggiunti.length === 0) return prec;
-                        const uniti = conRiarmo([...prec, ...aggiunti]);
-                        if (uniti.length === prec.length) return prec;
+                        if (prec.length === segnali.length && prec.every((s, i) => s.time === segnali[i].time && s.rialzista === segnali[i].rialzista)) return prec;
                         try {
-                            localStorage.setItem(chiaveSegnaliIv(), JSON.stringify(uniti));
+                            localStorage.setItem(chiaveSegnaliIv(), JSON.stringify(segnali));
                         } catch { }
-                        return uniti;
+                        return segnali;
                     });
                 }
             } catch (e) {
@@ -1307,13 +1310,26 @@ export default function MarketPage() {
         chart.$etichette = etichette;
 
         // I livelli che innescano l'analisi AI: i range disegnati e il GEX+/-
-        // di adesso, se mostrato.
+        // di adesso, se mostrato, fermo sullo stesso strike da GEX_FERMO_MS e
+        // prima delle FINE_GEX_NY (lib/aiLivelli.ts).
         const tracciati: LivelloTracciato[] = etichette.map((e) => ({ nome: e.testo, valore: e.valore }));
-        if (mostraGamma) {
-            for (const [indice, nome] of [[6, 'GEX+'], [7, 'GEX-']] as const) {
+        const oraUltimo = dataPoints[dataPoints.length - 1]?.time;
+        if (mostraGamma && oraUltimo && oraUltimo < oraRomaDaNy(FINE_GEX_NY)) {
+            const sec = (t: string) => {
+                const [h, m, s] = t.split(':').map(Number);
+                return h * 3600 + m * 60 + (s || 0);
+            };
+            for (const [indice, nome, campo] of [[6, 'GEX+', 'maxPos'], [7, 'GEX-', 'maxNeg']] as const) {
                 const serie = (chart.data.datasets[indice]?.data ?? []) as (number | null)[];
                 const v = serie[serie.length - 1];
-                if (v !== null && v !== undefined) tracciati.push({ nome, valore: v });
+                const fatti = tracciaGamma.filter((g) => g.time <= oraUltimo);
+                const strike = fatti[fatti.length - 1]?.[campo];
+                if (v === null || v === undefined || strike === null || strike === undefined) continue;
+                // Da quando e' su questo strike: la prima voce dopo l'ultima
+                // diversa (o la prima della traccia).
+                let k = fatti.length - 1;
+                while (k > 0 && fatti[k - 1][campo] === strike) k--;
+                if ((sec(oraUltimo) - sec(fatti[k].time)) * 1000 >= GEX_FERMO_MS) tracciati.push({ nome, valore: v });
             }
         }
         livelliTracciatiRef.current = tracciati;
@@ -1478,10 +1494,19 @@ export default function MarketPage() {
         const quando = new Date(adesso);
         quando.setHours(h, m, sec || 0, 0);
         if (Math.abs(adesso.getTime() - quando.getTime()) > PUNTO_RECENTE_MS) return;
-        const livello = livelloToccato(ultimo.esf, livelliTracciatiRef.current);
-        if (!livello || !prendiTurno(adesso.getTime())) return;
-
+        // Solo a cash aperto: dopo le 16:00 NY SPX e opzioni sono fermi (29/10:
+        // due analisi alle 21:10 e 21:19 senza dati, a detta dell'AI stessa).
+        if (ultimo.time < aperturaUsa() || ultimo.time >= oraRomaDaNy('16:00')) return;
         const giorno = getTodayKey();
+        // Prima si riarmano i livelli da cui ES si e' allontanato.
+        const prima = leggiScarichi(giorno);
+        const scarichi = riarma(ultimo.esf, adesso.getTime(), prima);
+        if (scarichi.length !== prima.length) salvaScarichi(giorno, scarichi);
+        const livello = livelloToccato(ultimo.esf, livelliTracciatiRef.current, scarichi);
+        if (!livello || !prendiTurno(adesso.getTime())) return;
+        salvaScarichi(giorno, [...scarichi, { ...livello, quando: adesso.getTime() }]);
+        const arrivo = descriviArrivo(dataPoints, livello, frecceAi);
+
         const freccia: FrecciaAi = { time: ultimo.time, esf: ultimo.esf, livello, bias: null };
         const aggiorna = (cambia: (f: FrecciaAi) => FrecciaAi) => setFrecceAi((tutte) => {
             const nuove = tutte.map((f) => (f.time === freccia.time ? cambia(f) : f));
@@ -1498,7 +1523,7 @@ export default function MarketPage() {
                 const res = await fetch('/api/ai-signal', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ innesco: { livello: livello.nome, prezzoLivello: livello.valore, esf: ultimo.esf } }),
+                    body: JSON.stringify({ innesco: { livello: livello.nome, prezzoLivello: livello.valore, esf: ultimo.esf, ...arrivo } }),
                 });
                 const json = await res.json();
                 if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
@@ -1508,7 +1533,7 @@ export default function MarketPage() {
                 aggiorna((f) => ({ ...f, errore: (e as Error).message }));
             }
         })();
-    }, [dataPoints, aiAuto]);
+    }, [dataPoints, aiAuto, frecceAi]);
 
     // ---- Plugins (zoom) ----
     useEffect(() => {

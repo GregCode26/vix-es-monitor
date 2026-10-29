@@ -156,7 +156,18 @@ function viaClaudeCode(riassunto: unknown): Promise<Esito> {
     });
 }
 
-type Innesco = { livello: string; prezzoLivello: number; esf: number | null };
+type Innesco = {
+    livello: string;
+    prezzoLivello: number;
+    esf: number | null;
+    /** Come ci e' arrivato ES (lib/aiLivelli.ts `descriviArrivo`), dal 29/10/2026. */
+    lato?: 'da sotto' | 'da sopra';
+    esf10m?: number;
+    distanzaMax30m?: number;
+    contatto?: number;
+};
+
+const numero = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
 
 /** Il corpo facoltativo di /market (AI Livelli): il livello a cui ES e' arrivato. */
 async function leggiInnesco(request: Request): Promise<Innesco | null> {
@@ -164,7 +175,15 @@ async function leggiInnesco(request: Request): Promise<Innesco | null> {
         const j = await request.json();
         const i = j?.innesco;
         if (!i || typeof i.livello !== 'string' || typeof i.prezzoLivello !== 'number') return null;
-        return { livello: i.livello.slice(0, 40), prezzoLivello: i.prezzoLivello, esf: typeof i.esf === 'number' ? i.esf : null };
+        return {
+            livello: i.livello.slice(0, 40),
+            prezzoLivello: i.prezzoLivello,
+            esf: typeof i.esf === 'number' ? i.esf : null,
+            lato: i.lato === 'da sotto' || i.lato === 'da sopra' ? i.lato : undefined,
+            esf10m: numero(i.esf10m),
+            distanzaMax30m: numero(i.distanzaMax30m),
+            contatto: numero(i.contatto),
+        };
     } catch {
         return null; // senza corpo: il pulsante "Analizza ora"
     }
