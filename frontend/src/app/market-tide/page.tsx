@@ -107,6 +107,75 @@ const lineaSpot = {
   },
 };
 
+/**
+ * Mirino al posto del puntatore: la linea verticale attraversa premi e volume
+ * (fin sotto l'indicatore), quella orizzontale sta all'altezza del cursore sul
+ * grafico dov'e' il mouse. Sul profilo, che ha la stessa scala dei prezzi, la
+ * linea orizzontale continua al prezzo indicato dal cursore sui premi.
+ */
+type Mirino = { indice: number | null; y: number | null; prezzo: number | null };
+const mirino = {
+  id: 'mirino',
+  afterDatasetsDraw(chart: ChartJS) {
+    const m = (chart.options.plugins as { mirino?: Mirino }).mirino;
+    if (!m) return;
+    const { left, right, top, bottom } = chart.chartArea;
+    const ctx = chart.ctx;
+    const etichetta = (testo: string, x: number, y: number, allinea: 'left' | 'right' | 'center') => {
+      ctx.font = 'bold 10px sans-serif';
+      const w = ctx.measureText(testo).width + 8;
+      const x0 = allinea === 'left' ? x : allinea === 'right' ? x - w : x - w / 2;
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(x0, y - 8, w, 16);
+      ctx.fillStyle = '#f8fafc';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(testo, x0 + w / 2, y);
+    };
+    ctx.save();
+    ctx.strokeStyle = 'rgba(226, 232, 240, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    const x = chart.scales.x;
+    let px: number | null = null;
+    if (m.indice != null && x && x.type === 'category') {
+      px = x.getPixelForValue(m.indice);
+      ctx.beginPath();
+      ctx.moveTo(px, top);
+      ctx.lineTo(px, bottom);
+      ctx.stroke();
+    }
+    let py = m.y;
+    if (py == null && m.prezzo != null && chart.scales.y) {
+      const v = chart.scales.y.getPixelForValue(m.prezzo);
+      if (v >= top && v <= bottom) py = v;
+    }
+    if (py != null && py >= top && py <= bottom) {
+      ctx.beginPath();
+      ctx.moveTo(left, py);
+      ctx.lineTo(right, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Valori sugli assi: sinistro e destro dove ci sono.
+      for (const s of Object.values(chart.scales)) {
+        if (s.axis !== 'y' || !s.options.display || (s.options as { ticks?: { display?: boolean } }).ticks?.display === false) continue;
+        const v = s.getValueForPixel(py);
+        if (v == null) continue;
+        const testo = s.id === 'ySpx' || s.id === 'y' ? v.toFixed(2) : compatto(v, s.id === 'yVol' ? 1 : 0);
+        if (s.position === 'left') etichetta(testo, s.right, py, 'right');
+        else etichetta(testo, s.left, py, 'left');
+      }
+    }
+    ctx.setLineDash([]);
+    // L'ora in basso, sul grafico che ha l'asse dei tempi visibile.
+    if (px != null && (x.options as { ticks?: { display?: boolean } }).ticks?.display !== false) {
+      const testo = chart.data.labels?.[m.indice as number];
+      if (testo != null) etichetta(String(testo), px, bottom + 10, 'center');
+    }
+    ctx.restore();
+  },
+};
+
 function Selettore<T extends string>({ titolo, valore, opzioni, onChange }: {
   titolo: string;
   valore: T;
@@ -138,7 +207,8 @@ export default function MarketTidePage() {
   const [autorizzato, setAutorizzato] = useState(false);
   const [points, setPoints] = useState<TidePoint[]>([]);
   const [caricato, setCaricato] = useState(false);
-  const [indiceHover, setIndiceHover] = useState<number | null>(null);
+  const [cursore, setCursore] = useState<{ indice: number; grafico: number; y: number } | null>(null);
+  const indiceHover = cursore?.indice ?? null;
   const [guidaAperta, setGuidaAperta] = useState(true);
   const [guidaGammaAperta, setGuidaGammaAperta] = useState(false);
 
@@ -311,6 +381,7 @@ export default function MarketTidePage() {
         animation: false,
         maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
+        elements: { point: { hoverRadius: 0 } },
         plugins: { legend: { display: false }, tooltip: { enabled: false } },
         scales: {
           x: { ...asseX, afterFit: fissaAltezza, ticks: { ...asseX.ticks, display: false } },
@@ -328,6 +399,7 @@ export default function MarketTidePage() {
           },
         },
       },
+      plugins: [mirino],
     });
 
     chartVolume.current = new ChartJS(volumeRef.current, {
@@ -349,6 +421,7 @@ export default function MarketTidePage() {
         animation: false,
         maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
+        elements: { point: { hoverRadius: 0 } },
         plugins: { legend: { display: false }, tooltip: { enabled: false } },
         scales: {
           x: asseX,
@@ -362,6 +435,7 @@ export default function MarketTidePage() {
           },
         },
       },
+      plugins: [mirino],
     });
 
     chartProfilo.current = new ChartJS(profiloRef.current, {
@@ -404,7 +478,7 @@ export default function MarketTidePage() {
           },
         },
       },
-      plugins: [lineaSpot],
+      plugins: [lineaSpot, mirino],
     });
 
     // Il cursore su uno dei due grafici guida l'intestazione e la linea
@@ -413,9 +487,10 @@ export default function MarketTidePage() {
     const charts = [chartPremi.current, chartVolume.current];
     const muovi = (i: number) => (evt: MouseEvent) => {
       const el = charts[i].getElementsAtEventForMode(evt, 'index', { intersect: false }, false)[0];
-      setIndiceHover(el ? el.index : null);
+      const r = canvases[i].getBoundingClientRect();
+      setCursore(el ? { indice: el.index, grafico: i, y: evt.clientY - r.top } : null);
     };
-    const esci = () => setIndiceHover(null);
+    const esci = () => setCursore(null);
     const handlers = canvases.map((c, i) => {
       const h = muovi(i);
       c.addEventListener('mousemove', h);
@@ -541,15 +616,28 @@ export default function MarketTidePage() {
     c.update('none');
   }, [profilo, serie, strikes, base, sogliaPct, spotGamma, scalaPrezzi]);
 
-  // Linea verticale del cursore, disegnata su entrambi i grafici.
+  // Mirino: verticale su premi e volume, orizzontale sul grafico sotto il
+  // mouse e, dai premi, anche sul profilo allo stesso prezzo.
   useEffect(() => {
-    for (const c of [chartPremi.current, chartVolume.current]) {
-      if (!c) continue;
-      const attivi = indiceHover == null ? [] : c.data.datasets.map((_, datasetIndex) => ({ datasetIndex, index: indiceHover }));
-      c.setActiveElements(attivi);
+    const cp = chartPremi.current;
+    const charts = [cp, chartVolume.current];
+    let prezzo: number | null = null;
+    if (cursore?.grafico === 0 && cp?.scales.ySpx) prezzo = cp.scales.ySpx.getValueForPixel(cursore.y) ?? null;
+    charts.forEach((c, i) => {
+      if (!c) return;
+      (c.options.plugins as { mirino?: Mirino }).mirino = {
+        indice: cursore?.indice ?? null,
+        y: cursore?.grafico === i ? cursore.y : null,
+        prezzo: null,
+      };
       c.update('none');
+    });
+    const cpr = chartProfilo.current;
+    if (cpr) {
+      (cpr.options.plugins as { mirino?: Mirino }).mirino = { indice: null, y: null, prezzo };
+      cpr.update('none');
     }
-  }, [indiceHover]);
+  }, [cursore]);
 
   if (!autorizzato) return null;
 
@@ -626,7 +714,7 @@ export default function MarketTidePage() {
               <canvas ref={profiloRef} />
             </div>
             <div className="relative flex-1 min-w-0">
-              <canvas ref={premiRef} />
+              <canvas ref={premiRef} style={{ cursor: 'none' }} />
             {caricato && points.length === 0 && (
               <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-slate-500 px-6">
                 Nessun dato di oggi. Il tide lo calcola il poller dei volumi (13:30–22:00) e parte dal suo ultimo riavvio;
@@ -642,7 +730,7 @@ export default function MarketTidePage() {
           <div className="flex h-[150px] md:h-[180px]">
             <div className="w-[240px] md:w-[300px] shrink-0" />
             <div className="relative flex-1 min-w-0">
-              <canvas ref={volumeRef} />
+              <canvas ref={volumeRef} style={{ cursor: 'none' }} />
             </div>
           </div>
         </div>
