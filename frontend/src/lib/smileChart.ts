@@ -46,6 +46,8 @@ export interface DatiSmile {
         ivFermaSec?: number;
         /** [ora 'HH:MM:SS' italiana, strike] a ogni cambio del vertice, in ordine. */
         storiaVertice?: [string, number][];
+        /** [ora italiana, regime] a ogni cambio del regime confermato nell'ultima mezz'ora. */
+        cambiRegime?: [string, string][];
     };
     punti: {
         strike: number; callIv: number | null; putIv: number | null; ivOtm: number | null;

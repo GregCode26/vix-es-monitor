@@ -511,6 +511,17 @@ function secondiDa(ora: string): number {
     return h * 3600 + m * 60 + (sec || 0);
 }
 
+/** Un cambio di regime dello smile: l'ora italiana e il verso. */
+interface SegnaleIv {
+    time: string;
+    rialzista: boolean;
+}
+
+/** I segnali valgono per la giornata, come la cache dei punti. */
+function chiaveSegnaliIv() {
+    return `marketIvSegnali_${getTodayKey()}`;
+}
+
 function getTodayKey() {
     const now = new Date();
     const y = now.getFullYear();
@@ -557,6 +568,18 @@ export default function MarketPage() {
      */
     const [mostraSmile, setMostraSmile] = useState(true);
     const smileRef = useRef<DatiSmile | null>(null);
+
+    /**
+     * I pallini sulla linea del prezzo: verde quando il regime dello smile
+     * diventa RIALZISTA, rosso quando diventa RIBASSISTA.
+     *
+     * /api/smile ricostruisce il regime solo sull'ultima mezz'ora di letture
+     * -- farlo su tutta la giornata vorrebbe dire uno z-score per ognuna
+     * contro tutto lo storico -- quindi i cambi si accumulano qui e si
+     * salvano, come la cache dei punti: ricaricando la pagina a meta' seduta
+     * i segnali della mattina restano dove sono.
+     */
+    const [segnaliIv, setSegnaliIv] = useState<SegnaleIv[]>([]);
     const mostraSmileRef = useRef(true);
     /**
      * L'indice SPX sulla scala destra, quella di ES. Solo da mercato aperto:
@@ -686,6 +709,10 @@ export default function MarketPage() {
         } else {
             setIsAuthorized(true);
             // Load divergence preference
+            try {
+                const salvati = localStorage.getItem(chiaveSegnaliIv());
+                if (salvati) setSegnaliIv(JSON.parse(salvati));
+            } catch { }
             const savedDiv = localStorage.getItem('marketShowDivergences');
             if (savedDiv !== null) setShowDivergences(savedDiv === 'true');
             const savedStr = localStorage.getItem('marketShowStraddle');
@@ -710,8 +737,8 @@ export default function MarketPage() {
         localStorage.setItem('marketShowStraddle', String(mostraStraddle));
     }, [mostraStraddle]);
 
-    // Smile: la colonna si apre o si chiude (larghezza dell'asse y-smile) e,
-    // finche' e' aperta, /api/smile si rilegge ogni 10 s (~3 KB, solo locale).
+    // Smile: la colonna si apre o si chiude (larghezza dell'asse y-smile).
+    // I dati li legge l'effetto qui sotto, acceso anche a colonna chiusa.
     useEffect(() => {
         localStorage.setItem('marketShowSmile', String(mostraSmile));
         mostraSmileRef.current = mostraSmile;
@@ -720,14 +747,45 @@ export default function MarketPage() {
             chart.$smileVisibile = mostraSmile;
             chart.update('none');
         }
-        if (!mostraSmile) return;
+    }, [mostraSmile]);
+
+    /**
+     * /api/smile ogni 10 s (~3 KB, solo locale). Si legge anche a colonna
+     * chiusa: da qui vengono sia la curva sia i pallini del regime, e questi
+     * ultimi devono comparire comunque.
+     */
+    useEffect(() => {
+        if (!isAuthorized) return;
         let attivo = true;
+        let giorno = getTodayKey();
         const carica = async () => {
             try {
                 const res = await fetch('/api/smile', { cache: 'no-store' });
                 const json = res.ok ? await res.json() : null;
                 if (!attivo) return;
                 smileRef.current = json && json.local !== false && json.punti ? json : null;
+
+                // Pagina rimasta aperta oltre la mezzanotte: i segnali sono di ieri.
+                if (getTodayKey() !== giorno) {
+                    giorno = getTodayKey();
+                    setSegnaliIv([]);
+                }
+                const cambi: [string, string][] = json?.smile?.cambiRegime ?? [];
+                const nuovi = cambi.filter(([, r]) => r === 'RIALZISTA' || r === 'RIBASSISTA');
+                if (nuovi.length > 0) {
+                    setSegnaliIv((prec) => {
+                        const visti = new Set(prec.map((s) => s.time));
+                        const aggiunti = nuovi
+                            .filter(([t]) => !visti.has(t))
+                            .map(([time, regime]) => ({ time, rialzista: regime === 'RIALZISTA' }));
+                        if (aggiunti.length === 0) return prec;
+                        const uniti = [...prec, ...aggiunti].sort((a, b) => a.time.localeCompare(b.time));
+                        try {
+                            localStorage.setItem(chiaveSegnaliIv(), JSON.stringify(uniti));
+                        } catch { }
+                        return uniti;
+                    });
+                }
             } catch (e) {
                 console.error('Smile fetch failed:', e);
                 if (attivo) smileRef.current = null;
@@ -744,7 +802,7 @@ export default function MarketPage() {
             attivo = false;
             clearInterval(id);
         };
-    }, [mostraSmile]);
+    }, [isAuthorized]);
 
 
     useEffect(() => {
@@ -1123,6 +1181,24 @@ export default function MarketPage() {
 
 
 
+        // I pallini del regime: uno solo nel punto in cui il segnale nasce,
+        // alla quota di ES di quel momento. L'ora dei segnali e' quella dello
+        // smile (ogni 10 s) e non cade su un punto di /api/market (ogni 15 s):
+        // si prende il primo punto da quell'ora in poi.
+        if (chart.data.datasets[8]) {
+            const colori: string[] = [];
+            const valori = new Array<number | null>(dataPoints.length).fill(null);
+            let i = 0;
+            for (const s of segnaliIv) {
+                while (i < dataPoints.length && dataPoints[i].time < s.time) i++;
+                if (i >= dataPoints.length) break;
+                valori[i] = dataPoints[i].esf;
+                colori[i] = s.rialzista ? '#22c55e' : '#ef4444';
+            }
+            chart.data.datasets[8].data = valori;
+            (chart.data.datasets[8] as { pointBackgroundColor?: string[] }).pointBackgroundColor = colori;
+        }
+
         const newAnnotations: any = {};
         const baseConfigs = [
             // Mattina: tratteggiata. Sono i livelli delle 10:35, calcolati
@@ -1354,7 +1430,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv]);
 
     // ---- Analisi AI sui livelli ----
     useEffect(() => {
@@ -2306,6 +2382,21 @@ export default function MarketPage() {
                 borderWidth: 4,
                 pointRadius: 0,
                 stepped: true,
+                yAxisID: 'y-right',
+                fill: false,
+            },
+            {
+                // Segnali IV: pallini sulla linea del prezzo, nessuna linea
+                // fra loro. `spanGaps: false` non basterebbe -- e' showLine a
+                // tenere separati due segnali lontani ore.
+                label: 'Segnali IV (regime smile)',
+                data: [] as (number | null)[],
+                showLine: false,
+                pointRadius: 5,
+                pointHoverRadius: 7,
+                pointBackgroundColor: [] as string[],
+                pointBorderColor: '#0f172a',
+                pointBorderWidth: 1.5,
                 yAxisID: 'y-right',
                 fill: false,
             },

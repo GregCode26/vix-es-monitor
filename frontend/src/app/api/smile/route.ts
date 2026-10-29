@@ -419,6 +419,14 @@ export async function GET(request: Request) {
     let ultimo: ReturnType<typeof zScore> | null = null;
     let grezzo: Regime | null = null;
     const recenti: [number, Regime | null][] = [];
+    /**
+     * Quando il regime confermato e' cambiato, nella finestra ricostruita qui
+     * sopra: [ora italiana 'HH:MM:SS', regime]. /market ci mette i pallini
+     * sulla linea del prezzo, e li accumula per conto suo -- questa finestra
+     * e' mezz'ora, non la giornata, perche' ricostruire il regime su tutte le
+     * letture vorrebbe dire uno z-score per ognuna contro tutto lo storico.
+     */
+    const cambiRegime: [string, Regime][] = [];
     for (const o of finestra) {
         const zs = zScore(o, passato, oggi);
         ultimo = zs;
@@ -430,7 +438,13 @@ export async function GET(request: Request) {
         if (t - recenti[0][0] < CONFERMA_SEC - 10) continue;
         const conti = new Map<Regime, number>();
         for (const [, r] of recenti) if (r) conti.set(r, (conti.get(r) ?? 0) + 1);
-        for (const [r, n] of conti) if (r !== confermato && n >= QUOTA_CONFERMA * recenti.length) confermato = r;
+        for (const [r, n] of conti) {
+            if (r !== confermato && n >= QUOTA_CONFERMA * recenti.length) {
+                confermato = r;
+                // `t` manca nelle letture piu' vecchie: senza ora non c'e' pallino.
+                if (o.t) cambiRegime.push([o.t, r]);
+            }
+        }
     }
     if (!ultimo) ultimo = zScore(l, passato, oggi);
     const sospeso = l.tEt >= FINE_REGIME_ET;
@@ -461,6 +475,7 @@ export async function GET(request: Request) {
             regime: ultimo.base === 'in raccolta' || sospeso ? null : confermato,
             regimeGrezzo: sospeso ? null : grezzo,
             sospeso,
+            cambiRegime,
             storiaVertice,
         },
         punti,
