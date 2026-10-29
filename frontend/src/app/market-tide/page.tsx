@@ -428,7 +428,8 @@ export default function MarketTidePage() {
         scales: {
           x: asseX,
           // A sinistra, larga come quella dei premi: le aree restano allineate.
-          ySpx: { position: 'left', afterFit: fissaLarghezza, grace: '5%', grid: { display: false }, ticks: { color: GIALLO, maxTicksLimit: 5 } },
+          ySpx: { position: 'left', afterFit: fissaLarghezza, grace: '5%', grid: { display: false }, // Con la scala spostata a mano gli estremi non sono tondi: niente decimali.
+          ticks: { color: GIALLO, maxTicksLimit: 5, callback: (v) => (Number.isInteger(Number(v)) ? v : '') } },
           yVol: {
             position: 'right',
             afterFit: fissaLarghezza,
@@ -500,7 +501,67 @@ export default function MarketTidePage() {
       return h;
     });
 
+    // La linea SPX sul net volume si sposta col mouse: trascinando dentro il
+    // grafico sale e scende, trascinando sulla sua scala (a sinistra) cambia
+    // ampiezza (in su si allarga il prezzo, in giu' si stringe). Doppio clic:
+    // di nuovo automatica.
+    const cv = chartVolume.current;
+    const canvasVol = volumeRef.current;
+    let trascina: { modo: 'sposta' | 'ampiezza'; y0: number; min: number; max: number } | null = null;
+    const sullaScala = (evt: MouseEvent) => {
+      const r = canvasVol.getBoundingClientRect();
+      const x = evt.clientX - r.left;
+      const s = cv.scales.ySpx;
+      return x >= s.left && x <= s.right;
+    };
+    const premi = (evt: MouseEvent) => {
+      const s = cv.scales.ySpx;
+      if (!s) return;
+      evt.preventDefault();
+      trascina = { modo: sullaScala(evt) ? 'ampiezza' : 'sposta', y0: evt.clientY, min: s.min, max: s.max };
+    };
+    const trascinaSpx = (evt: MouseEvent) => {
+      if (!trascina) {
+        const x = evt.clientX - canvasVol.getBoundingClientRect().left;
+        const nellArea = x >= cv.chartArea.left && x <= cv.chartArea.right;
+        canvasVol.style.cursor = sullaScala(evt) ? 'ns-resize' : nellArea ? 'none' : 'default';
+        return;
+      }
+      canvasVol.style.cursor = trascina.modo === 'ampiezza' ? 'ns-resize' : 'grabbing';
+      const s = cv.scales.ySpx;
+      const dy = evt.clientY - trascina.y0;
+      const ampiezza = trascina.max - trascina.min;
+      const opz = cv.options.scales!.ySpx!;
+      if (trascina.modo === 'sposta') {
+        const passo = (dy / (s.bottom - s.top)) * ampiezza;
+        opz.min = trascina.min + passo;
+        opz.max = trascina.max + passo;
+      } else {
+        // 100 px in su = scala dimezzata (prezzo il doppio piu' ampio).
+        const fattore = Math.pow(2, dy / 100);
+        const centro = (trascina.min + trascina.max) / 2;
+        opz.min = centro - (ampiezza * fattore) / 2;
+        opz.max = centro + (ampiezza * fattore) / 2;
+      }
+      cv.update('none');
+    };
+    const rilascia = () => { trascina = null; };
+    const automatica = () => {
+      const opz = cv.options.scales!.ySpx!;
+      delete opz.min;
+      delete opz.max;
+      cv.update('none');
+    };
+    canvasVol.addEventListener('mousedown', premi);
+    window.addEventListener('mousemove', trascinaSpx);
+    window.addEventListener('mouseup', rilascia);
+    canvasVol.addEventListener('dblclick', automatica);
+
     return () => {
+      canvasVol.removeEventListener('mousedown', premi);
+      window.removeEventListener('mousemove', trascinaSpx);
+      window.removeEventListener('mouseup', rilascia);
+      canvasVol.removeEventListener('dblclick', automatica);
       canvases.forEach((c, i) => {
         c.removeEventListener('mousemove', handlers[i]);
         c.removeEventListener('mouseleave', esci);
