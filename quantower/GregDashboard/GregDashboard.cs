@@ -195,6 +195,15 @@ namespace GregDashboard
             public List<PuntoSmile> Punti;
         }
 
+        /// <summary>La traccia IV MIN di un giorno passato (/api/smile?giorni=), con la basis ES-SPX di quel giorno.</summary>
+        private sealed class TracciaGiorno
+        {
+            public DateTime Mezzanotte;
+            public double? Basis;
+            public int Fine;
+            public List<(int sec, double strike)> Storia;
+        }
+
         private static readonly HttpClient http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
 
         private CancellationTokenSource cts;
@@ -204,6 +213,10 @@ namespace GregDashboard
         private volatile List<Segmento> segmentiPronti = new List<Segmento>();
         private volatile List<Assorbimento> assorbimentiPronti = new List<Assorbimento>();
         private volatile DatiSmile smile;
+        // Le tracce dei giorni passati: si rileggono al cambio di giorno e ogni 30 minuti.
+        private volatile List<TracciaGiorno> tracce = new List<TracciaGiorno>();
+        private DateTime prossimeTracce = DateTime.MinValue;
+        private const int GIORNI_TRACCE = 5;
         private volatile string stato = "in attesa della dashboard...";
 
         /// <summary>Giorno (yyyy-MM-dd) dei segmenti: i secondi sono dall'inizio di quel giorno, ora locale.</summary>
@@ -296,6 +309,11 @@ namespace GregDashboard
                     if (ora >= prossimoSmile)
                     {
                         if (MostraSmile) await LeggiSmile(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("smile"); });
+                        if (MostraSmile && MostraIvMin && ora >= prossimeTracce)
+                        {
+                            await LeggiTracce(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("tracce"); });
+                            prossimeTracce = ora.AddMinutes(30) < DateTime.Today.AddDays(1) ? ora.AddMinutes(30) : DateTime.Today.AddDays(1);
+                        }
                         prossimoSmile = ora.AddSeconds(10);
                     }
                     if (MostraLiquidita || MostraAssorbimenti) await LeggiBookmap(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("bookmap"); });
@@ -436,6 +454,37 @@ namespace GregDashboard
                 }
             }
             profilo = righe;
+        }
+
+        /// <summary>
+        /// Le tracce IV MIN dei giorni passati: il grafico mostra anche quelli,
+        /// e /api/smile senza parametri da' solo oggi (prima dell'apertura nemmeno).
+        /// </summary>
+        private async Task LeggiTracce(CancellationToken token)
+        {
+            using var doc = await Get($"/api/smile?giorni={GIORNI_TRACCE}", token);
+            if (doc == null || !doc.RootElement.TryGetProperty("giorni", out var giorni) || giorni.ValueKind != JsonValueKind.Array) return;
+            var lette = new List<TracciaGiorno>();
+            foreach (var gg in giorni.EnumerateArray())
+            {
+                if (!DateTime.TryParseExact(Stringa(gg, "date"), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) continue;
+                if (!gg.TryGetProperty("storia", out var storia) || storia.ValueKind != JsonValueKind.Array) continue;
+                var t = new TracciaGiorno
+                {
+                    Mezzanotte = mezzanotte,
+                    Basis = Numero(gg, "basis"),
+                    Fine = Secondi(Stringa(gg, "fine") ?? "00:00:00"),
+                    Storia = new List<(int, double)>(),
+                };
+                foreach (var e in storia.EnumerateArray())
+                {
+                    if (e.ValueKind != JsonValueKind.Array || e.GetArrayLength() != 2) continue;
+                    if (e[0].ValueKind != JsonValueKind.String || e[1].ValueKind != JsonValueKind.Number) continue;
+                    t.Storia.Add((Secondi(e[0].GetString()), e[1].GetDouble()));
+                }
+                if (t.Storia.Count > 0) lette.Add(t);
+            }
+            tracce = lette;
         }
 
         private async Task LeggiSmile(CancellationToken token)
@@ -921,6 +970,7 @@ namespace GregDashboard
             using var font10 = new Font("Arial", 10f, FontStyle.Regular, GraphicsUnit.Pixel);
 
             var baseEs = BaseCorrente();
+            if (MostraIvMin) TracceGiorniPassati(g, area, conv, x0, baseEs);
             var messaggio = dati == null ? "Smile: in attesa dei dati"
                 : baseEs == null ? $"Smile: in attesa della basis ES-SPX ({OraLocaleDaNy(9, 30)})" : null;
             if (messaggio != null)
@@ -1080,6 +1130,54 @@ namespace GregDashboard
             using var br = new SolidBrush(COLORE_VERTICE);
             using var sf = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Far };
             g.DrawString($"IV MIN {F1(ultimo)}", font, br, x1 - 3, y - 1, sf);
+        }
+
+        /// <summary>
+        /// Le tracce IV MIN dei giorni passati, a gradini come quella di oggi,
+        /// ognuna portata su ES con la basis del suo giorno (quella di oggi se
+        /// manca) e chiusa all'ora dell'ultima lettura.
+        /// </summary>
+        private void TracceGiorniPassati(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv,
+            float x0, double? baseOggi)
+        {
+            var lista = tracce;
+            if (lista.Count == 0) return;
+            var clip = g.Clip;
+            var modo = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.SetClip(RectangleF.FromLTRB(area.Left, area.Top, x0, area.Bottom), CombineMode.Intersect);
+            using var pen = new Pen(COLORE_VERTICE, 1.5f);
+            using var br = new SolidBrush(COLORE_VERTICE);
+            using var font9 = new Font("Arial", 9f, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var sf = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Far };
+            try
+            {
+                foreach (var t in lista)
+                {
+                    var b = t.Basis ?? baseOggi;
+                    if (b == null) continue;
+                    float X(int sec) => (float)Math.Clamp(conv.GetChartX(Utc(t.Mezzanotte, sec)), area.Left - 10, x0 + 10);
+                    float Y(double strike) => (float)Math.Clamp(conv.GetChartY(strike + b.Value), area.Top - 50000, area.Bottom + 50000);
+                    var xFine = X(t.Fine);
+                    if (xFine <= area.Left || X(t.Storia[0].sec) >= x0) continue; // giorno fuori dalla vista
+                    var punti = new List<PointF>();
+                    for (var i = 0; i < t.Storia.Count; i++)
+                    {
+                        var x = X(t.Storia[i].sec);
+                        if (i > 0) punti.Add(new PointF(x, Y(t.Storia[i - 1].strike)));
+                        punti.Add(new PointF(x, Y(t.Storia[i].strike)));
+                    }
+                    var ultimo = t.Storia[^1].strike;
+                    punti.Add(new PointF(xFine, Y(ultimo)));
+                    if (punti.Count >= 2) g.DrawLines(pen, punti.ToArray());
+                    g.DrawString($"IV MIN {F1(ultimo)}", font9, br, xFine - 3, Y(ultimo) - 1, sf);
+                }
+            }
+            finally
+            {
+                g.Clip = clip;
+                g.SmoothingMode = modo;
+            }
         }
 
         /// <summary>Una linea orizzontale su tutto il grafico e sulla colonna, con l'etichetta a destra nella colonna.</summary>

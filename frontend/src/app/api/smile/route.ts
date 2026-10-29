@@ -268,12 +268,80 @@ function storiaDelVertice(letture: Lettura[]): [string, number][] {
     return storia;
 }
 
-export async function GET() {
+/** La traccia IV MIN di un giorno passato, gia' con la basis ES-SPX di quel giorno. */
+interface TracciaGiorno {
+    date: string;
+    /** Mediana di ES - SPX nelle ore delle letture: null se il file di /api/market manca. */
+    basis: number | null;
+    /** Ora dell'ultima lettura: l'ultimo tratto finisce li'. */
+    fine: string;
+    storia: [string, number][];
+}
+
+const GIORNI_TRACCIA_MAX = 10;
+// I giorni passati non cambiano piu': si leggono una volta.
+const cacheTracce = new Map<string, TracciaGiorno | null>();
+
+function basisDelGiorno(dati: string, giorno: string, da: string, a: string): number | null {
+    let punti: { time?: string; esf?: number | null; spx?: number | null }[];
+    try {
+        const grezzo = JSON.parse(fs.readFileSync(path.join(dati, 'market', `${giorno}.json`), 'utf-8'));
+        punti = Array.isArray(grezzo) ? grezzo : grezzo?.data ?? [];
+    } catch {
+        return null;
+    }
+    // Solo nelle ore delle letture: fuori dal cash SPX resta fermo e ES no.
+    const diff = punti
+        .filter((p) => p.time && p.time >= da && p.time <= a && p.esf != null && p.spx != null)
+        .map((p) => (p.esf as number) - (p.spx as number))
+        .sort((x, y) => x - y);
+    if (diff.length === 0) return null;
+    const m = Math.floor(diff.length / 2);
+    return diff.length % 2 ? diff[m] : (diff[m - 1] + diff[m]) / 2;
+}
+
+/**
+ * Le tracce IV MIN degli ultimi `n` giorni prima di oggi, per Quantower: il
+ * suo grafico mostra anche i giorni passati, e la linea che segue i cambi del
+ * vertice spariva a mezzanotte (29/10/2026).
+ */
+function tracceGiorni(dati: string, oggi: string, n: number): TracciaGiorno[] {
+    const dir = path.join(dati, 'smile');
+    let file: string[];
+    try {
+        file = fs.readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(f) && f.slice(0, 10) < oggi);
+    } catch {
+        return [];
+    }
+    return file.sort().slice(-n).flatMap((f) => {
+        const giorno = f.slice(0, 10);
+        if (!cacheTracce.has(giorno)) {
+            const letture = leggiNdjson(path.join(dir, f)).filter((l) => l.t);
+            const storia = storiaDelVertice(letture);
+            cacheTracce.set(giorno, storia.length === 0 ? null : {
+                date: giorno,
+                basis: basisDelGiorno(dati, giorno, letture[0].t as string, letture[letture.length - 1].t as string),
+                fine: letture[letture.length - 1].t as string,
+                storia,
+            });
+        }
+        const t = cacheTracce.get(giorno);
+        return t ? [t] : [];
+    });
+}
+
+export async function GET(request: Request) {
     const date = getTodayKey();
     if (process.env.VERCEL) {
         return NextResponse.json({ date, local: false });
     }
     const dati = cartellaDati();
+    // ?giorni=N: solo le tracce IV MIN dei giorni passati, anche prima
+    // dell'apertura, quando lo smile di oggi risponde 503.
+    const giorni = Number(new URL(request.url).searchParams.get('giorni'));
+    if (giorni > 0) {
+        return NextResponse.json({ date, local: true, giorni: tracceGiorni(dati, date, Math.min(giorni, GIORNI_TRACCIA_MAX)) });
+    }
     let q: FileQuote;
     try {
         q = JSON.parse(fs.readFileSync(path.join(dati, 'catena', 'quote.json'), 'utf-8'));
