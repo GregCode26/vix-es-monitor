@@ -70,6 +70,22 @@ namespace GregDashboard
         [InputParameter("Spessore linee liquidita'", 33, 0.5, 5, 0.5, 1)]
         public double SpessoreLiquidita = 1;
 
+        /// <summary>0 = il livello piu' grosso fra quelli in vista prende il colore pieno.</summary>
+        [InputParameter("Contratti per colore pieno (0 = automatico)", 35, 0, 20000, 10, 0)]
+        public int ContrattiPieno = 0;
+
+        /// <summary>0 = linee opache, 90 = quasi invisibili: lascia vedere le candele sotto.</summary>
+        [InputParameter("Trasparenza liquidita' (%)", 36, 0, 90, 5, 0)]
+        public int TrasparenzaLiquidita = 10;
+
+        /// <summary>
+        /// Quanto in fretta la sfumatura va verso il colore scuro: 1 = scala
+        /// logaritmica com'e', sopra 1 i livelli medi si scuriscono prima, sotto
+        /// 1 restano chiari e si distinguono meglio i grossi.
+        /// </summary>
+        [InputParameter("Intensita' colori liquidita'", 37, 0.25, 4, 0.25, 2)]
+        public double IntensitaLiquidita = 1;
+
         [InputParameter("Alias Bookmap (vuoto = tutti)", 34)]
         public string AliasBookmap = "";
 
@@ -835,7 +851,9 @@ namespace GregDashboard
             var soglia = (double)sogliaUsata;
             // Un tick di altezza (almeno 1,5 px), come nella pagina.
             var alto = (float)(Math.Max(1.5, Math.Abs(conv.GetChartY(0) - conv.GetChartY(TICK)) * 0.8) * SpessoreLiquidita);
-            using var verde = new SolidBrush(Color.Empty);
+
+            // Prima i segmenti in vista, per sapere quale prende il colore pieno.
+            var visibili = new List<(Segmento seg, float x1, float x2, float y)>();
             foreach (var seg in segmenti)
             {
                 if (seg.A - seg.Da + 1 < DurataMinima) continue;
@@ -845,12 +863,71 @@ namespace GregDashboard
                 var x1 = (float)conv.GetChartX(Utc(mezzanotte, seg.Da));
                 var x2 = (float)conv.GetChartX(Utc(mezzanotte, seg.A + 1));
                 if (x2 < area.Left || x1 > area.Right) continue;
-                // da 0,25 alla soglia fino a pieno a 5 volte la soglia
-                var alfa = Math.Min(1, 0.25 + 0.75 * (seg.Contratti - soglia) / (soglia * 4));
-                var a = (int)Math.Round(Math.Clamp(alfa, 0, 1) * 255);
-                verde.Color = seg.Bid ? Color.FromArgb(a, 52, 211, 153) : Color.FromArgb(a, 244, 63, 94);
-                g.FillRectangle(verde, x1, y - alto / 2, Math.Max(1, x2 - x1), alto);
+                visibili.Add((seg, x1, x2, y));
             }
+            if (visibili.Count == 0) return;
+            var pieno = ContrattiPieno > 0 ? ContrattiPieno : visibili.Max(v => v.seg.Contratti);
+            pieno = Math.Max(pieno, soglia * 1.5);
+
+            // I piu' grossi per ultimi, cosi' stanno sopra.
+            using var pennello = new SolidBrush(Color.Empty);
+            foreach (var (seg, x1, x2, y) in visibili.OrderBy(v => v.seg.Contratti))
+            {
+                pennello.Color = ColoreLiquidita(seg.Bid, Intensita(seg.Contratti, soglia, pieno));
+                g.FillRectangle(pennello, x1, y - alto / 2, Math.Max(1, x2 - x1), alto);
+            }
+            LegendaLiquidita(g, area, soglia, pieno);
+        }
+
+        // Dal quasi bianco al verde / rosso scuro: la tinta chiara tiene distinti i due lati anche sui livelli piccoli.
+        private static readonly Color BID_CHIARO = ColorTranslator.FromHtml("#f0fdf4");
+        private static readonly Color BID_SCURO = ColorTranslator.FromHtml("#166534");
+        private static readonly Color ASK_CHIARO = ColorTranslator.FromHtml("#fef2f2");
+        private static readonly Color ASK_SCURO = ColorTranslator.FromHtml("#991b1b");
+
+        /// <summary>
+        /// 0 alla soglia, 1 a `pieno` e oltre, in scala logaritmica: i contratti
+        /// vanno da 50 a qualche migliaio, e in scala lineare i livelli normali
+        /// finirebbero tutti nello stesso bianco.
+        /// </summary>
+        private static double Intensita(double contratti, double soglia, double pieno) =>
+            Math.Clamp(Math.Log(Math.Max(contratti, soglia) / soglia) / Math.Log(pieno / soglia), 0, 1);
+
+        /// <summary>Il colore a intensita' t (0-1), con i due regolatori delle impostazioni.</summary>
+        private Color ColoreLiquidita(bool bid, double t)
+        {
+            var (da, a) = bid ? (BID_CHIARO, BID_SCURO) : (ASK_CHIARO, ASK_SCURO);
+            t = Math.Pow(Math.Clamp(t, 0, 1), 1 / Math.Clamp(IntensitaLiquidita, 0.25, 4));
+            int Mix(int x, int y) => (int)Math.Round(x + (y - x) * t);
+            var alfa = (int)Math.Round(255 * (1 - Math.Clamp(TrasparenzaLiquidita, 0, 90) / 100.0));
+            return Color.FromArgb(alfa, Mix(da.R, a.R), Mix(da.G, a.G), Mix(da.B, a.B));
+        }
+
+        /// <summary>In basso a sinistra: le due sfumature con i contratti agli estremi e a meta'.</summary>
+        private void LegendaLiquidita(Graphics g, Rectangle area, double soglia, double pieno)
+        {
+            const int largo = 120, alto = 6, passi = 24;
+            float x0 = area.Left + 8, y0 = area.Bottom - 34;
+            using var font = new Font("Arial", 9f, FontStyle.Regular, GraphicsUnit.Pixel);
+            using (var fondo = new SolidBrush(Color.FromArgb(200, 15, 23, 42)))
+                g.FillRectangle(fondo, x0 - 4, y0 - 4, largo + 8, 2 * alto + 22);
+            using var pennello = new SolidBrush(Color.Empty);
+            for (var i = 0; i < passi; i++)
+            {
+                var t = i / (double)(passi - 1);
+                pennello.Color = ColoreLiquidita(true, t);
+                g.FillRectangle(pennello, x0 + i * largo / (float)passi, y0, largo / (float)passi + 0.5f, alto);
+                pennello.Color = ColoreLiquidita(false, t);
+                g.FillRectangle(pennello, x0 + i * largo / (float)passi, y0 + alto + 2, largo / (float)passi + 0.5f, alto);
+            }
+            // Il valore a meta' della scala logaritmica e' la media geometrica.
+            var meta = Math.Sqrt(soglia * pieno);
+            var ty = y0 + 2 * alto + 4;
+            using var sf = new StringFormat { Alignment = StringAlignment.Center };
+            g.DrawString($"{soglia:0}", font, Brushes.Silver, x0, ty);
+            g.DrawString($"{meta:0}", font, Brushes.Silver, x0 + largo / 2f, ty, sf);
+            using var sfDestra = new StringFormat { Alignment = StringAlignment.Far };
+            g.DrawString($"{pieno:0}", font, Brushes.Silver, x0 + largo, ty, sfDestra);
         }
 
         /// <summary>
