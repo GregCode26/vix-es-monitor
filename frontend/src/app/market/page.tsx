@@ -522,6 +522,33 @@ function chiaveSegnaliIv() {
     return `marketIvSegnali_${getTodayKey()}`;
 }
 
+/** Dopo un pallino il segnale e' scarico: si riarma dopo questi secondi. */
+const RIARMO_SEGNALI_SEC = 30;
+
+/**
+ * I segnali che sopravvivono al riarmo, in ordine di tempo.
+ *
+ * Il regime puo' cambiare due volte di fila a pochi secondi di distanza --
+ * conferma e isteresi lavorano su finestre di 90 s, non impediscono un
+ * rimbalzo subito dopo -- e due pallini attaccati sulla stessa candela non
+ * dicono niente di piu' del primo. Si rifiltra sempre tutta la lista, anche
+ * quella ripresa da localStorage, cosi' la regola vale anche sui segnali
+ * salvati prima.
+ */
+function conRiarmo(segnali: SegnaleIv[]): SegnaleIv[] {
+    const sec = (t: string) => {
+        const [h, m, s] = t.split(':').map(Number);
+        return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+    };
+    const tenuti: SegnaleIv[] = [];
+    for (const s of [...segnali].sort((a, b) => a.time.localeCompare(b.time))) {
+        const ultimo = tenuti[tenuti.length - 1];
+        if (ultimo && sec(s.time) - sec(ultimo.time) < RIARMO_SEGNALI_SEC) continue;
+        tenuti.push(s);
+    }
+    return tenuti;
+}
+
 function getTodayKey() {
     const now = new Date();
     const y = now.getFullYear();
@@ -711,7 +738,7 @@ export default function MarketPage() {
             // Load divergence preference
             try {
                 const salvati = localStorage.getItem(chiaveSegnaliIv());
-                if (salvati) setSegnaliIv(JSON.parse(salvati));
+                if (salvati) setSegnaliIv(conRiarmo(JSON.parse(salvati)));
             } catch { }
             const savedDiv = localStorage.getItem('marketShowDivergences');
             if (savedDiv !== null) setShowDivergences(savedDiv === 'true');
@@ -779,7 +806,8 @@ export default function MarketPage() {
                             .filter(([t]) => !visti.has(t))
                             .map(([time, regime]) => ({ time, rialzista: regime === 'RIALZISTA' }));
                         if (aggiunti.length === 0) return prec;
-                        const uniti = [...prec, ...aggiunti].sort((a, b) => a.time.localeCompare(b.time));
+                        const uniti = conRiarmo([...prec, ...aggiunti]);
+                        if (uniti.length === prec.length) return prec;
                         try {
                             localStorage.setItem(chiaveSegnaliIv(), JSON.stringify(uniti));
                         } catch { }
