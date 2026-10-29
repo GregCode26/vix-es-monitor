@@ -549,11 +549,19 @@ interface PuntoBase {
   base: number;
 }
 
-/** La serie della base dallo storico di /api/market: solo i punti con SPX cash vero (dalle 15:30). */
+/**
+ * La serie della base dallo storico di /api/market: solo i punti del cash
+ * (9:30-16:00 NY). Prima l'SPX non c'e'; dopo resta fermo all'ultimo valore
+ * mentre ES si muove, e la differenza non e' piu' la base (28/10/2026: 16,8
+ * invece di 35 alle 22:00). Dopo la chiusura vale l'ultima misurata.
+ */
 function serieBase(storico: { time?: string; esf?: number | null; spx?: number | null }[] | undefined): PuntoBase[] {
   const out: PuntoBase[] = [];
+  const apertura = oraRomaDaNy('09:30');
+  const chiusura = oraRomaDaNy('16:00');
   for (const p of storico ?? []) {
     if (!p.time || !p.esf || !p.spx || p.esf <= 0 || p.spx <= 0) continue;
+    if (p.time < apertura || p.time > chiusura) continue;
     const sec = secondi(p.time);
     if (out.length > 0 && sec <= out[out.length - 1].sec) continue;
     out.push({ sec, base: p.esf - p.spx });

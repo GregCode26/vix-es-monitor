@@ -73,7 +73,7 @@ namespace GregDashboard
         [InputParameter("Alias Bookmap (vuoto = tutti)", 34)]
         public string AliasBookmap = "";
 
-        [InputParameter("Palle assorbimento", 40)]
+        [InputParameter("Frecce assorbimento", 40)]
         public bool MostraAssorbimenti = true;
 
         // Il minimo e' quello dell'add-on: sotto ASS_MIN_CONTRATTI (30) non rileva niente.
@@ -83,7 +83,7 @@ namespace GregDashboard
         /// <summary>
         /// Passo 3 dell'add-on reso regolabile: secondi in cui il livello deve
         /// restare al migliore dopo l'ultimo trade. L'add-on ne controlla gia' 1;
-        /// oltre si verifica qui sul bid/ask di ogni secondo, e la palla compare
+        /// oltre si verifica qui sul bid/ask di ogni secondo, e la freccia compare
         /// solo quando la tenuta e' raggiunta. Vedi studio_assorbimenti.py.
         /// </summary>
         [InputParameter("Tenuta assorbimento (s)", 42, 1, TENUTA_MAX, 1, 0)]
@@ -269,7 +269,49 @@ namespace GregDashboard
         {
             cts?.Cancel();
             cts = null;
+            AppDomain.CurrentDomain.SetData(CHIAVE_LIVELLI, null);
             base.OnClear();
+        }
+
+        /// <summary>
+        /// Dove gli altri indicatori (ZoneFootprint) trovano i livelli chiave in
+        /// prezzi ES. Sono DLL separate: si passa un double[] nell'AppDomain,
+        /// che e' di tipo base e quindi leggibile da qualunque assembly.
+        /// </summary>
+        public const string CHIAVE_LIVELLI = "GregDashboard.LivelliChiave";
+
+        /// <summary>I livelli accesi nelle impostazioni: range, Major Pos/Neg Gamma, IV MIN e Spot +-1/2 sigma, in ES.</summary>
+        private void PubblicaLivelli()
+        {
+            var livelli = new List<double>();
+            foreach (var l in livelliRange)
+                if (l.Tratteggiato ? MostraRangeMattino : MostraRangeOb) livelli.Add(l.Prezzo);
+
+            var b = BaseCorrente();
+            if (b != null)
+            {
+                var righe = profilo;
+                if (MostraGex && MostraMajor && righe.Count > 0)
+                {
+                    double Valore(RigaGex r) => BaseGex switch { 0 => r.Gex, 2 => r.GexLr, _ => r.GexOi };
+                    var major = righe.OrderByDescending(Valore).First();
+                    var minor = righe.OrderBy(Valore).First();
+                    if (Valore(major) > 0) livelli.Add(major.Strike + b.Value);
+                    if (Valore(minor) < 0) livelli.Add(minor.Strike + b.Value);
+                }
+
+                var dati = smile;
+                if (MostraSmile && dati != null)
+                {
+                    var em = dati.Em ?? 0;
+                    if (MostraSigma && em > 0)
+                        foreach (var k in new[] { -2, -1, 1, 2 }) livelli.Add(dati.Spot + k * em + b.Value);
+                    var vertice = dati.StoriaVertice.Count > 0 ? dati.StoriaVertice[^1].strike : dati.VerticeStrike;
+                    if (MostraIvMin && vertice != null) livelli.Add(vertice.Value + b.Value);
+                }
+            }
+
+            AppDomain.CurrentDomain.SetData(CHIAVE_LIVELLI, livelli.ToArray());
         }
 
         #region Richieste
@@ -317,6 +359,7 @@ namespace GregDashboard
                         prossimoSmile = ora.AddSeconds(10);
                     }
                     if (MostraLiquidita || MostraAssorbimenti) await LeggiBookmap(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("bookmap"); });
+                    PubblicaLivelli();
 
                     stato = errori.Count == 0 ? null : "dashboard non raggiungibile (" + string.Join(", ", errori) + ") su " + BaseUrl;
                 }
@@ -363,6 +406,7 @@ namespace GregDashboard
                     var spx = Numero(p, "spx");
                     if (t == null || esf is not > 0 || spx is not > 0) continue;
                     var sec = Secondi(t);
+                    if (!DentroCash(sec)) continue;
                     if (serie.Count > 0 && sec <= serie[^1].Item1) continue;
                     serie.Add((sec, esf.Value - spx.Value));
                 }
@@ -402,12 +446,22 @@ namespace GregDashboard
             var spx = Numero(root, "spx");
             if (t == null || esf is not > 0 || spx is not > 0) return;
             var sec = Secondi(t);
+            if (!DentroCash(sec)) return;
             lock (lockBase)
             {
                 if (giornoBase != Oggi()) { serieBase.Clear(); giornoBase = Oggi(); }
                 if (serieBase.Count == 0 || sec > serieBase[^1].sec) serieBase.Add((sec, esf.Value - spx.Value));
             }
         }
+
+        /// <summary>
+        /// Solo le misure del cash (9:30-16:00 NY): dopo la chiusura IBKR lascia
+        /// l'SPX fermo all'ultimo valore mentre ES continua, e la differenza non e'
+        /// piu' la base (28/10/2026: 16,8 invece di 35 alle 22:00). Dopo la
+        /// chiusura resta cosi' la base degli ultimi 5 minuti del cash.
+        /// </summary>
+        private static bool DentroCash(int sec) =>
+            sec >= Secondi(OraLocaleDaNy(9, 30) + ":00") && sec <= Secondi(OraLocaleDaNy(16, 0) + ":00");
 
         /// <summary>La base in vigore adesso: mediana degli ultimi 5 minuti di misure, come /bookmap.</summary>
         private double? BaseCorrente()
@@ -799,7 +853,12 @@ namespace GregDashboard
             }
         }
 
-        /// <summary>Come /bookmap: raggio dalla radice dei contratti (4-20 px), verde/rosso semitrasparente, bordo bianco.</summary>
+        /// <summary>
+        /// Frecce invece delle palle di /bookmap: blu verso l'alto quando i limit
+        /// buy assorbono i market sell, rossa verso il basso quando i limit sell
+        /// assorbono i market buy. La punta sta sul prezzo dell'assorbimento; la
+        /// misura segue la stessa regola delle palle (4-20 px dalla radice dei contratti).
+        /// </summary>
         private void DisegnaAssorbimenti(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
         {
             var lista = assorbimentiPronti;
@@ -809,22 +868,45 @@ namespace GregDashboard
 
             var modo = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using var compratori = new SolidBrush(Color.FromArgb(140, 52, 211, 153));
-            using var venditori = new SolidBrush(Color.FromArgb(140, 244, 63, 94));
+            using var compratori = new SolidBrush(Color.FromArgb(200, 59, 130, 246));
+            using var venditori = new SolidBrush(Color.FromArgb(200, 244, 63, 94));
             using var bordo = new Pen(Color.FromArgb(217, 255, 255, 255), 1f);
             foreach (var a in lista)
             {
                 if (a.Contratti < MinAssorbimento) continue;
-                // Con 1 s vale il controllo dell'add-on; oltre, la palla compare a tenuta raggiunta.
+                // Con 1 s vale il controllo dell'add-on; oltre, la freccia compare a tenuta raggiunta.
                 if (TenutaAssorbimento > 1 && a.Tenuta < TenutaAssorbimento) continue;
                 var x = (float)conv.GetChartX(Utc(mezzanotte, a.Sec));
                 var y = (float)conv.GetChartY(a.Prezzo);
-                if (x < area.Left - 20 || x > area.Right + 20 || y < area.Top - 20 || y > area.Bottom + 20) continue;
+                if (x < area.Left - 40 || x > area.Right + 40 || y < area.Top - 40 || y > area.Bottom + 40) continue;
                 var r = (float)Math.Min(20, Math.Max(4, Math.Sqrt(a.Contratti) * 0.9));
-                g.FillEllipse(a.Verso > 0 ? compratori : venditori, x - r, y - r, 2 * r, 2 * r);
-                g.DrawEllipse(bordo, x - r, y - r, 2 * r, 2 * r);
+                var freccia = FrecciaAssorbimento(x, y, r, a.Verso > 0);
+                g.FillPolygon(a.Verso > 0 ? compratori : venditori, freccia);
+                g.DrawPolygon(bordo, freccia);
             }
             g.SmoothingMode = modo;
+        }
+
+        /// <summary>
+        /// Freccia alta 2r con la punta in (x, y): verso l'alto ha il corpo sotto
+        /// il prezzo, verso il basso sopra. Testa larga 1,6r, stelo largo 0,6r.
+        /// </summary>
+        private static PointF[] FrecciaAssorbimento(float x, float y, float r, bool versoAlto)
+        {
+            var v = versoAlto ? 1 : -1; // +1: il corpo scende sotto la punta (y cresce verso il basso)
+            var testa = r;          // altezza della testa
+            var mezzaTesta = 0.8f * r;
+            var mezzoStelo = 0.3f * r;
+            return new[]
+            {
+                new PointF(x, y),
+                new PointF(x + mezzaTesta, y + v * testa),
+                new PointF(x + mezzoStelo, y + v * testa),
+                new PointF(x + mezzoStelo, y + v * 2 * r),
+                new PointF(x - mezzoStelo, y + v * 2 * r),
+                new PointF(x - mezzoStelo, y + v * testa),
+                new PointF(x - mezzaTesta, y + v * testa),
+            };
         }
 
         private void DisegnaRange(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)

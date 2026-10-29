@@ -444,6 +444,11 @@ const spxAxisPlugin = {
  * l'indice quota, come fa `/bookmap`. La mediana e non l'ultimo punto
  * perche' i due prezzi non arrivano nello stesso istante e un singolo
  * scarto sposterebbe tutta la colonna. Prima delle 15:30 niente basis.
+ * Solo fino alla chiusura del cash (16:00 NY): dopo, IBKR lascia l'SPX
+ * fermo all'ultimo valore mentre ES continua, e la "basis" diventa il
+ * movimento di ES dopo la chiusura (28/10/2026: da 35 a 16,8 alle 22:00,
+ * scala SPX, smile e GEX spostati di 18 punti). Dopo la chiusura resta
+ * quella degli ultimi 5 minuti del cash.
  */
 const secondi = (t: string) => { const [h, m, s] = t.split(':').map(Number); return h * 3600 + m * 60 + (s || 0); };
 
@@ -483,7 +488,8 @@ function etichetteConFuturo(points: DataPoint[], fino: number): string[] {
 }
 
 function basisEsSpx(points: DataPoint[]): number | null {
-    const validi = points.filter((d) => d.time >= aperturaUsa()
+    const chiusura = oraRomaDaNy('16:00');
+    const validi = points.filter((d) => d.time >= aperturaUsa() && d.time <= chiusura
         && d.esf !== null && d.spx !== null && d.spx !== undefined);
     if (validi.length === 0) return null;
     const fine = secondi(validi[validi.length - 1].time);

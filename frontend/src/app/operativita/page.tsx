@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useRouter } from 'next/navigation';
 import type { Blocco, Lato, Vertical } from '../api/verticali/route';
 import { leggiRefLines, leggiVisibilita } from '@/lib/refLines';
@@ -142,6 +142,7 @@ export default function OperativitaPage() {
   const [sim, setSim] = useState(false);
   // Dall'ultima riga di /api/market: VWAP di ES e base ES - SPX del momento.
   const [mercato, setMercato] = useState<{ vwap: number | null; basis: number | null } | null>(null);
+  const misureBasis = useRef<{ ora: string; sec: number; basis: number }[]>([]);
   // range.ob di /api/market?history=true, in prezzi ES con la loro basis delle 15:35.
   const [rangeEs, setRangeEs] = useState<Record<string, number> | null>(null);
 
@@ -187,7 +188,26 @@ export default function OperativitaPage() {
         const num = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
         const esf = num(j.esf);
         const spx = num(j.spx);
-        setMercato({ vwap: num(j.vwap), basis: esf != null && spx != null ? esf - spx : null });
+        // Basis: mediana degli ultimi 5 minuti del cash, come /market e
+        // /bookmap. Una lettura sola scarta di +-1,5 punti (ES e SPX non sono
+        // presi nello stesso istante), abbastanza da cambiare vertical al
+        // VWAP; dopo le 16:00 NY l'SPX resta fermo e la differenza non e'
+        // piu' la basis, quindi si tiene l'ultima del cash.
+        const ora: string | null = typeof j.sourceTime === 'string' ? j.sourceTime : null;
+        const misure = misureBasis.current;
+        // Un orario che torna indietro e' il giorno nuovo: si riparte.
+        if (ora && misure.length > 0 && ora < misure[misure.length - 1].ora) misure.length = 0;
+        if (esf != null && spx != null && ora && ora >= oraRomaDaNy('09:30') && ora <= oraRomaDaNy('16:00')
+          && (misure.length === 0 || ora > misure[misure.length - 1].ora)) {
+          const [h, mi, se] = ora.split(':').map(Number);
+          misure.push({ ora, sec: h * 3600 + mi * 60 + (se || 0), basis: esf - spx });
+          const ultimo = misure[misure.length - 1].sec;
+          while (misure.length > 0 && misure[0].sec < ultimo - 300) misure.shift();
+        }
+        const valori = misure.map((x) => x.basis).sort((a, b) => a - b);
+        const m = valori.length >> 1;
+        const basis = valori.length === 0 ? null : valori.length % 2 ? valori[m] : (valori[m - 1] + valori[m]) / 2;
+        setMercato({ vwap: num(j.vwap), basis });
       } catch (e) {
         console.error('Market fetch failed:', e);
       }
@@ -231,7 +251,9 @@ export default function OperativitaPage() {
 
   const livelli = useMemo((): { vwap: number | null; range: Livello[] } => {
     if (sim) return livelliSimulati();
-    const basisLive = mercato?.basis ?? null;
+    // Aperta la pagina dopo la chiusura non ci sono misure del cash: vale
+    // la basis delle 15:35, dello stesso giorno.
+    const basisLive = mercato?.basis ?? rangeEs?.basis ?? null;
     const vwap = mercato?.vwap != null && basisLive != null ? mercato.vwap - basisLive : null;
     // Le modifiche fatte a mano nel pannello Range di /market valgono piu' del
     // server, e la visibilita' scelta lì vale anche qui (come in /bookmap).
