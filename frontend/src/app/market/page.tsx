@@ -197,8 +197,12 @@ const crosshairPlugin = {
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
             ctx.moveTo(chart.crosshair.x, top);
             ctx.lineTo(chart.crosshair.x, bottom);
-            ctx.moveTo(left, chart.crosshair.y);
-            ctx.lineTo(right, chart.crosshair.y);
+            // L'orizzontale attraversa anche le scale dei prezzi: VIX a
+            // sinistra, colonna dello smile, ES/SPX/% a destra.
+            const yL = scales['y-left'];
+            const yR = scales['y-right'];
+            ctx.moveTo(yL ? yL.left : left, chart.crosshair.y);
+            ctx.lineTo(yR ? yR.right : right, chart.crosshair.y);
             ctx.stroke();
 
             // Draw axis labels
@@ -218,8 +222,32 @@ const crosshairPlugin = {
                 ctx.fillText(xLabel, chart.crosshair.x, bottom + 10);
             }
 
-            // Y-axis labels (optional, can be noisy with priceTagPlugin)
-            
+            // Il valore su ogni scala, all'altezza del cursore.
+            const y = chart.crosshair.y;
+            const tag = (testo: string, x: number, allinea: 'left' | 'right') => {
+                const w = ctx.measureText(testo).width + 8;
+                const x0 = allinea === 'left' ? x : x - w;
+                ctx.fillStyle = '#2a2e39';
+                ctx.fillRect(x0, y - 9, w, 18);
+                ctx.fillStyle = '#d1d4dc';
+                ctx.fillText(testo, x0 + w / 2, y);
+            };
+            if (yL) tag(yL.getValueForPixel(y).toFixed(2), yL.right, 'right');
+            if (yR) {
+                const es = yR.getValueForPixel(y);
+                tag(es.toFixed(2), yR.left, 'left');
+                const basis: number | null | undefined = chart.$basisSpx;
+                if (basis !== null && basis !== undefined) {
+                    const spx = es - basis;
+                    tag(spx.toFixed(2), yR.right - PCT_COL - 2, 'right');
+                    const apertura: number | null | undefined = chart.$aperturaSpx;
+                    if (apertura) {
+                        const pct = (spx / apertura - 1) * 100;
+                        tag(`${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`, yR.right, 'right');
+                    }
+                }
+            }
+
             ctx.restore();
         }
     }
@@ -2793,7 +2821,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, crosshairPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin]}
+                                plugins={[scaleBackgroundPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin, crosshairPlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">
