@@ -277,7 +277,7 @@ export default function OperativitaPage() {
     const min = Number(soglia);
     const tutti = (dati?.blocchi ?? []).filter((b) => b.size >= min).sort((a, b) => (a.t < b.t ? 1 : -1));
     const conta = new Map<string, number>();
-    for (const b of tutti) conta.set(`${b.k1}${b.lato}`, (conta.get(`${b.k1}${b.lato}`) ?? 0) + 1);
+    for (const b of tutti) conta.set(`${b.k1}-${b.k2}${b.lato}`, (conta.get(`${b.k1}-${b.k2}${b.lato}`) ?? 0) + 1);
     return { grossi: tutti, perVertical: conta };
   }, [dati, soglia]);
 
@@ -337,7 +337,7 @@ export default function OperativitaPage() {
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-xs">
                 <div>
                   <div className="text-slate-500 uppercase tracking-wider">Blocchi di vertical</div>
-                  <div className="text-[11px] text-slate-600">le due gambe nello stesso istante, stessa size; verso dal prezzo fra credito e debito</div>
+                  <div className="text-[11px] text-slate-600">vertical da 5 a 50 punti: le due gambe nello stesso istante, stessa size; verso dal prezzo fra credito e debito</div>
                 </div>
                 <Selettore
                   titolo="Almeno"
@@ -432,8 +432,8 @@ export default function OperativitaPage() {
                           <td className="px-2 py-1 text-right" style={{ color: isAtm ? GIALLO : centro >= 0 ? VERDE : ROSSO }}>
                             {isAtm && spot != null ? `SPX ${spot.toFixed(2)}` : `${centro >= 0 ? '+' : ''}${centro.toFixed(1)}`}
                           </td>
-                          <CellaLato l={v.call} grossi={perVertical.get(`${v.k1}C`) ?? 0} />
-                          <CellaLato l={v.put} grossi={perVertical.get(`${v.k1}P`) ?? 0} />
+                          <CellaLato l={v.call} grossi={perVertical.get(`${v.k1}-${v.k2}C`) ?? 0} />
+                          <CellaLato l={v.put} grossi={perVertical.get(`${v.k1}-${v.k2}P`) ?? 0} />
                         </tr>
                       );
                     })}

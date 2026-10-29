@@ -561,7 +561,7 @@ export default function MarketTidePage() {
         <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <div>
             <h1 className="text-2xl font-bold text-white">Market Tide</h1>
-            <p className="text-xs text-slate-500">SPX 0DTE · premio e volume netti, lato ask meno lato bid · solo locale</p>
+            <p className="text-xs text-slate-500">SPX 0DTE · premio e volume netti trade per trade, vertical contati una volta · solo locale</p>
           </div>
           <button
             onClick={() => router.push('/market')}
@@ -708,10 +708,13 @@ export default function MarketTidePage() {
               <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-400">
                 <div className="font-semibold text-slate-300 mb-1">Come è calcolato qui</div>
                 Non è tutto il mercato come su Unusual Whales: è la catena SPX 0DTE che segue il poller dei volumi (37 strike
-                attorno all&apos;ATM, call e put). IBKR non manda ogni trade con il suo lato, quindi quando il volume di un
-                contratto sale i contratti in più si attribuiscono confrontando l&apos;ultimo prezzo con bid e ask di quel
-                momento: oltre il 60% dello spread verso l&apos;ask contano come comprati, sotto il 40% come venduti, in mezzo
-                non contano. Premio = contratti × prezzo × 100. I contratti scambiati mentre il poller è fermo restano fuori.
+                attorno all&apos;ATM, call e put). Dal 29/10/2026 si conta trade per trade (RTVolume di IBKR): ogni
+                trade sopra il mid del bid/ask in vigore <span className="text-slate-300">prima</span> del trade è comprato,
+                sotto è venduto, al mid non conta. Le due gambe di un vertical (stesso lato, stessa size, nello stesso
+                istante) contano una volta sola, al prezzo dello spread: un vertical deep ITM da 3.000 contratti il 28/10
+                aveva fatto +40 milioni di NCP per uno spread che ne valeva al massimo 3. Prima si guardava il bid/ask dopo
+                il movimento, e quando SPX saliva le put sembravano comprate: la linea andava al contrario del mercato.
+                Premio = contratti × prezzo × 100. I contratti scambiati mentre il poller è fermo restano fuori.
               </div>
             </div>
           )}

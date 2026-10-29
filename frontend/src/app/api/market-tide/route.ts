@@ -27,7 +27,7 @@ interface Snapshot {
     time: string;
     spxPrice?: number | null;
     undPrice?: number | null;
-    tide?: { ncp: number; npp: number; ncv: number; npv: number };
+    tide?: { ncp: number; npp: number; ncv: number; npv: number; v?: number };
 }
 
 export interface TidePoint {
@@ -118,9 +118,13 @@ export async function GET(request: Request) {
         ? daDb
         : (readLocalSnapshots(date) ?? []).filter((s) => !since || s.time > since);
 
+    // Dalla versione 2 del poller (29/10/2026) il tide riparte da zero: in
+    // una giornata a cavallo si tengono solo i punti dell'ultima versione,
+    // o la linea salterebbe a meta' seduta.
+    const versione = Math.max(0, ...snapshots.map((s) => s.tide?.v ?? 1));
     const points: TidePoint[] = [];
     for (const s of snapshots) {
-        if (!s.tide) continue;
+        if (!s.tide || (s.tide.v ?? 1) !== versione) continue;
         points.push({
             time: s.time,
             spx: s.undPrice ?? s.spxPrice ?? null,

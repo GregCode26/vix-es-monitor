@@ -99,19 +99,27 @@ class MarketTide:
     E' il "Market Tide" di Unusual Whales, ma su quello che questo poller vede:
     la catena SPX 0DTE degli strike sottoscritti, non tutto il mercato.
 
-    IBKR non manda ogni trade con il suo lato. Manda il volume cumulato del
-    contratto, l'ultimo prezzo e il book: quando il volume sale, i contratti
-    in piu' si attribuiscono confrontando l'ultimo prezzo con bid e ask di
-    quel momento. Vicino all'ask conta come comprato, vicino al bid come
-    venduto, a meta' non conta. E' un'approssimazione: i tick di opzioni sono
-    campionati, e fra due aggiornamenti possono passare piu' trade.
+    Versione 2 (29/10/2026), trade per trade da RTVolume tramite
+    RilevaVerticali. La versione 1 attribuiva gli aumenti del volume cumulato
+    confrontando l'ultimo prezzo con il bid/ask di quel momento, e lo studio
+    del 29/10 (execution/studio_tide.py, 14 sessioni) ha trovato due errori:
+
+    1. andava al contrario del mercato: il bid/ask era gia' quello spostato
+       dal movimento, e quando SPX sale le put sembrano comprate e le call
+       vendute (correlazione con SPX nello stesso intervallo: NPP +0.16,
+       NCP -0.08; il Tide netto -0.28 sui 5 minuti). Qui ogni trade si
+       confronta con la quotazione in vigore PRIMA del trade;
+    2. le gambe dei vertical contavano due volte, a premio pieno: il 28/10 un
+       7670/7680 call deep ITM da 3.000 contratti fece +40 milioni di NCP, per
+       uno spread che ne valeva al massimo 3. Qui un vertical conta una volta,
+       per il suo prezzo e nel suo verso (comprato = premio pagato).
+
+    Trade al mid, o senza quotazione prima, non contano.
     """
 
-    VICINO_ASK = 0.6  # quota dello spread da bid verso ask
-    VICINO_BID = 0.4
+    VERSIONE = 2
 
     def __init__(self):
-        self.ultimo_volume = {}  # conId -> volume cumulato visto
         self.ncp = 0.0  # net call premium, $
         self.npp = 0.0  # net put premium, $
         self.ncv = 0    # net call volume, contratti
@@ -120,10 +128,13 @@ class MarketTide:
     def riprendi(self, snapshots):
         """Riparte dai totali dell'ultimo snapshot: un riavvio a meta' sessione
         non deve azzerare la giornata. I contratti scambiati mentre il poller
-        era giu' restano fuori, perche' il loro lato non si puo' piu' sapere."""
+        era giu' restano fuori, perche' il loro lato non si puo' piu' sapere.
+        Totali della versione 1 non si riprendono: si riparte da zero."""
         for snap in reversed(snapshots):
             tide = snap.get("tide")
             if tide:
+                if tide.get("v") != self.VERSIONE:
+                    return
                 self.ncp = float(tide.get("ncp", 0))
                 self.npp = float(tide.get("npp", 0))
                 self.ncv = int(tide.get("ncv", 0))
@@ -131,44 +142,37 @@ class MarketTide:
                 print(f"Market Tide ripreso dalle {snap.get('time')}: NCP {self.ncp:,.0f}, NPP {self.npp:,.0f}")
                 return
 
-    @staticmethod
-    def _valido(x):
-        return x is not None and x == x and x > 0
+    def _somma(self, lato, segno, prezzo, size):
+        premio = segno * prezzo * size * 100
+        if lato == 'C':
+            self.ncp += premio
+            self.ncv += segno * size
+        else:
+            self.npp += premio
+            self.npv += segno * size
 
-    def su_tickers(self, tickers):
-        for t in tickers:
-            c = t.contract
-            if c is None or c.secType != 'OPT':
-                continue
-            vol = t.volume
-            if vol is None or vol != vol:
-                continue
-            precedente = self.ultimo_volume.get(c.conId)
-            self.ultimo_volume[c.conId] = vol
-            # Il primo volume visto e' la base: quello che c'era prima non ha lato.
-            if precedente is None or vol <= precedente:
-                continue
-            nuovi = vol - precedente
-            prezzo, bid, ask = t.last, t.bid, t.ask
-            if not (self._valido(prezzo) and self._valido(bid) and self._valido(ask)) or ask <= bid:
-                continue
-            quota = (prezzo - bid) / (ask - bid)
-            if quota >= self.VICINO_ASK:
-                lato = 1
-            elif quota <= self.VICINO_BID:
-                lato = -1
-            else:
-                continue
-            premio = nuovi * prezzo * 100 * lato
-            if c.right == 'C':
-                self.ncp += premio
-                self.ncv += int(nuovi) * lato
-            else:
-                self.npp += premio
-                self.npv += int(nuovi) * lato
+    def trade(self, t):
+        """Un trade singolo (non gamba di un vertical): regola della quotazione."""
+        bid, ask = t["bid"], t["ask"]
+        if bid is None or ask is None:
+            return
+        mid = (bid + ask) / 2
+        if t["prezzo"] > mid + 1e-9:
+            self._somma(t["lato"], 1, t["prezzo"], t["size"])
+        elif t["prezzo"] < mid - 1e-9:
+            self._somma(t["lato"], -1, t["prezzo"], t["size"])
+
+    def vertical(self, v):
+        """Un vertical: una volta sola, al suo prezzo. Comprato = bull call o
+        bear put, cioe' premio pagato sul suo lato; venduto il contrario."""
+        if v["verso"] == "comprato":
+            self._somma(v["lato"], 1, v["prezzo"], v["size"])
+        elif v["verso"] == "venduto":
+            self._somma(v["lato"], -1, v["prezzo"], v["size"])
 
     def fotografia(self):
-        return {"ncp": round(self.ncp), "npp": round(self.npp), "ncv": self.ncv, "npv": self.npv}
+        return {"ncp": round(self.ncp), "npp": round(self.npp), "ncv": self.ncv, "npv": self.npv,
+                "v": self.VERSIONE}
 
 
 class LeeReady:
@@ -516,11 +520,11 @@ def main():
         _session_cache["date"] = oggi
         _session_cache["snapshots"] = read_session_file(oggi)
     tide.riprendi(_session_cache["snapshots"])
-    ib.pendingTickersEvent += tide.su_tickers
     lee_ready = LeeReady()
     lee_ready.riprendi(_session_cache["snapshots"])
     ib.pendingTickersEvent += lee_ready.su_tickers
-    rileva_verticali = RilevaVerticali(VERTICALI_DIR)
+    # I trade arrivano al tide da qui, dopo aver capito se erano gambe di un vertical.
+    rileva_verticali = RilevaVerticali(VERTICALI_DIR, tide)
     ib.pendingTickersEvent += rileva_verticali.su_tickers
 
     print("Subscribed. Starting poller loop...")

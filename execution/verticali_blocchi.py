@@ -1,4 +1,5 @@
-"""I vertical da 5 punti eseguiti sullo SPX 0DTE, riconosciuti dai singoli trade.
+"""I vertical eseguiti sullo SPX 0DTE, riconosciuti dai singoli trade, e il
+Market Tide calcolato sugli stessi trade.
 
 IBKR non dice quali trade delle opzioni sono gambe di un ordine multi-leg: il
 test del 27/10/2026 ha trovato i codici OPRA (`specialConditions`) vuoti in
@@ -7,9 +8,10 @@ SPXW (errore 10189). Resta RTVolume (tick generico 233), che da' prezzo e size
 di ogni trade sulle stesse linee di market data gia' aperte. Un vertical si
 riconosce cosi':
 
-1. due trade sullo stesso lato (call o put), strike K e K+5, stessa size,
-   arrivati entro FINESTRA_SEC: le gambe di un ordine complesso si stampano
-   insieme;
+1. due trade sullo stesso lato (call o put), strike K e K+L con L multiplo
+   di 5 fino a AMPIEZZA_MAX, stessa size, arrivati entro FINESTRA_SEC: le
+   gambe di un ordine complesso si stampano insieme. Fino al 28/10/2026 solo
+   L = 5, e il 7670/7680 da 3.000 contratti di quel giorno non si vedeva;
 2. il prezzo del vertical (gamba cara - gamba economica) sta fra il credito e
    il debito al naturale del bid/ask in vigore PRIMA dei trade, con
    TOLLERANZA: due ordini singoli che capitano insieme di rado fanno un
@@ -23,6 +25,10 @@ UNIONE_SEC diventano un blocco solo.
 
 I blocchi si accodano a `frontend/data/verticali/YYYY-MM-DD.ndjson`, che legge
 /api/verticali. Solo locale.
+
+Ogni trade, quando si sa se era una gamba o no, passa anche al Market Tide
+(`tide`, vedi MarketTide in tws_volumes_poller.py): i trade singoli uno per
+uno, i vertical una volta sola, con il loro prezzo e verso.
 """
 
 import json
@@ -32,7 +38,8 @@ from datetime import datetime
 FINESTRA_SEC = 0.5
 UNIONE_SEC = 1.0
 TOLLERANZA = 0.10
-AMPIEZZA = 5
+PASSO = 5
+AMPIEZZA_MAX = 50
 # Sotto questa size le coppie sono quasi tutte coincidenze (il 27/10, sui tick
 # della notte, 868 coppie su 955 erano di 1 contratto).
 SIZE_MIN = 5
@@ -43,8 +50,9 @@ def _valido(x):
 
 
 class RilevaVerticali:
-    def __init__(self, cartella):
+    def __init__(self, cartella, tide=None):
         self.cartella = cartella
+        self.tide = tide
         # conId -> (bid, ask) in vigore
         self.quote = {}
         # trade in attesa di essere accoppiati: dict con t, strike, lato, prezzo, size, bid, ask
@@ -76,7 +84,7 @@ class RilevaVerticali:
         # Sulle call vale di piu' lo strike basso, sulle put quello alto.
         cara, economica = (basso, alto) if a["lato"] == 'C' else (alto, basso)
         prezzo = round(cara["prezzo"] - economica["prezzo"], 2)
-        if not 0 <= prezzo <= AMPIEZZA:
+        if not 0 <= prezzo <= alto["strike"] - basso["strike"]:
             return None
         verso = "incerto"
         debito = credito = None
@@ -111,26 +119,33 @@ class RilevaVerticali:
                     break
                 if j in usati or b["lato"] != a["lato"] or b["size"] != a["size"]:
                     continue
-                if abs(b["strike"] - a["strike"]) != AMPIEZZA:
+                ampiezza = abs(b["strike"] - a["strike"])
+                if ampiezza == 0 or ampiezza > AMPIEZZA_MAX or ampiezza % PASSO:
                     continue
-                if migliore is None or b["t"] - a["t"] < self.attesa[migliore]["t"] - a["t"]:
-                    migliore = j
+                # La gamba piu' vicina nel tempo, a parita' la piu' stretta.
+                chiave = (b["t"] - a["t"], ampiezza)
+                if migliore is None or chiave < migliore[0]:
+                    migliore = (chiave, j)
             if migliore is not None and a["size"] >= SIZE_MIN:
-                v = self._vertical(a, self.attesa[migliore])
+                v = self._vertical(a, self.attesa[migliore[1]])
                 if v:
-                    usati.add(migliore)
+                    usati.add(migliore[1])
                     self._unisci(v)
+                    if self.tide:
+                        self.tide.vertical(v)
                     continue
             # Senza compagna: se e' ancora nella finestra di qualcuno piu'
             # giovane resta in attesa, altrimenti era un trade singolo.
             if adesso - a["t"] < 2 * FINESTRA_SEC:
                 restano.append(a)
+            elif self.tide:
+                self.tide.trade(a)
         self.attesa = [x for x in restano]
         self._chiudi(adesso, date_key)
 
     def _unisci(self, v):
         for b in self.aperti:
-            if (b["k1"], b["lato"], b["verso"]) == (v["k1"], v["lato"], v["verso"]) and v["ts"] - b["ts"] <= UNIONE_SEC:
+            if (b["k1"], b["k2"], b["lato"], b["verso"]) == (v["k1"], v["k2"], v["lato"], v["verso"]) and v["ts"] - b["ts"] <= UNIONE_SEC:
                 # Prezzo medio pesato sulle size, ora dell'ultimo pezzo.
                 b["prezzo"] = round((b["prezzo"] * b["size"] + v["prezzo"] * v["size"]) / (b["size"] + v["size"]), 2)
                 b["size"] += v["size"]

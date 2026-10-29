@@ -129,9 +129,11 @@ function sommaVolumi(verticali: Vertical[], blocchi: Blocco[]) {
         if (v.call) v.call.vol = { comprati: 0, venduti: 0, incerti: 0 };
         if (v.put) v.put.vol = { comprati: 0, venduti: 0, incerti: 0 };
     }
-    const perK1 = new Map(verticali.map((v) => [v.k1, v]));
+    // Solo i blocchi da 5 punti finiscono nelle righe; quelli piu' larghi
+    // (dal 29/10/2026) stanno solo nella lista.
+    const perStrike = new Map(verticali.map((v) => [`${v.k1}-${v.k2}`, v]));
     for (const b of blocchi) {
-        const v = perK1.get(b.k1);
+        const v = perStrike.get(`${b.k1}-${b.k2}`);
         const vol = (b.lato === 'C' ? v?.call : v?.put)?.vol;
         if (!vol) continue;
         vol[b.verso === 'comprato' ? 'comprati' : b.verso === 'venduto' ? 'venduti' : 'incerti'] += b.size;
