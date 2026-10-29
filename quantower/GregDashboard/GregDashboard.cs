@@ -186,6 +186,8 @@ namespace GregDashboard
             public double? ZAtm;
             public string Regime;
             public bool Sospeso;
+            /// <summary>Dopo la chiusura: niente curva, resta solo la traccia del vertice.</summary>
+            public bool Chiuso;
             public bool Est25;
             public double IvFermaSec;
             /// <summary>(secondi da mezzanotte ora locale, strike) a ogni cambio del vertice.</summary>
@@ -456,6 +458,7 @@ namespace GregDashboard
                 Base = Stringa(s, "base"),
                 Regime = Stringa(s, "regime"),
                 Sospeso = s.TryGetProperty("sospeso", out var so) && so.ValueKind == JsonValueKind.True,
+                Chiuso = s.TryGetProperty("chiuso", out var ch) && ch.ValueKind == JsonValueKind.True,
                 Est25 = s.TryGetProperty("est25", out var e25) && e25.ValueKind == JsonValueKind.True,
                 IvFermaSec = Numero(s, "ivFermaSec") ?? 0,
                 StoriaVertice = new List<(int, double)>(),
@@ -927,15 +930,27 @@ namespace GregDashboard
                 return;
             }
 
-            var punti = dati.Punti.Where(p => p.IvOtm != null).OrderBy(p => p.Strike).ToList();
-            if (punti.Count == 0)
-            {
-                IntestazioneSmile(g, dati, x0, x1, top);
-                return;
-            }
             var b = baseEs.Value;
             // Fuori dall'area si limita: GDI+ non regge coordinate enormi.
             float YDi(double strike) => (float)Math.Clamp(conv.GetChartY(strike + b), top - 50000, bottom + 50000);
+            var punti = dati.Punti.Where(p => p.IvOtm != null).OrderBy(p => p.Strike).ToList();
+            if (punti.Count == 0)
+            {
+                // A mercato chiuso la curva non c'e', la traccia IV MIN della giornata si'.
+                if (MostraIvMin && dati.StoriaVertice.Count > 0)
+                {
+                    var clip = g.Clip;
+                    var modoChiuso = g.SmoothingMode;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.SetClip(RectangleF.FromLTRB(area.Left, top, x1, bottom), CombineMode.Intersect);
+                    using var font9 = new Font("Arial", 9f, FontStyle.Regular, GraphicsUnit.Pixel);
+                    StoriaVertice(g, area, conv, dati, YDi, x1, font9);
+                    g.Clip = clip;
+                    g.SmoothingMode = modoChiuso;
+                }
+                IntestazioneSmile(g, dati, x0, x1, top);
+                return;
+            }
             bool Dentro(float y) => y >= top && y <= bottom;
             bool XDentro(float x) => x >= x0 + 2 && x <= x1 - 2;
             // La scala delle IV sugli strike che si vedono, non su tutta la catena.
@@ -1111,7 +1126,7 @@ namespace GregDashboard
             var coloreRegime = s.Regime == null ? grigio
                 : COLORE_REGIME.TryGetValue(s.Regime, out var cr) ? cr : ColorTranslator.FromHtml("#cbd5e1");
             righe.Add((true, coloreRegime,
-                s.Regime ?? (s.Sospeso ? $"SOSPESO dalle {OraLocaleDaNy(15, 15)}" : s.Base == "in raccolta" ? "IN RACCOLTA" : "IN CONFERMA")));
+                s.Regime ?? (s.Chiuso ? "MERCATO CHIUSO" : s.Sospeso ? $"SOSPESO dalle {OraLocaleDaNy(15, 15)}" : s.Base == "in raccolta" ? "IN RACCOLTA" : "IN CONFERMA")));
             if (s.IvAtm != null)
                 righe.Add((false, ColorTranslator.FromHtml("#94a3b8"), $"IV ATM {F1(s.IvAtm.Value)}%{(s.Em != null ? $" · 1σ {F1(s.Em.Value)}" : "")}"));
             if (s.VerticeStrike != null)
