@@ -1506,6 +1506,9 @@ export default function MarketPage() {
         if (!livello || !prendiTurno(adesso.getTime())) return;
         salvaScarichi(giorno, [...scarichi, { ...livello, quando: adesso.getTime() }]);
         const arrivo = descriviArrivo(dataPoints, livello, frecceAi);
+        // Quanto e' lungo il movimento rispetto all'1σ dello smile (Modifica 1).
+        const em = smileRef.current?.smile?.em ?? null;
+        const estensione = arrivo && em ? Math.round((arrivo.distanzaMax30m / em) * 100) / 100 : undefined;
 
         const freccia: FrecciaAi = { time: ultimo.time, esf: ultimo.esf, livello, bias: null };
         const aggiorna = (cambia: (f: FrecciaAi) => FrecciaAi) => setFrecceAi((tutte) => {
@@ -1523,7 +1526,7 @@ export default function MarketPage() {
                 const res = await fetch('/api/ai-signal', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ innesco: { livello: livello.nome, prezzoLivello: livello.valore, esf: ultimo.esf, ...arrivo } }),
+                    body: JSON.stringify({ innesco: { livello: livello.nome, prezzoLivello: livello.valore, esf: ultimo.esf, ...arrivo, em: em ?? undefined, estensione } }),
                 });
                 const json = await res.json();
                 if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);

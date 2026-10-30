@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { oraRoma, riassumi, SCHEMA_SEGNALE, SYSTEM_PROMPT, type Segnale } from '@/lib/aiSignal';
+import { oraRoma, riassumi, SCHEMA_SEGNALE, SYSTEM_PROMPT, type CampioneBookmap, type Innesco, type Segnale } from '@/lib/aiSignal';
 
 /**
  * POST /api/ai-signal — bias su ES (LONG/SHORT/NEUTRALE) da Claude, a titolo di studio.
@@ -37,21 +37,23 @@ async function leggi<T>(origin: string, percorso: string): Promise<T | null> {
     }
 }
 
-async function raccogli(origin: string) {
+async function raccogli(origin: string, innesco: Innesco | null = null) {
     // ?since= dove la route lo supporta: l'IV monitor pesa ~8 MB a sessione intera.
-    const [latest, storia, gex, iv, tide, hedging] = await Promise.all([
+    // Bookmap: gli ultimi 11 minuti a un campione al secondo, solo locale (~600 KB, niente Supabase).
+    const [latest, storia, gex, iv, tide, hedging, bookmap] = await Promise.all([
         leggi<Record<string, unknown>>(origin, '/api/market'),
         leggi<{ history: Record<string, unknown>[] }>(origin, '/api/market?history=true'),
         leggi<Parameters<typeof riassumi>[0]['gex']>(origin, '/api/gex?flow=0'),
         leggi<Parameters<typeof riassumi>[0]['iv']>(origin, `/api/iv-monitor?since=${oraRoma(16)}`),
         leggi<Parameters<typeof riassumi>[0]['tide']>(origin, `/api/market-tide?since=${oraRoma(31)}`),
         leggi<Record<string, unknown>>(origin, '/api/hedging-pressure'),
+        leggi<{ points?: CampioneBookmap[] }>(origin, `/api/bookmap?since=${oraRoma(11)}`),
     ]);
 
     if (!latest && !storia?.history?.length) return null;
     const riassunto = riassumi({
         market: { latest: latest as never, history: (storia?.history ?? []) as never },
-        gex, iv, tide, hedging,
+        gex, iv, tide, hedging, bookmap, innesco,
     });
     return { riassunto, esf: (latest as { esf?: number } | null)?.esf ?? null, gex: !!gex, hedging: !!hedging };
 }
@@ -156,17 +158,6 @@ function viaClaudeCode(riassunto: unknown): Promise<Esito> {
     });
 }
 
-type Innesco = {
-    livello: string;
-    prezzoLivello: number;
-    esf: number | null;
-    /** Come ci e' arrivato ES (lib/aiLivelli.ts `descriviArrivo`), dal 29/10/2026. */
-    lato?: 'da sotto' | 'da sopra';
-    esf10m?: number;
-    distanzaMax30m?: number;
-    contatto?: number;
-};
-
 const numero = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
 
 /** Il corpo facoltativo di /market (AI Livelli): il livello a cui ES e' arrivato. */
@@ -183,6 +174,8 @@ async function leggiInnesco(request: Request): Promise<Innesco | null> {
             esf10m: numero(i.esf10m),
             distanzaMax30m: numero(i.distanzaMax30m),
             contatto: numero(i.contatto),
+            em: numero(i.em),
+            estensione: numero(i.estensione),
         };
     } catch {
         return null; // senza corpo: il pulsante "Analizza ora"
@@ -191,9 +184,9 @@ async function leggiInnesco(request: Request): Promise<Innesco | null> {
 
 export async function POST(request: Request) {
     const innesco = await leggiInnesco(request);
-    const raccolto = await raccogli(new URL(request.url).origin);
+    const raccolto = await raccogli(new URL(request.url).origin, innesco);
     if (!raccolto) return NextResponse.json(NESSUN_DATO, { status: 503 });
-    const riassunto = innesco ? { ...raccolto.riassunto, innesco } : raccolto.riassunto;
+    const riassunto = raccolto.riassunto;
 
     const conChiave = !!(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
     let esito: Esito;
@@ -211,10 +204,11 @@ export async function POST(request: Request) {
         modello: esito.modello,
         via: conChiave ? 'api' : 'claude-code',
         fonti: {
-            gex: raccolto.gex, iv: !!riassunto.ivSpx0dte, tide: !!riassunto.marketTide, hedging: raccolto.hedging,
+            gex: raccolto.gex, iv: !!riassunto.ivSpx0dte, tide: !!riassunto.marketTide, hedging: raccolto.hedging, bookmap: !!riassunto.bookmapEs,
         },
         usage: esito.usage,
-        innesco,
+        // Con confluenze e basis calcolate qui (Modifica 1, 30/10/2026).
+        innesco: riassunto.innesco ?? innesco,
         segnale: esito.segnale,
     };
     try {
