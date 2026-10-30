@@ -60,6 +60,8 @@ interface Snapshot {
     spxPrice?: number | null;
     undPrice?: number | null;
     volumes: StrikeRow[];
+    /** Riga dell'anello esterno (volumes_esterni): entra nel profilo, non nella serie dello spot. */
+    esterno?: boolean;
 }
 
 /**
@@ -278,7 +280,7 @@ function elaboraSnapshot(
         if (!spot || !Number.isFinite(spot) || !Array.isArray(snap.volumes)) continue;
 
         const snapSec = toSeconds(snap.time);
-        if (snapSec - ultimoSpotSec >= SPOT_STEP_SEC) {
+        if (!snap.esterno && snapSec - ultimoSpotSec >= SPOT_STEP_SEC) {
             spotSerie.push({ time: orario, price: spot });
             ultimoSpotSec = snapSec;
         }
@@ -329,7 +331,7 @@ function elaboraSnapshot(
             fotografie.push({ time: orario, mappa: new Map(freschi(snapSec).map((r) => [r.strike, r])) });
             ultimaSerieSec = snapSec;
         }
-        ultimoValido = { time: orario, price: spot };
+        if (!snap.esterno) ultimoValido = { time: orario, price: spot };
     }
 
     // L'ultimo prezzo non deve aspettare il prossimo passo di campionamento:
@@ -405,6 +407,58 @@ function readLocalSnapshots(dateStr: string): Snapshot[] | null {
         }
     }
     return null;
+}
+
+/**
+ * L'anello esterno della catena: gli strike oltre i 37 in streaming, che il
+ * poller legge a rotazione e scrive una volta al minuto (tabella
+ * volumes_esterni, sql/007, oppure frontend/data/volumes-esterni/). Solo
+ * volume, open interest e gamma: niente Lee-Ready, quindi `gexLr` li' vale 0.
+ *
+ * Con `since` arrivano le righe dopo `since` PIU' l'ultima non oltre: il
+ * profilo di una risposta incrementale sostituisce quello del client, e senza
+ * quella riga gli strike esterni sparirebbero per i 50 s fra una riga e l'altra.
+ */
+async function leggiEsterni(dateStr: string, since: string | null): Promise<Snapshot[]> {
+    const daRiga = (r: { time: string; spx_price: number | null; und_price: number | null; volumes: unknown }): Snapshot =>
+        ({ time: r.time, spxPrice: r.spx_price, undPrice: r.und_price, volumes: r.volumes as StrikeRow[], esterno: true });
+    if (supabase) {
+        const righe: Snapshot[] = [];
+        let errore = false;
+        if (since) {
+            const { data, error } = await supabase
+                .from('volumes_esterni').select('time, spx_price, und_price, volumes')
+                .eq('date', dateStr).lte('time', since).order('time', { ascending: false }).limit(1);
+            if (error) errore = true;
+            else righe.push(...(data ?? []).map(daRiga));
+        }
+        // ~500 righe a sessione: una pagina basta, la seconda e' margine.
+        for (let from = 0; !errore && from < 2000; from += 1000) {
+            let q = supabase.from('volumes_esterni').select('time, spx_price, und_price, volumes')
+                .eq('date', dateStr).order('time', { ascending: true }).range(from, from + 999);
+            if (since) q = q.gt('time', since);
+            const { data, error } = await q;
+            if (error) { errore = true; break; }
+            righe.push(...(data ?? []).map(daRiga));
+            if (!data || data.length < 1000) break;
+        }
+        if (!errore && righe.length > 0) return righe;
+    }
+    const candidati = [
+        path.join(process.cwd(), 'data', 'volumes-esterni', `${dateStr}.ndjson`),
+        path.join(process.cwd(), 'frontend', 'data', 'volumes-esterni', `${dateStr}.ndjson`),
+    ];
+    for (const p of candidati) {
+        if (!fs.existsSync(p)) continue;
+        const tutte: Snapshot[] = [];
+        for (const l of fs.readFileSync(p, 'utf-8').split('\n')) {
+            try { const r = JSON.parse(l); tutte.push({ ...r, esterno: true }); } catch { /* riga a meta' */ }
+        }
+        if (!since) return tutte;
+        const prima = tutte.filter((r) => r.time <= since);
+        return [...prima.slice(-1), ...tutte.filter((r) => r.time > since)];
+    }
+    return [];
 }
 
 /**
@@ -519,15 +573,28 @@ export async function GET(request: Request) {
             }
         }
 
+        // `lastTime` resta quello degli snapshot in streaming: e' il `since` del
+        // giro dopo, e una riga esterna piu' recente lo farebbe saltare avanti.
+        const lastTime = snapshots.length > 0 ? snapshots[snapshots.length - 1].time : null;
+
+        // L'anello esterno entra nel cammino come snapshot con i soli suoi
+        // strike, dopo quello in streaming dello stesso secondo. Una risposta
+        // incrementale senza snapshot nuovi resta vuota come prima.
+        if (!since || snapshots.length > 0) {
+            const esterni = await leggiEsterni(targetDate, since);
+            if (esterni.length > 0) {
+                snapshots = [...snapshots, ...esterni].sort((a, b) =>
+                    a.time < b.time ? -1 : a.time > b.time ? 1 : Number(!!a.esterno) - Number(!!b.esterno));
+            }
+        }
+
         // Lo storico serve solo al primo caricamento, per non far aspettare
         // dieci minuti i pallini: dopo, il client ha gia' i profili che ha
         // ricevuto e se li tiene da solo. Con `since` la finestra e' larga
         // pochi secondi e non conterrebbe comunque niente.
         const { points, profile, spot, profileHistory, strikes, serie, conLr, inizioLr } = elaboraSnapshot(snapshots, targetDate, base, !since);
-        // `lastTime` e' l'ora di Roma dell'ultimo snapshot: il client la
-        // rimanda come `since`. I punti invece portano l'ora di New York,
-        // che e' quella su cui ragiona la pagina.
-        const lastTime = snapshots.length > 0 ? snapshots[snapshots.length - 1].time : null;
+        // `lastTime` (sopra) e' l'ora di Roma dell'ultimo snapshot: il client
+        // la rimanda come `since`.
 
         // Con `since` una risposta vuota e' normale: vuol dire solo che non
         // sono arrivati snapshot nuovi. Il 503 vale solo al primo caricamento.

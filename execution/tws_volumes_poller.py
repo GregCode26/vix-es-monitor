@@ -36,6 +36,18 @@ END_NY = (16, 0)
 # sessione si chiuda per ricentrarla: 8 strike da 5 punti = 40 punti, e ne
 # restano almeno 10 dal lato verso cui si muove.
 RICENTRA_DOPO_STRIKE = 8
+# Anello esterno, solo per il profilo GEX (volume, open interest e gamma):
+# altri 20 strike per lato oltre i 37 in streaming, letti a rotazione perche'
+# in streaming non ci stanno (IBKR da' ~100 linee e ne usiamo ~90). Volume e
+# OI sono totali del giorno, quindi leggerli ogni mezzo minuto non perde
+# niente; Lee-Ready, vertical, tide e smile invece vedono ogni trade e restano
+# sui 37 centrali. Sonda del 30/10/2026: volume, OI e gamma arrivano entro
+# 1,5 s dalla sottoscrizione, 8 linee in piu' senza errori.
+ESTERNI_PER_LATO = 20
+LOTTO_ESTERNI = 8          # contratti sottoscritti insieme
+TIENI_ESTERNI_SEC = 3      # quanto resta aperto un lotto prima di leggerlo
+ESTERNI_OGNI_SEC = 60      # una riga dell'anello al minuto, file e Supabase
+ESTERNI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend', 'data', 'volumes-esterni')
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -379,6 +391,127 @@ def push_snapshot_to_supabase(date_key, snapshot):
     except Exception as e:
         print(f"Error pushing snapshot to Supabase: {e}", file=sys.stderr)
 
+class AnelloEsterno:
+    """Gli strike oltre i 37 in streaming, sottoscritti a lotti e poi cancellati.
+
+    Ogni TIENI_ESTERNI_SEC si legge il lotto aperto (volume, OI, greche), si
+    cancella e si apre il successivo: 80 contratti a 8 per volta sono un giro
+    ogni ~40 s. Tiene l'ultimo valore visto di ogni contratto, e `righe()` li
+    mette nella stessa forma delle righe di `volumes` per /api/gex.
+
+    Nessun RTVolume (233): i loro trade non devono arrivare a vertical e tide.
+    """
+
+    def __init__(self, ib, contratti):
+        self.ib = ib
+        self.contratti = list(contratti)
+        self.conid = {c.conId for c in self.contratti}
+        self.pos = 0
+        self.lotto = LOTTO_ESTERNI
+        self.aperti = []
+        self.dal = 0
+        # (strike, right) -> {"vol", "oi", "gamma", "delta", "vega", "und"}
+        self.valori = {}
+        ib.errorEvent += self._errore
+
+    def _errore(self, req_id, code, msg, contract):
+        # 101 = troppe linee aperte: si dimezza il lotto invece di insistere.
+        if code == 101 and self.lotto > 2:
+            self.lotto = max(2, self.lotto // 2)
+            print(f"Anello esterno: limite di linee IBKR, lotto ridotto a {self.lotto}.", flush=True)
+
+    @staticmethod
+    def _num(x):
+        return float(x) if x is not None and x == x else None
+
+    def _leggi(self, t):
+        c = t.contract
+        v = self.valori.setdefault((c.strike, c.right), {})
+        vol = self._num(t.volume)
+        oi = self._num(t.callOpenInterest if c.right == 'C' else t.putOpenInterest)
+        if vol is not None and vol >= 0:
+            v["vol"] = int(vol)
+        if oi is not None and oi >= 0:
+            v["oi"] = int(oi)
+        g = t.modelGreeks
+        if g:
+            for nome, x in (("gamma", g.gamma), ("delta", g.delta), ("vega", g.vega), ("und", g.undPrice)):
+                x = self._num(x)
+                if x is not None:
+                    v[nome] = x
+
+    def avanza(self, adesso):
+        if self.aperti and adesso - self.dal < TIENI_ESTERNI_SEC:
+            return
+        for t in self.aperti:
+            self._leggi(t)
+            self.ib.cancelMktData(t.contract)
+        if not self.contratti:
+            self.aperti = []
+            return
+        lotto = [self.contratti[(self.pos + i) % len(self.contratti)] for i in range(min(self.lotto, len(self.contratti)))]
+        self.pos = (self.pos + len(lotto)) % len(self.contratti)
+        self.aperti = [self.ib.reqMktData(c, '100,101,106', False, False) for c in lotto]
+        self.dal = adesso
+
+    def righe(self):
+        """Una riga per strike con il gamma noto: calls/puts, callsOi/putsOi, greche."""
+        strike = sorted({k for k, _ in self.valori})
+        out = []
+        for s in strike:
+            c = self.valori.get((s, 'C'), {})
+            p = self.valori.get((s, 'P'), {})
+            gamma = c.get("gamma", p.get("gamma"))
+            if gamma is None:
+                continue
+            arr = lambda x, n: round(x, n) if x is not None else None
+            out.append({"strike": s, "calls": c.get("vol", 0), "puts": p.get("vol", 0),
+                        "gamma": arr(gamma, 8), "delta": arr(c.get("delta", p.get("delta")), 8),
+                        "vega": arr(c.get("vega", p.get("vega")), 8),
+                        "callsOi": c.get("oi", 0), "putsOi": p.get("oi", 0)})
+        return out
+
+    def und(self):
+        for v in self.valori.values():
+            if v.get("und"):
+                return round(v["und"], 2)
+        return None
+
+
+# Come per la colonna tide: se la tabella non c'e' ancora (sql/007 non
+# eseguito) si smette di provare per dieci minuti, il file locale resta.
+_tabella_esterni_manca_dal = None
+
+def scrivi_esterni(date_key, riga):
+    """Accoda la riga dell'anello esterno al file del giorno e la manda a Supabase."""
+    global _supabase_client, _tabella_esterni_manca_dal
+    try:
+        os.makedirs(ESTERNI_DIR, exist_ok=True)
+        with open(os.path.join(ESTERNI_DIR, f"{date_key}.ndjson"), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(riga, separators=(',', ':')) + "\n")
+    except Exception as e:
+        print(f"Error writing outer ring: {e}")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    if _tabella_esterni_manca_dal is not None and time.time() - _tabella_esterni_manca_dal < _RIPROVA_COLONNA_TIDE_SEC:
+        return
+    try:
+        if _supabase_client is None:
+            _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _supabase_client.table("volumes_esterni").upsert(
+            {"date": date_key, "time": riga["time"], "spx_price": riga["spxPrice"],
+             "und_price": riga["undPrice"], "volumes": riga["volumes"]},
+            on_conflict="date,time", returning="minimal").execute()
+        _tabella_esterni_manca_dal = None
+    except Exception as e:
+        if "volumes_esterni" in str(e) or "PGRST205" in str(e):
+            _tabella_esterni_manca_dal = time.time()
+            print("Tabella volumes_esterni assente su Supabase: l'anello esterno resta nel file locale "
+                  "finche' non si esegue sql/007_volumes_esterni.sql.", file=sys.stderr)
+        else:
+            print(f"Error pushing outer ring to Supabase: {e}", file=sys.stderr)
+
+
 def main():
     print("Starting Volumes Poller background service (IBKR TWS API)...")
     ensure_data_dir()
@@ -511,6 +644,21 @@ def main():
         ticker = ib.reqMktData(c, '100,101,106,233', False, False)
         option_tickers.append({"strike": c.strike, "right": c.right, "ticker": ticker})
 
+    # L'anello esterno: ESTERNI_PER_LATO strike per lato oltre quelli in
+    # streaming, qualificati una volta e poi sottoscritti a rotazione.
+    esterni_strike = (sorted_strikes[max(0, start_idx - ESTERNI_PER_LATO):start_idx]
+                      + sorted_strikes[end_idx:end_idx + ESTERNI_PER_LATO])
+    esterni_contratti = [Option('SPX', target_exp, k, r, 'CBOE', multiplier='100', tradingClass=chain.tradingClass)
+                         for k in esterni_strike for r in ('C', 'P')]
+    anello = AnelloEsterno(ib, ib.qualifyContracts(*esterni_contratti) if esterni_contratti else [])
+    print(f"Anello esterno: {len(anello.contratti)} contratti "
+          f"({esterni_strike[0] if esterni_strike else '-'}-{esterni_strike[-1] if esterni_strike else '-'}) a rotazione.")
+    ultimo_esterni = 0
+
+    def solo_catena(gestore):
+        """Il gestore senza i ticker dell'anello: per Lee-Ready e vertical esistono solo i 37 strike."""
+        return lambda tickers: gestore([t for t in tickers if t.contract is None or t.contract.conId not in anello.conid])
+
     # Il tide parte dai totali gia' salvati oggi, poi ascolta ogni aggiornamento
     # dei ticker: fra uno snapshot e l'altro (10 s) il volume cambia piu' volte,
     # e il lato va letto quando cambia, non dieci secondi dopo.
@@ -522,10 +670,10 @@ def main():
     tide.riprendi(_session_cache["snapshots"])
     lee_ready = LeeReady()
     lee_ready.riprendi(_session_cache["snapshots"])
-    ib.pendingTickersEvent += lee_ready.su_tickers
+    ib.pendingTickersEvent += solo_catena(lee_ready.su_tickers)
     # I trade arrivano al tide da qui, dopo aver capito se erano gambe di un vertical.
     rileva_verticali = RilevaVerticali(VERTICALI_DIR, tide)
-    ib.pendingTickersEvent += rileva_verticali.su_tickers
+    ib.pendingTickersEvent += solo_catena(rileva_verticali.su_tickers)
 
     print("Subscribed. Starting poller loop...")
 
@@ -703,10 +851,24 @@ def main():
                           f"visti in giornata: sottoscrizioni degradate, chiudo la sessione.")
                     return
 
+                if timestamp - ultimo_esterni >= ESTERNI_OGNI_SEC:
+                    righe_esterni = anello.righe()
+                    if righe_esterni:
+                        scrivi_esterni(today_key, {"time": time_str, "spxPrice": current_spx,
+                                                   "undPrice": anello.und() or und_price,
+                                                   "volumes": righe_esterni})
+                        ultimo_esterni = timestamp
+
                 last_poll = timestamp
         else:
             if now.second % 30 == 0:
                 print(f"[{now.strftime('%H:%M:%S')}] Outside active hours ({start_minutes//60}:{start_minutes%60:02d} to {end_minutes//60}:{end_minutes%60:02d}). Waiting...")
+
+        if is_active:
+            try:
+                anello.avanza(time.time())
+            except Exception as e:
+                print(f"Outer ring error: {e}")
 
         # Ogni secondo, non ogni 10: i trade si accoppiano entro mezzo secondo.
         try:
