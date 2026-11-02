@@ -6,6 +6,8 @@
  * centinaia di numeri, campionato a 1 minuto, con i livelli già calcolati.
  */
 
+import { oraRomaDaNy } from './orarioNy';
+
 export type Bias = 'LONG' | 'SHORT' | 'NEUTRALE';
 
 export interface Segnale {
@@ -14,7 +16,11 @@ export interface Segnale {
     orizzonte: string;
     sintesi: string;
     motivi: { fonte: string; osservazione: string; direzione: Bias }[];
-    livelli: { riferimento: number | null; invalidazione: number | null; obiettivo: number | null };
+    livelli: {
+        riferimento: number | null; invalidazione: number | null; obiettivo: number | null;
+        /** L'obiettivo proposto dal modello quando `limitaObiettivo` l'ha accorciato a 1R. */
+        obiettivoAi?: number | null;
+    };
     rischi: string[];
 }
 
@@ -48,6 +54,41 @@ export const SCHEMA_SEGNALE = {
         rischi: { type: 'array', items: { type: 'string' } },
     },
 };
+
+/**
+ * Obiettivo a 1R (02/11/2026). Nel check 27/10-02/11 i target del modello
+ * sono stati presi solo con R:R pianificato < 1,2 (5 su 5), mai sopra 1,3
+ * (0 su 8: stop o uscita a tempo, spesso dopo essere stati in guadagno).
+ * Oltre 1,2 volte il rischio l'obiettivo diventa riferimento +- rischio, e
+ * quello del modello resta in `obiettivoAi`.
+ */
+export const RR_MASSIMO = 1.2;
+export function limitaObiettivo(s: Segnale): Segnale {
+    const { riferimento: rif, invalidazione: inv, obiettivo: obi } = s.livelli ?? {};
+    if (s.bias === 'NEUTRALE' || rif == null || inv == null || obi == null) return s;
+    const verso = s.bias === 'LONG' ? 1 : -1;
+    const rischio = (rif - inv) * verso;
+    const premio = (obi - rif) * verso;
+    if (!(rischio > 0) || premio <= rischio * RR_MASSIMO) return s;
+    return { ...s, livelli: { ...s.livelli, obiettivo: Math.round((rif + verso * rischio) * 4) / 4, obiettivoAi: obi } };
+}
+
+/**
+ * Il verso della giornata dall'apertura del cash (9:30 NY): variazione di ES
+ * e lato del VWAP. 'ribasso'/'rialzo' solo con almeno 10 punti E il prezzo
+ * dalla stessa parte del VWAP, altrimenti 'laterale'.
+ */
+export function trendGiorno(storia: Riga[]) {
+    const apertura = oraRomaDaNy('09:30');
+    const primo = storia.find((p) => typeof p.time === 'string' && p.time >= apertura && typeof p.esf === 'number');
+    const ultimo = [...storia].reverse().find((p) => typeof p.esf === 'number');
+    if (!primo || !ultimo) return null;
+    const variazione = (ultimo.esf as number) - (primo.esf as number);
+    const vwap = typeof ultimo.vwap === 'number' ? ultimo.vwap : null;
+    const sopra = vwap == null ? null : (ultimo.esf as number) > vwap;
+    const verso = variazione >= 10 && sopra !== false ? 'rialzo' : variazione <= -10 && sopra !== true ? 'ribasso' : 'laterale';
+    return { esAperturaCash: r(primo.esf), variazioneDaApertura: r(variazione), vwap: r(vwap), sopraVwap: sopra, verso };
+}
 
 /** HH:MM:SS a Roma, `minuti` fa: è il fuso in cui i poller scrivono `time`. */
 export function oraRoma(minutiFa = 0): string {
@@ -255,6 +296,7 @@ export function riassumi(fonti: {
         ...(innesco ? { innesco: { ...innesco, confluenze: confluenze(innesco, profilo, hedging, basis), basisEsSpx: r(basis) } } : {}),
         es: {
             ultimo: market.latest,
+            trendGiorno: trendGiorno(storia),
             sessione: es.length
                 ? { primo: es[0], massimo: Math.max(...es), minimo: Math.min(...es), primoOrario: storia[0]?.time }
                 : null,
@@ -315,5 +357,6 @@ Regole:
 - Movimento passato contro prossimo (con innesco): market tide cumulato, VIX in salita o discesa, distanza dal VWAP, gex di flusso cumulato e massimi/minimi in fila descrivono il movimento che ha PORTATO il prezzo al livello, non quello dopo: da soli non bastano a dire che il livello si rompe. innesco.estensione = distanzaMax30m / em (em = 1 sigma da adesso alla chiusura delle 16:00 ET, in punti, dallo smile 0DTE): con estensione >= 0.6 al primo o secondo contatto il movimento e' gia' lungo e la reazione sul livello e' l'ipotesi di partenza; la continuazione richiede prove fresche degli ultimi 1-3 minuti in bookmapEs (delta ancora in accelerazione col prezzo che avanza, muri dalla parte del movimento spariti o assenti, niente assorbimenti contrari).
 - innesco.confluenze: strike pesanti (gamma, open interest, zone di pressione) a 3 punti ES dal livello. Una confluenza rinforza la tenuta del livello: pesala fra i motivi, non solo fra i rischi.
 - bookmapEs (se c'e'): delta e CVD minuto per minuto, muri limit vicini, muri spariti, assorbimenti. Vendite (o acquisti) forti col prezzo che non avanza piu' e muri dalla parte opposta = esaurimento; muri spariti dalla parte del livello = rottura piu' probabile. Cita i numeri.
-- livelli.riferimento = prezzo ES attuale; invalidazione = livello ES che smentirebbe il bias; obiettivo = livello ES plausibile. Con bias NEUTRALE puoi lasciarli a null.
+- Trend del giorno (es.trendGiorno, dall'apertura cash e rispetto al VWAP): un bias CONTRO il verso 'rialzo' o 'ribasso' (LONG in ribasso, SHORT in rialzo) richiede prove fresche di inversione negli ultimi 1-3 minuti di bookmapEs (delta girato col prezzo che segue, assorbimenti dalla parte del bias, muri contrari spariti) e anche cosi' confidenza al massimo 45; senza quelle prove rispondi NEUTRALE. Con estensione alta in una giornata di trend la reazione attesa sul livello e' una pausa, non un'inversione. Nel check 27/10-02/11 i LONG contro il trend sono stati 1 su 6.
+- livelli.riferimento = prezzo ES attuale; invalidazione = livello ES che smentirebbe il bias; obiettivo = il primo livello di reazione plausibile, a circa 1 volta il rischio (|obiettivo - riferimento| fra 0,8 e 1,2 volte |riferimento - invalidazione|), non un obiettivo lontano: i target piu' lontani di 1,2 volte il rischio non sono mai stati raggiunti. Con bias NEUTRALE puoi lasciarli a null.
 - Scrivi in italiano, conciso.`;

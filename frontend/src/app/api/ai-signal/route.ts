@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { oraRoma, riassumi, SCHEMA_SEGNALE, SYSTEM_PROMPT, type CampioneBookmap, type Innesco, type Segnale } from '@/lib/aiSignal';
+import { limitaObiettivo, oraRoma, riassumi, SCHEMA_SEGNALE, SYSTEM_PROMPT, type CampioneBookmap, type Innesco, type Segnale } from '@/lib/aiSignal';
 
 /**
  * POST /api/ai-signal — bias su ES (LONG/SHORT/NEUTRALE) da Claude, a titolo di studio.
@@ -209,7 +209,8 @@ export async function POST(request: Request) {
         usage: esito.usage,
         // Con confluenze e basis calcolate qui (Modifica 1, 30/10/2026).
         innesco: riassunto.innesco ?? innesco,
-        segnale: esito.segnale,
+        // Obiettivo accorciato a 1R se il modello l'ha messo piu' lontano (02/11/2026).
+        segnale: limitaObiettivo(esito.segnale),
     };
     try {
         fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
