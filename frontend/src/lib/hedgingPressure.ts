@@ -63,11 +63,18 @@ export function calculateProximityScale(spot: number, atmIv: number): number {
     // For intraday: roughly [BASE_SCALE_PERCENT]% of spot
     const baseScale = Math.max(HEDGING_PRESSURE_CONFIG.SCALE_FLOOR, spot * HEDGING_PRESSURE_CONFIG.BASE_SCALE_PERCENT);
 
-    // Adjust by IV: higher IV = wider relevant zone
-    const ivNorm = Math.max(0.1, atmIv); // Ensure non-zero
+    // Adjust by IV: higher IV = wider relevant zone.
+    //
+    // `atmIv` arriva in decimale (0.30 = 30%), mentre IV_NORMALIZATION e' in
+    // punti percentuali (25 = "25% e' la volatilita' normale"): va convertito,
+    // o il rapporto vale 0.012 e finisce sempre su MIN_IV_ADJUSTMENT. Fino al
+    // 03/11/2026 era cosi', e la scala restava inchiodata allo 0,5% dello spot
+    // con qualunque volatilita' (verificato sulle sessioni 27/10-02/11: l'IV
+    // non entrava mai nel peso di prossimita').
+    const ivPercento = Math.max(0.1, atmIv) * 100;
     const ivAdjustment = Math.max(
         HEDGING_PRESSURE_CONFIG.MIN_IV_ADJUSTMENT,
-        Math.min(HEDGING_PRESSURE_CONFIG.MAX_IV_ADJUSTMENT, ivNorm / HEDGING_PRESSURE_CONFIG.IV_NORMALIZATION)
+        Math.min(HEDGING_PRESSURE_CONFIG.MAX_IV_ADJUSTMENT, ivPercento / HEDGING_PRESSURE_CONFIG.IV_NORMALIZATION)
     );
 
     const finalScale = baseScale * ivAdjustment;

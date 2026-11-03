@@ -329,7 +329,11 @@ function elaboraSnapshot(snapshots: Snapshot[]): {
         }
 
         for (const row of snap.volumes) {
-            if (row.gamma == null || !Number.isFinite(row.gamma)) continue;
+            // gamma 0 non e' "gamma nullo": dopo la chiusura IBKR manda 0 su
+            // tutta la catena, e tenerlo azzerava l'intero profilo (03/11/2026:
+            // alle 22:00 tutte le pressioni valevano 0 e i "top strike"
+            // diventavano i primi cinque dell'array). Si tiene l'ultimo valido.
+            if (row.gamma == null || !Number.isFinite(row.gamma) || row.gamma === 0) continue;
 
             const vol = (row.calls ?? 0) - (row.puts ?? 0);
             const oi = (row.callsOi ?? 0) - (row.putsOi ?? 0);
@@ -463,13 +467,31 @@ export async function GET(request: Request) {
         // Identify risk zones
         const riskZones = identifyRiskZones(pressures);
 
-        // Build pressure history for top 5 strikes (for time-series visualization)
-        // Pick top 5 by absolute normalized pressure
+        /**
+         * I cinque strike di cui si manda lo storico: i piu' carichi per
+         * |pressione normalizzata|.
+         *
+         * Solo fra quelli con una pressione vera: a parita' di valore il sort
+         * lascia l'ordine dell'array, quindi quando le pressioni sono tutte
+         * uguali (chiusura, o un dato di gamma che non e' ancora arrivato) la
+         * vecchia versione sceglieva i cinque strike piu' BASSI della catena,
+         * lontanissimi dallo spot. Se non ne restano abbastanza si completa
+         * con i piu' vicini allo spot, che e' la scelta neutra.
+         */
+        const NUM_TOP_STRIKE = 5;
+        const perVicinanza = pressures
+            .map((p) => p.strike)
+            .sort((x, y) => Math.abs(x - latestSpot) - Math.abs(y - latestSpot));
         const topStrikes = pressures
-            .map((p, idx) => ({ ...p, normPressure: normalizedPressures[idx] }))
+            .map((p, idx) => ({ strike: p.strike, normPressure: normalizedPressures[idx], tot: p.totalPressure }))
+            .filter((p) => Number.isFinite(p.tot) && p.tot !== 0)
             .sort((a, b) => Math.abs(b.normPressure) - Math.abs(a.normPressure))
-            .slice(0, 5)
+            .slice(0, NUM_TOP_STRIKE)
             .map((p) => p.strike);
+        for (const strike of perVicinanza) {
+            if (topStrikes.length >= NUM_TOP_STRIKE) break;
+            if (!topStrikes.includes(strike)) topStrikes.push(strike);
+        }
 
         // Il riferimento di apertura per lo spostamento dello spot: e' il
         // primo punto della serie, che readSupabaseSnapshots mette apposta.
@@ -497,7 +519,7 @@ export async function GET(request: Request) {
 
                 for (const strike of topStrikes) {
                     const row = snap.volumes?.find((v) => v.strike === strike);
-                    if (!row || row.gamma == null) continue;
+                    if (!row || row.gamma == null || !Number.isFinite(row.gamma) || row.gamma === 0) continue;
 
                     // @ts-expect-error - atmIv is guaranteed to be a number from getAtmIv
                     const vanna = estimateVanna(row.vega, snapSpot, strike, atmIv, timeToExpiry);
@@ -506,7 +528,9 @@ export async function GET(request: Request) {
                     const vol = (row.calls ?? 0) - (row.puts ?? 0);
                     const gex = strikeGexStorico(row.gamma, vol, snapSpot);
 
-                    const scale = Math.max(1, snapSpot * 0.01 * Math.max(0.5, Math.min(2, atmIv / 25)));
+                    // Come calculateProximityScale: atmIv e' decimale, la
+                    // normalizzazione e' in punti percentuali.
+                    const scale = Math.max(1, snapSpot * 0.01 * Math.max(0.5, Math.min(2, (atmIv * 100) / 25)));
                     const distance = Math.abs(strike - snapSpot);
                     const proximity = distance === 0 ? 1 : Math.exp(-distance / scale);
 
