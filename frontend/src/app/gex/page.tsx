@@ -18,6 +18,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import { costruisciMappa, disegnaColonna, disegnaMappa, gradienteCss, LARGHEZZA_COLONNA, type MappaGex, type ModoMappa } from '@/lib/gexHeatmap';
 
 // Base registration (safe for SSR).
 // I *Controller servono quanto gli Element: qui il grafico si costruisce a
@@ -76,15 +77,6 @@ interface SpxHistoryPoint {
  * (e non si accorcia piu' fino a domani), cosi' niente esce dal grafico.
  */
 const FONDO_SCALA_M: Record<'volume' | 'oi', number> = { volume: 150000, oi: 10000 };
-
-/**
- * Sotto questa quota una riga non si disegna. Si misura sul muro piu' grande
- * della sessione, non sul fondo scala: il fondo scala e' tarato sulla fine
- * della giornata (150.000 M$ in volume), e il 16/09/2026 alle 16:47 lo strike
- * piu' grande valeva 4.544 M$ -- quota 0,17 -- quindi non si vedeva nessuna
- * riga. Spessore e colore restano invece sul metro fisso.
- */
-const SOGLIA_RIGA = 0.18;
 
 /**
  * Ogni quanto il client allunga la storia del profilo. E' lo stesso passo con
@@ -155,6 +147,16 @@ export default function GexPage() {
   // posizioni aperte (posizionamento, il GEX canonico). Ogni punto porta
   // gia' entrambi i valori, quindi il cambio e' istantaneo.
   const [gexBasis, setGexBasis] = useState<'volume' | 'oi'>('volume');
+  // Cosa colora la mappa: |GEX| sulla scala termica di Bookmap, il livello
+  // col segno (verde/rosa), o quanto e' cambiato negli ultimi `lookbackMin`
+  // minuti (ciano = si rafforza, arancio = si scioglie).
+  const [modoMappa, setModoMappa] = useState<ModoMappa>('termico');
+  // Lo slider di contrasto di Bookmap: >1 fa saturare prima, i muri piccoli escono.
+  const [contrasto, setContrasto] = useState(1);
+  const [lookbackMin, setLookbackMin] = useState<number>(10);
+  const [fondoMappa, setFondoMappa] = useState(0);
+  const lookbackRef = useRef(lookbackMin);
+  lookbackRef.current = lookbackMin;
   // La vista di partenza e' la sessione intera: da quando la pagina disegna
   // come i muri si sono costruiti, una finestra di cinque minuti nasconde
   // proprio la cosa che c'e' da guardare.
@@ -221,6 +223,10 @@ export default function GexPage() {
   const latestSpxHistory = useRef<SpxHistoryPoint[]>([]);
   const latestSerie = useRef<SerieFrame[]>([]);
   const latestStrikes = useRef<number[]>([]);
+  /** La mappa di calore pronta da disegnare: la costruisce buildDatasets, la disegna il plugin. */
+  const mappaRef = useRef<MappaGex | null>(null);
+  /** Ultima posizione del puntatore sul grafico, per leggere la mappa nel tooltip. */
+  const puntatoreRef = useRef<{ x: number; y: number } | null>(null);
   /** Lo storico del prezzo e' gia' stato scaricato per questa giornata. */
   const storicoPrezzo = useRef(false);
   /** I livelli delle 15:35 sono arrivati: non serve piu' rileggere lo storico. */
@@ -469,19 +475,6 @@ export default function GexPage() {
 
   const fondoScala = useRef({ ...FONDO_SCALA_M });
 
-  /** Quanto pesa un valore sul metro fermo, da 0 a 1. */
-  const quotaMuro = useCallback(
-    (valore: number) => Math.min(1, Math.sqrt(Math.abs(valore) / fondoScala.current[gexBasis])),
-    [gexBasis],
-  );
-
-  /** Il muro piu' grande della sessione sulla base corrente: lo aggiorna buildDatasets. */
-  const massimoSessione = useRef(0);
-  const muroVisibile = useCallback(
-    (valore: number) => massimoSessione.current > 0 && Math.sqrt(Math.abs(valore) / massimoSessione.current) >= SOGLIA_RIGA,
-    [],
-  );
-
   /**
    * Il metro con cui si disegna: assoluto, e per tutta la sessione non
    * torna mai indietro. Se si accorciasse quando i livelli calano, la stessa
@@ -600,7 +593,7 @@ export default function GexPage() {
     });
 
     return annotations;
-  }, [gexProfile, scalaDisegno, quotaMuro, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis]);
+  }, [gexProfile, scalaDisegno, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis]);
 
   // ─── Build datasets helper ───
   const buildDatasets = useCallback((currentSpxHistory: SpxHistoryPoint[], currentGexProfile: { strike: number; gex: number }[]) => {
@@ -623,83 +616,31 @@ export default function GexPage() {
     };
 
     if (viewMode === 'lines') {
-      // Un muro per strike, disegnato come una linea continua che attraversa
-      // la sessione cambiando colore e spessore man mano che il gamma si
-      // aggiunge o si toglie.
+      // Mappa di calore: uno strike per riga, il tempo in orizzontale, il
+      // colore che sfuma fra una fotografia e l'altra (lib/gexHeatmap.ts).
       //
-      // Prima erano quadretti staccati, uno ogni due minuti: la taglia la
-      // dicevano, ma a leggerli bisognava ricomporli con l'occhio. Una linea
-      // sola dice la stessa cosa e in piu' mostra il verso -- si ingrossa
-      // mentre il muro si costruisce, si assottiglia mentre si scioglie.
-      //
-      // Il valore sta dentro ogni punto (`v`), non in una variabile catturata:
-      // l'aggiornamento imperativo sostituisce solo `data`, quindi una
-      // chiusura su un array esterno resterebbe indietro di un giro e
-      // colorerebbe i segmenti con i numeri di prima.
+      // Prima era una linea per strike spezzata in tratti di due minuti, ogni
+      // tratto colorato col valore alla sua fine e acceso solo sopra una
+      // soglia: il muro cambiava a scatti e crescita e calo si leggevano solo
+      // dallo spessore. La mappa si disegna sotto i dataset da un plugin, che
+      // la legge da `mappaRef`; qui resta solo il prezzo.
       const strikeSerie = latestStrikes.current;
-      const serieOra = latestSerie.current;
-
-      const valoreDi = (ctx: { chart?: { data?: { datasets?: { data?: { v?: number }[] }[] } }; datasetIndex?: number; p1DataIndex?: number }) =>
-        ctx.chart?.data?.datasets?.[ctx.datasetIndex ?? 0]?.data?.[ctx.p1DataIndex ?? 0]?.v ?? 0;
-
-      massimoSessione.current = serieOra.reduce((m, f) => {
-        for (const v of gexBasis === 'oi' ? f.gexOi : f.gex) if (Math.abs(v) > m) m = Math.abs(v);
-        return m;
-      }, 0);
-
-      const muri = [];
-      for (let i = 0; i < strikeSerie.length; i++) {
-        const strike = strikeSerie[i];
-        const punti: { x: Date; y: number; v: number }[] = [];
-        let massimo = 0;
-        for (const f of serieOra) {
-          const t = f.time.includes(':') ? f.time : `${f.time}:00`;
-          const x = new Date(`${todayStr}T${t}`);
-          if (isNaN(x.getTime())) continue;
-          const v = (gexBasis === 'oi' ? f.gexOi : f.gex)[i] ?? 0;
-          if (Math.abs(v) > massimo) massimo = Math.abs(v);
-          punti.push({ x, y: strike, v });
-        }
-        // Uno strike che non ha mai contato non merita una linea: sarebbero
-        // trentasette dataset di cui venti invisibili.
-        if (punti.length === 0 || !muroVisibile(massimo)) continue;
-
-        muri.push({
-          type: 'line' as const,
-          chiave: `muro-${strike}`,
-          // Una sola voce in legenda per tutti: le altre resterebbero
-          // trenta caselle senza nome.
-          label: muri.length === 0 ? 'Muri per strike' : '',
-          data: punti,
-          xAxisID: 'xTime', yAxisID: 'y',
-          pointRadius: 0,
-          pointHoverRadius: 4,
-          fill: false,
-          tension: 0,
-          borderColor: 'rgba(148, 163, 184, 0.5)',
-          borderWidth: 1,
-          order: 5,
-          segment: {
-            borderColor: (ctx: Parameters<typeof valoreDi>[0]) => {
-              const v = valoreDi(ctx);
-              const q = quotaMuro(v);
-              // Sotto la soglia il muro non c'e' ancora: la linea non si
-              // interrompe, semplicemente non si vede, e si accende quando
-              // il livello comincia a contare.
-              if (!muroVisibile(v)) return 'rgba(0, 0, 0, 0)';
-              const opacita = 0.15 + q * 0.8;
-              return v > 0 ? `rgba(34, 197, 94, ${opacita})` : `rgba(239, 68, 68, ${opacita})`;
-            },
-            borderWidth: (ctx: Parameters<typeof valoreDi>[0]) => {
-              const v = valoreDi(ctx);
-              return muroVisibile(v) ? 1 + quotaMuro(v) * 13 : 0;
-            },
-          },
-        });
+      const fotogrammi = latestSerie.current.map((f) => {
+        const t = f.time.includes(':') ? f.time : `${f.time}:00`;
+        return { t: new Date(`${todayStr}T${t}`).getTime(), valori: gexBasis === 'oi' ? f.gexOi : f.gex };
+      }).filter((f) => !isNaN(f.t));
+      // L'ultima colonna e' il profilo di adesso, non la fotografia di due
+      // minuti fa: cosi' il bordo destro della mappa e' il muro attuale.
+      const ultimoT = lastGexTime.current ? new Date(`${todayStr}T${lastGexTime.current}`).getTime() : NaN;
+      const ultimaFoto = fotogrammi[fotogrammi.length - 1];
+      if (!isNaN(ultimoT) && strikeSerie.length > 0 && currentGexProfile.length > 0 && (!ultimaFoto || ultimoT > ultimaFoto.t)) {
+        const mappa = new Map(currentGexProfile.map((r) => [r.strike, r.gex]));
+        fotogrammi.push({ t: ultimoT, valori: strikeSerie.map((k) => mappa.get(k) ?? 0) });
       }
-
-      return [...muri, priceDataset];
+      mappaRef.current = costruisciMappa(strikeSerie, fotogrammi, modoMappa, lookbackMin, contrasto);
+      return [priceDataset];
     }
+    mappaRef.current = null;
 
     // Il divisore era 15, con i valori in M$: sopra i 15 M$ -- cioe' sempre,
     // visto che a fine sessione uno strike ATM ne fa decine di migliaia -- il
@@ -728,7 +669,7 @@ export default function GexPage() {
       borderWidth: 1, barThickness: 8, indexAxis: 'y' as const,
     };
     return [priceDataset, posGexDataset, negGexDataset];
-  }, [viewMode, gexBasis, quotaMuro, muroVisibile]);
+  }, [viewMode, gexBasis, modoMappa, lookbackMin, contrasto]);
 
   const handleTimeWindowChange = useCallback((w: number | 'all') => {
     setTimeWindow(w);
@@ -787,6 +728,8 @@ export default function GexPage() {
         responsive: true,
         maintainAspectRatio: false,
         animation: false as const,
+        // Spazio a destra della scala per la colonna del profilo (stile COB).
+        layout: { padding: { right: viewMode === 'lines' ? LARGHEZZA_COLONNA : 0 } },
         scales: {
           xTime: {
             type: 'time' as const, position: 'bottom' as const,
@@ -839,6 +782,24 @@ export default function GexPage() {
                 }
                 return `${l}: ${ctx.parsed.x.toFixed(2)} M$`;
               },
+              // Il muro sotto il puntatore, letto dalla mappa: valore e
+              // variazione sul lookback scelto.
+              afterBody: (items: any[]) => {
+                const mappa = mappaRef.current;
+                const p = puntatoreRef.current;
+                const c = items[0]?.chart as ChartJS | undefined;
+                if (!mappa || !p || !c) return '';
+                const t = (c.scales as any).xTime?.getValueForPixel(p.x);
+                const k = (c.scales as any).y?.getValueForPixel(p.y);
+                if (t == null || k == null) return '';
+                const r = mappa.leggi(t, k);
+                if (!r) return '';
+                const bn = (v: number) => `${v >= 0 ? '+' : ''}${(v / 1000).toFixed(2)} Bn`;
+                return [
+                  `Strike ${r.strike}: ${bn(r.valore)}`,
+                  `|GEX| in ${lookbackRef.current}m: ${bn(r.delta)}${r.delta > 0 ? ' (si rafforza)' : r.delta < 0 ? ' (si indebolisce)' : ''}`,
+                ];
+              },
             },
           },
           zoom: {
@@ -862,6 +823,20 @@ export default function GexPage() {
           },
         },
       } as any,
+      plugins: [{
+        id: 'mappaGex',
+        // Sotto i dataset: prezzo e livelli restano sopra la mappa.
+        beforeDatasetsDraw: (c: ChartJS) => {
+          if (mappaRef.current) disegnaMappa(c as any, mappaRef.current);
+        },
+        afterDraw: (c: ChartJS) => {
+          if (mappaRef.current) disegnaColonna(c as any, mappaRef.current);
+        },
+        afterEvent: (_c: ChartJS, args: { event: { type: string; x: number | null; y: number | null } }) => {
+          const ev = args.event;
+          puntatoreRef.current = ev.type === 'mouseout' || ev.x == null || ev.y == null ? null : { x: ev.x, y: ev.y };
+        },
+      }],
     });
 
     chartRef.current = chart;
@@ -998,6 +973,7 @@ export default function GexPage() {
     if (!chart) return;
 
     const newDatasets = buildDatasets(spxHistory, gexProfile);
+    setFondoMappa(mappaRef.current?.fondo ?? 0);
 
     // Si aggiorna sul posto solo se nella stessa posizione c'e' lo stesso
     // dataset: i muri visibili cambiano di numero durante la sessione, e
@@ -1091,7 +1067,7 @@ export default function GexPage() {
               onClick={() => setViewMode('lines')}
               className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${viewMode === 'lines' ? 'bg-slate-800 text-teal-400 shadow-md border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
             >
-              Heatmap Lines (Photo)
+              Heatmap
             </button>
             <button
               onClick={() => setViewMode('bars')}
@@ -1144,14 +1120,65 @@ export default function GexPage() {
         </div>
 
         {viewMode === 'lines' && (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] font-medium text-slate-300 bg-slate-900/60 px-4 py-2 rounded-lg border border-slate-700/80 shadow-sm">
-            <span className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-blue-500/80 border border-blue-400" /> Addition (GEX+)</span>
-            <span className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-fuchsia-500/80 border border-fuchsia-400" /> Subtraction (GEX-)</span>
-            <span className="text-slate-500">|</span>
-            <span className="text-slate-400">Bubble size = Activity Volume</span>
-            <span className="text-slate-500">|</span>
-            <span className="flex items-center gap-2"><span className="w-4 h-1.5 bg-green-500 rounded-sm" /> Major Call Wall</span>
-            <span className="flex items-center gap-2"><span className="w-4 h-1.5 bg-red-500 rounded-sm" /> Major Put Wall</span>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] font-medium text-slate-300 bg-slate-900/60 px-3 py-2 rounded-lg border border-slate-700/80 shadow-sm">
+            <div className="flex items-center gap-1 bg-slate-950/60 p-0.5 rounded-md border border-slate-800">
+              {(['termico', 'livello', 'variazione'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setModoMappa(m)}
+                  title={m === 'termico'
+                    ? "Scala termica stile Bookmap su |GEX|: blu poco, giallo-arancio tanto, bianco il massimo. Il segno e' nella colonna a destra"
+                    : m === 'livello'
+                    ? "Colore = GEX cumulato dello strike: piu' chiaro, muro piu' grande"
+                    : "Colore = quanto |GEX| e' cambiato negli ultimi minuti: ciano si rafforza, arancio si indebolisce"}
+                  className={`px-2.5 py-1 text-[11px] font-semibold rounded transition-all ${modoMappa === m ? 'bg-slate-800 text-teal-400 border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
+                >
+                  {m === 'termico' ? 'Termico' : m === 'livello' ? 'Livello' : 'Variazione'}
+                </button>
+              ))}
+            </div>
+            {modoMappa === 'variazione' && (
+              <div className="flex items-center gap-1 bg-slate-950/60 p-0.5 rounded-md border border-slate-800" title="Su quanti minuti si misura la variazione">
+                {[2, 10, 30].map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setLookbackMin(m)}
+                    className={`px-2 py-1 text-[11px] font-semibold rounded transition-all ${lookbackMin === m ? 'bg-slate-800 text-teal-400 border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
+                  >
+                    {m}m
+                  </button>
+                ))}
+              </div>
+            )}
+            {modoMappa !== 'variazione' && (
+              <label className="flex items-center gap-2 whitespace-nowrap text-slate-400" title="Contrasto: verso destra i muri piccoli si accendono e i grandi saturano">
+                Contrasto
+                <input
+                  type="range" min={0.3} max={4} step={0.05} value={contrasto}
+                  onChange={(e) => setContrasto(Number(e.target.value))}
+                  onDoubleClick={() => setContrasto(1)}
+                  className="w-24 accent-sky-500"
+                />
+              </label>
+            )}
+            {modoMappa === 'termico' ? (
+              <span className="flex items-center gap-2 whitespace-nowrap">|GEX| basso<span className="w-28 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('termico', 'pos') }} />alto</span>
+            ) : modoMappa === 'livello' ? (
+              <>
+                <span className="flex items-center gap-2 whitespace-nowrap">GEX−<span className="w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('livello', 'neg').replace('to right', 'to left') }} /></span>
+                <span className="flex items-center gap-2 whitespace-nowrap"><span className="w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('livello', 'pos') }} />GEX+</span>
+              </>
+            ) : (
+              <>
+                <span className="flex items-center gap-2 whitespace-nowrap">Si indebolisce<span className="w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('variazione', 'neg').replace('to right', 'to left') }} /></span>
+                <span className="flex items-center gap-2 whitespace-nowrap"><span className="w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('variazione', 'pos') }} />Si rafforza</span>
+              </>
+            )}
+            {fondoMappa > 0 && (
+              <span className="text-slate-500 font-mono text-[10px] whitespace-nowrap" title={modoMappa === 'livello' ? "Il colore pieno: il muro piu' grande della sessione" : "Il colore pieno: 98° percentile delle variazioni della sessione"}>
+                pieno = {modoMappa === 'variazione' ? '±' : ''}{(fondoMappa / 1000).toFixed(1)} Bn
+              </span>
+            )}
             {currentBasis !== 0 && (
               <>
                 <span className="text-slate-500">|</span>
