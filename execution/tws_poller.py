@@ -283,6 +283,16 @@ _colonna_iv_manca_dal = None
 _RIPROVA_COLONNA_IV_SEC = 600
 
 
+def _prezzo_valido(ticker):
+    """Ultimo prezzo di un indice, None se manca (mai NaN nel file)."""
+    if ticker is None:
+        return None
+    for v in (ticker.marketPrice(), ticker.last, ticker.close):
+        if v and v == v and v > 0:
+            return round(float(v), 2)
+    return None
+
+
 def push_to_supabase(point):
     if not SUPABASE_URL or not SUPABASE_KEY or SUPABASE_URL == "YOUR_SUPABASE_URL":
         return
@@ -322,6 +332,63 @@ def push_to_supabase(point):
             supabase.table("market_data").insert(data, returning="minimal").execute()
     except Exception as e:
         print(f"Error pushing to Supabase: {e}", file=sys.stderr)
+
+# Chiusure di ieri degli indici di vol CBOE, per il contesto di /api/vol
+# (studio_vol.py: la term structure della sera prima prevede l'ampiezza del
+# giorno, non la direzione). Richieste storiche, non linee di market data:
+# 5 per aggiornamento, a 3 s l'una dall'altra, e si aggiorna solo quando e'
+# finita una seduta nuova (dopo le 16:20 NY) -> 5-10 richieste al giorno,
+# lontanissime dal limite IBKR di 60 ogni 10 minuti.
+INDICI_VOL = ['VIX', 'VIX9D', 'VIX3M', 'VIX1D', 'SKEW']
+FILE_CHIUSURE = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'vol', 'chiusure.json')
+
+
+def _ultima_fine_seduta_ny():
+    """L'ultimo istante 16:20 di New York gia' passato (oggi o ieri)."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    ny = datetime.now(ZoneInfo('America/New_York'))
+    fine = ny.replace(hour=16, minute=20, second=0, microsecond=0)
+    return fine if ny >= fine else fine - timedelta(days=1)
+
+
+def chiusure_da_aggiornare():
+    try:
+        with open(FILE_CHIUSURE, encoding='utf-8') as f:
+            scritto = json.load(f).get('scritto', 0)
+    except Exception:
+        return True
+    return scritto < _ultima_fine_seduta_ny().timestamp()
+
+
+def aggiorna_chiusure_vol(ib):
+    from zoneinfo import ZoneInfo
+    ny = datetime.now(ZoneInfo('America/New_York'))
+    finita_oggi = ny.hour * 60 + ny.minute >= 16 * 60 + 15
+    print(f"Chiusure indici vol: {len(INDICI_VOL)} richieste storiche giornaliere, 3 s fra l'una e l'altra")
+    chiusure = {}
+    for i, simbolo in enumerate(INDICI_VOL):
+        if i:
+            ib.sleep(3)
+        try:
+            c = Index(simbolo, 'CBOE', 'USD')
+            if not ib.qualifyContracts(c):
+                continue
+            barre = ib.reqHistoricalData(c, endDateTime='', durationStr='10 D', barSizeSetting='1 day',
+                                         whatToShow='TRADES', useRTH=True, formatDate=1, timeout=30)
+            # Solo sedute finite: la barra di oggi prima delle 16:15 NY e' parziale.
+            finite = [b for b in barre if str(b.date) < ny.strftime('%Y-%m-%d') or finita_oggi]
+            if finite:
+                chiusure[simbolo] = {'data': str(finite[-1].date), 'chiusura': finite[-1].close}
+        except Exception as e:
+            print(f"  {simbolo}: {e}")
+    if not chiusure:
+        return
+    os.makedirs(os.path.dirname(FILE_CHIUSURE), exist_ok=True)
+    with open(FILE_CHIUSURE, 'w', encoding='utf-8') as f:
+        json.dump({'scritto': time.time(), 'chiusure': chiusure}, f)
+    print("  " + ", ".join(f"{k} {v['chiusura']} ({v['data']})" for k, v in chiusure.items()))
+
 
 def main():
     print("Starting Market Poller background service (IBKR TWS API)...")
@@ -378,6 +445,11 @@ def main():
     ib.qualifyContracts(spx_contract)
     spx_ticker = ib.reqMktData(spx_contract, '', False, False)
 
+    # VIX1D: la vol a 1 giorno, per le bande e le divergenze di /api/vol
+    # (studio_vol_intraday.py). Una linea di market data in piu'.
+    vix1d_contract = Index('VIX1D', 'CBOE')
+    vix1d_ticker = ib.reqMktData(vix1d_contract, '', False, False) if ib.qualifyContracts(vix1d_contract) else None
+
     # Initialize option greeks variables
     vol_tide_score = 100.0
     # Il cono e' di giornata: se oggi era gia' stato fissato prima di questo
@@ -405,6 +477,7 @@ def main():
     ib.sleep(3) # Wait for initial data
 
     giorno_sessione = get_today_key()
+    prossime_chiusure = 0
 
     while True:
         # A mezzanotte la sessione finisce: gli strike ATM e le scadenze
@@ -422,6 +495,14 @@ def main():
         
         # Ensure we process incoming IBKR messages to keep subscriptions alive
         ib.sleep(POLL_INTERVAL)
+
+        # Se IBKR non risponde si riprova fra 10 minuti, non a ogni giro.
+        if timestamp >= prossime_chiusure and chiusure_da_aggiornare():
+            prossime_chiusure = timestamp + 600
+            try:
+                aggiorna_chiusure_vol(ib)
+            except Exception as e:
+                print(f"Chiusure indici vol non aggiornate: {e}")
 
         if is_active:
             # We get marketPrice() which uses last price, or bid/ask average if last price is not available
@@ -609,6 +690,7 @@ def main():
                     "spxAtmStrike": spx_atm_strike,
                     "spxRef": spx_ref,
                     "vwap": esf_vwap,
+                    "vix1d": _prezzo_valido(vix1d_ticker),
                 }
                 
                 # Save locally

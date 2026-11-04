@@ -170,8 +170,22 @@ export const VolflowChartPanel: React.FC<VolflowChartPanelProps> = ({
     // formula di PriceChart (indice / candles.length): e' cosi' che i due
     // riquadri condividono l'asse dei tempi.
     if (volflowHistory && volflowHistory.length > 0 && candles.length > 0) {
-      const indicePerIstante = new Map<number, number>();
-      candles.forEach((c, i) => indicePerIstante.set(c.timestamp, i));
+      // Prezzi e volumi vengono da due poller con orologi diversi (un punto
+      // ogni ~20 s il primo, ogni ~10 s il secondo): cercando la candela con
+      // lo STESSO istante il 02/11/2026 se ne trovavano 118 su 1.737, e il
+      // pannello disegnava il 7% delle letture. Ogni lettura va invece
+      // sull'ultima candela non successiva, se non e' piu' vecchia di un minuto.
+      const indiceDi = (ts: number): number | undefined => {
+        let basso = 0;
+        let alto = candles.length - 1;
+        if (ts < candles[0].timestamp) return undefined;
+        while (basso < alto) {
+          const medio = (basso + alto + 1) >> 1;
+          if (candles[medio].timestamp <= ts) basso = medio;
+          else alto = medio - 1;
+        }
+        return ts - candles[basso].timestamp <= 60_000 ? basso : undefined;
+      };
 
       interface Gruppo {
         somma: number;
@@ -184,8 +198,8 @@ export const VolflowChartPanel: React.FC<VolflowChartPanelProps> = ({
       const gruppi = new Map<number, Gruppo>();
 
       volflowHistory.forEach((punto) => {
-        const index = indicePerIstante.get(punto.timestamp);
-        if (index === undefined) return; // candela gia' uscita dalla finestra
+        const index = indiceDi(punto.timestamp);
+        if (index === undefined) return; // fuori dalla finestra delle candele, o in un buco
         const chiave = Math.floor(punto.timestamp / intervalloMs);
         const v = Math.max(-100, Math.min(100, punto.value));
         const g = gruppi.get(chiave);

@@ -24,6 +24,8 @@ import { minutiRomaDaNy } from '@/lib/orarioNy';
 
 interface PuntoMercato {
   time?: string;
+  /** Solo nell'ultimo punto (/api/market senza history): l'orario della riga. */
+  sourceTime?: string | null;
   vix?: number | null;
   esf?: number | null;
   spx?: number | null;
@@ -147,11 +149,48 @@ export class RealDataProvider {
   private storicoVolflow: IngressoVolflow[] = [];
   /** Ultimo motivo per cui un punto non era utilizzabile, per la UI. */
   public ultimoAvviso: string | null = null;
+  /** L'ultimo punto dello storico: in una giornata passata e' lo "spot". */
+  private ultimoStorico: PuntoMercato | null = null;
+  /** ES - SPX dei punti a cash aperto, i piu' recenti in fondo. */
+  private basiCash: number[] = [];
+  private aperturaCashMin: number;
+  private chiusuraCashMin: number;
 
-  constructor() {
-    const oggi = new Date();
-    oggi.setHours(0, 0, 0, 0);
-    this.todayMs = oggi.getTime();
+  /**
+   * `data` (YYYY-MM-DD) per rivedere una giornata passata: lo storico si
+   * legge una volta dal file locale e non si interroga piu' niente.
+   */
+  constructor(private data: string | null = null) {
+    const giorno = data ? new Date(`${data}T00:00:00`) : new Date();
+    giorno.setHours(0, 0, 0, 0);
+    this.todayMs = giorno.getTime();
+    const mezzogiorno = new Date(this.todayMs + 12 * 3600000);
+    this.aperturaCashMin = minutiRomaDaNy('09:30', mezzogiorno);
+    this.chiusuraCashMin = minutiRomaDaNy('16:00', mezzogiorno);
+  }
+
+  /**
+   * La base ES - SPX: mediana degli ultimi 20 punti (~5 minuti) a cash
+   * aperto, come /bookmap, /market e Quantower. Solo cash: dopo le 16:00 di
+   * New York IBKR lascia SPX fermo mentre ES continua, e il 28/10/2026 la
+   * "base" e' scivolata da 35 a 16.8. Null prima dell'apertura.
+   */
+  public get basis(): number | null {
+    if (this.basiCash.length === 0) return null;
+    const ultime = [...this.basiCash.slice(-20)].sort((a, b) => a - b);
+    return ultime[Math.floor(ultime.length / 2)];
+  }
+
+  private registraBase(p: PuntoMercato): void {
+    const es = num(p.esf);
+    const spx = num(p.spx);
+    const ora = p.time ?? p.sourceTime;
+    if (es === null || spx === null || !ora) return;
+    const [h, m] = ora.split(':').map(Number);
+    const minuti = h * 60 + m;
+    if (minuti < this.aperturaCashMin || minuti >= this.chiusuraCashMin) return;
+    this.basiCash.push(es - spx);
+    if (this.basiCash.length > 200) this.basiCash.shift();
   }
 
   private oraInMs(timeStr?: string): number {
@@ -181,7 +220,8 @@ export class RealDataProvider {
   private async caricaStorico(): Promise<void> {
     if (this.storicoCaricato) return;
     try {
-      const res = await fetch("/api/market?history=true", { cache: "no-store" });
+      const url = this.data ? `/api/market?history=true&date=${this.data}` : "/api/market?history=true";
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) return;
       const dati = await res.json();
       const storico: PuntoMercato[] = Array.isArray(dati?.history) ? dati.history : [];
@@ -191,6 +231,8 @@ export class RealDataProvider {
         if (spot === null) continue;
         const ts = this.oraInMs(p.time);
         if (ts <= this.ultimoTsCandela) continue; // il poller ripete lo stesso orario
+        this.registraBase(p);
+        this.ultimoStorico = p;
         this.candele.push({ timestamp: ts, open: spot, high: spot, low: spot, close: spot, volume: 0 });
         this.ultimoTsCandela = ts;
 
@@ -206,7 +248,10 @@ export class RealDataProvider {
   }
 
   private tagliaCandele(): void {
-    const MAX = 720; // ~3 ore a un punto ogni 15 secondi
+    // La sessione intera (un punto ogni ~20 s, ~1.200 il 02/11/2026): a 720
+    // il riquadro dei prezzi copriva tre ore e quello del flusso, tagliato
+    // a parte, un altro tratto ancora.
+    const MAX = 3000;
     if (this.candele.length > MAX) this.candele = this.candele.slice(-MAX);
   }
 
@@ -264,7 +309,15 @@ export class RealDataProvider {
     await this.caricaStorico();
 
     let punto: PuntoMercato;
-    try {
+    if (this.data) {
+      // Giornata passata: lo spot e' l'ultimo punto, e non c'e' altro da chiedere.
+      if (!this.ultimoStorico) {
+        this.ultimoAvviso = `nessun dato di mercato per il ${this.data}`;
+        return null;
+      }
+      punto = this.ultimoStorico;
+    } else {
+      try {
       const res = await fetch("/api/market", { cache: "no-store" });
       if (!res.ok) {
         // 404 = il poller non ha ancora scritto niente oggi: e' la risposta
@@ -278,6 +331,7 @@ export class RealDataProvider {
       console.error("[REAL] fetch fallita:", e);
       return null;
     }
+    }
 
     const spot = num(punto.esf) ?? num(punto.spx);
     if (spot === null) {
@@ -285,8 +339,9 @@ export class RealDataProvider {
       return null;
     }
 
-    const ts = this.oraInMs(punto.time);
+    const ts = this.oraInMs(punto.time ?? punto.sourceTime ?? undefined);
     if (ts > this.ultimoTsCandela) {
+      this.registraBase(punto);
       this.candele.push({ timestamp: ts, open: spot, high: spot, low: spot, close: spot, volume: 0 });
       this.ultimoTsCandela = ts;
       this.tagliaCandele();

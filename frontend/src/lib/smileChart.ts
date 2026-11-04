@@ -15,12 +15,17 @@
  * - frecce = convexity ladder: arancio da sinistra = taker corti di
  *   convessita' (gamma netta < 0), azzurra da destra = taker lunghi.
  *
- * - linee orizzontali su tutto il grafico: Spot +-1 sigma (tratteggio lungo),
- *   +-2 sigma (puntinato) e il vertice IV MIN (viola, piena), che non e'
- *   orizzontale: segue nel tempo i cambi di strike del vertice, a gradini.
+ * - linee orizzontali su tutto il grafico: le bande di chiusura 68%
+ *   (tratteggio lungo) e 95% (puntinato) e il vertice IV MIN (viola, piena),
+ *   che non e' orizzontale: segue nel tempo i cambi di strike del vertice, a
+ *   gradini. Dal 03/11/2026 le bande sono quelle calibrate di
+ *   lib/volContesto.ts (VIX1D x quantili osservati): lo Spot +-1/2 sigma
+ *   dell'IV 0DTE, piu' largo del vero, resta solo se le bande mancano
+ *   (niente VIX1D, prima delle 9:45 o dopo le 15:50 NY).
  */
 
 import { oraRomaDaNy } from './orarioNy';
+import type { Vol } from './volContesto';
 
 export const SMILE_COL = 180;
 
@@ -49,6 +54,8 @@ export interface DatiSmile {
         /** [ora italiana, regime] a ogni cambio del regime confermato nell'ultima mezz'ora. */
         cambiRegime?: [string, string][];
     };
+    /** Bande di chiusura, divergenze e contesto (lib/volContesto.ts), dal 03/11/2026. */
+    vol?: Vol;
     punti: {
         strike: number; callIv: number | null; putIv: number | null; ivOtm: number | null;
         /** IV OTM in media a 3 strike, per la linea; assente prima della v2 di /api/smile. */
@@ -187,11 +194,37 @@ function storiaVertice(chart: any, ctx: CanvasRenderingContext2D, storia: [strin
 }
 
 /** Regime, IV ATM, vertice e z-score in alto nella colonna: testo su fondo scuro, sopra la curva. */
-function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], x0: number, x1: number, top: number) {
+function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], vol: Vol | undefined, x0: number, x1: number, top: number) {
     const righe: [string, string, string][] = [];
-    righe.push(['bold 11px Arial', s.regime ? COLORE_REGIME[s.regime] ?? '#cbd5e1' : '#64748b',
-        s.regime ?? (s.chiuso ? 'MERCATO CHIUSO' : s.sospeso ?`SOSPESO dalle ${oraRomaDaNy('15:15').slice(0, 5)}`
-            : s.base === 'in raccolta' ? 'IN RACCOLTA' : 'IN CONFERMA')]);
+    // In testa il contesto della giornata (studio_vol.py: prevede l'ampiezza,
+    // non la direzione), poi bande e ultima divergenza.
+    const c = vol?.contesto;
+    if (c) {
+        righe.push(['bold 11px Arial', c.attesa === 'AMPIA' ? ARANCIO : c.attesa === 'STRETTA' ? AZZURRO : '#cbd5e1',
+            `GIORNATA ${c.attesa} ×${c.rangeRelativo.toFixed(2)}`]);
+        // Ognuna col suo percentile dal 2022 e il range medio del suo quintile.
+        for (const v of c.voci.filter((x) => x.nome !== 'VIX' && x.nome !== 'VIX/VIX3M')) {
+            const valore = v.nome === 'SKEW' ? v.valore.toFixed(0) : v.valore.toFixed(2);
+            righe.push(['10px Arial', '#94a3b8', `${v.nome} ${valore} (${v.percentile}°) ×${v.rangeRelativo.toFixed(2)}`]);
+        }
+    }
+    const b = vol?.bande;
+    if (b) {
+        righe.push(['10px Arial', '#e2e8f0',
+            `chiusura 68% ±${(b.q68 * b.emResto).toFixed(0)} · 95% ±${(b.q95 * b.emResto).toFixed(0)}`]);
+        righe.push(['10px Arial', '#64748b', `VIX1D ${b.vix1d.toFixed(1)} · RV/IV ${b.rvIv?.toFixed(2) ?? '—'}`]);
+    }
+    const u = vol?.ultima;
+    if (u) {
+        const d = vol?.divergenze[vol.divergenze.length - 1];
+        righe.push(['10px Arial', '#64748b', `SPX 30' ${u.dS >= 0 ? '+' : ''}${u.dS.toFixed(1)}σ · res VIX1D ${u.residuo >= 0 ? '+' : ''}${u.residuo.toFixed(2)}`]);
+        if (d) righe.push(['10px Arial', d.tipo === 'rimbalzo' ? VERDE : ROSSO, `div. ${d.tipo} ${d.time.slice(0, 5)} (in prova)`]);
+    }
+    // Il regime dello smile resta come informazione, non piu' come segnale:
+    // lo studio intraday non trova direzione nelle variazioni di vol.
+    righe.push(['10px Arial', s.regime ? COLORE_REGIME[s.regime] ?? '#cbd5e1' : '#64748b',
+        `smile: ${s.regime ?? (s.chiuso ? 'MERCATO CHIUSO' : s.sospeso ? `sospeso dalle ${oraRomaDaNy('15:15').slice(0, 5)}`
+            : s.base === 'in raccolta' ? 'in raccolta' : 'in conferma')}`]);
     if (s.ivAtm != null) {
         righe.push(['10px Arial', '#94a3b8', `IV ATM ${s.ivAtm.toFixed(1)}%${s.em != null ? ` · 1σ ${s.em.toFixed(1)}` : ''}`]);
     }
@@ -264,7 +297,7 @@ export const smilePlugin = {
                 storiaVertice(chart, ctx, s.storiaVertice, yDi, x1);
                 ctx.restore();
             }
-            intestazione(ctx, s, x0, x1, chartArea.top);
+            intestazione(ctx, s, dati.vol, x0, x1, chartArea.top);
             ctx.restore();
             return;
         }
@@ -293,7 +326,15 @@ export const smilePlugin = {
         ctx.rect(chartArea.left, chartArea.top, x1 - chartArea.left, chartArea.bottom - chartArea.top);
         ctx.clip();
         const livelli: [number, string, number[], string][] = [];
-        if (em > 0) {
+        const bande = dati.vol?.bande;
+        if (bande) {
+            livelli.push(
+                [bande.su95, COLORE_2S, [2, 4], '95%'],
+                [bande.su68, COLORE_1S, [6, 4], '68%'],
+                [bande.giu68, COLORE_1S, [6, 4], '68%'],
+                [bande.giu95, COLORE_2S, [2, 4], '95%'],
+            );
+        } else if (em > 0) {
             livelli.push(
                 [dati.spot + 2 * em, COLORE_2S, [2, 4], '+2σ'],
                 [dati.spot + em, COLORE_1S, [6, 4], '+1σ'],
@@ -361,7 +402,7 @@ export const smilePlugin = {
             const daCall = sottoSpot ? p.putIv == null : p.callIv != null;
             pallino(ctx, xDi(p.ivOtm as number), y, daCall ? VERDE : ROSSO, vuoto);
         }
-        intestazione(ctx, s, x0, x1, chartArea.top);
+        intestazione(ctx, s, dati.vol, x0, x1, chartArea.top);
         ctx.restore();
     },
 };

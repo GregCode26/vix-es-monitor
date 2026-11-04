@@ -21,6 +21,13 @@ export const dynamic = 'force-dynamic';
  * righe al giorno, e senza bisogno di vederle da fuori non vale l'egress.
  * Solo oggi; `?since=HH:MM:SS` per la lettura incrementale, altrimenti gli
  * ultimi MAX_INIZIALI campioni.
+ *
+ * `?assorbimenti=1`: tutti i campioni di PRIMA di quella finestra, in punti
+ * leggeri (ora, alias, bid/ask, abs; niente book, ~2.5 MB a fine giornata,
+ * una volta all'avvio). Il book pesa, il resto no: l'indicatore Quantower ci
+ * ritrova gli assorbimenti (con il bid/ask dei secondi dopo, per la tenuta) e
+ * il prezzo di ogni secondo per la conferma sui range. Senza, a fine giornata
+ * non mostrava niente prima delle ultime 3 ore (04/11/2026).
  */
 
 interface Campione {
@@ -116,6 +123,18 @@ interface Giornata {
 
 /** Tre ore a un campione al secondo: quanto la pagina tiene in memoria. */
 const MAX_INIZIALI = 10800;
+
+/** I campioni prima della finestra iniziale, senza book. */
+function assorbimentiPrima(g: Giornata) {
+    const fine = Math.max(0, g.points.length - MAX_INIZIALI);
+    return g.points.slice(0, fine).map((p) => ({
+        time: p.time,
+        alias: p.alias,
+        bid: p.bid,
+        ask: p.ask,
+        abs: p.abs && p.abs.length > 0 ? p.abs : null,
+    }));
+}
 
 const giornate = new Map<string, Giornata>();
 
@@ -276,6 +295,9 @@ export async function GET(request: NextRequest) {
     }
     const g = giornata(date);
     const since = request.nextUrl.searchParams.get('since');
+    if (request.nextUrl.searchParams.get('assorbimenti') === '1') {
+        return NextResponse.json({ date, points: assorbimentiPrima(g) });
+    }
 
     let points: BookmapPoint[];
     if (isValidTime(since)) {

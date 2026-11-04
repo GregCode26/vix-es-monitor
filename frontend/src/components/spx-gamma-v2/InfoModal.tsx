@@ -12,9 +12,9 @@ interface InfoModalProps {
  * La spiegazione della pagina, per intero.
  *
  * Sta qui e non in un README perche' le cose da sapere prima di fidarsi di un
- * numero -- che la IV e' invertita dai premi e non letta da IBKR, che il GEX
- * non c'e', che il VOLFLOW guarda 60 secondi indietro -- servono davanti al
- * grafico, non in un file che nessuno apre a mercato aperto.
+ * numero -- che la IV e' invertita dai premi e non letta da IBKR, che il
+ * flusso descrive e non prevede -- servono davanti al grafico, non in un
+ * file che nessuno apre a mercato aperto.
  */
 export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
   // Esc chiude: e' una finestra che si apre a mercato aperto, deve andarsene
@@ -45,16 +45,18 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
             <h3>In una riga</h3>
             <p>
               La pagina misura la <span className={styles.chiave}>pressione delle opzioni SPX 0DTE</span>: chi sta
-              comprando davvero fra call e put. Il numero in basso e&apos; il{" "}
+              scambiando davvero fra call e put, e dove stanno i muri di gamma. Il numero in basso e&apos; il{" "}
               <span className={styles.chiave}>FLUSSO GAMMA</span>, da -100 (put) a +100 (call), ricavato dai contratti
-              realmente scambiati.
+              realmente scambiati. <span className={styles.chiave}>Descrive, non prevede</span>: vedi sotto.
             </p>
           </div>
 
           <div className={styles.sezione}>
             <h3>Da dove vengono i dati</h3>
             <p>
-              Due rotte, entrambe gia&apos; in uso altrove. <span className={styles.chiave}>/api/market</span> per il
+              Tre rotte, tutte gia&apos; in uso altrove. <span className={styles.chiave}>/api/gex?flow=0</span> per il
+              profilo GEX per strike del riquadro a destra, ogni 15 secondi con <code>?since=</code>.{" "}
+              <span className={styles.chiave}>/api/market</span> per il
               prezzo e le quote ATM: lo storico del giorno una volta all&apos;apertura, poi solo l&apos;ultimo punto.{" "}
               <span className={styles.chiave}>/api/volumes</span> per la catena scambiata, che alimenta il riquadro in
               basso: si legge in modo incrementale con <code>?since=</code>, circa 2 KB a giro invece della sessione
@@ -112,9 +114,15 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
               l&apos;etichetta <span className={styles.chiave}>SPOT</span> e&apos; l&apos;ultimo prezzo.
             </p>
             <p>
-              Le righe LONG / SHORT / CALL / PUT GAMMA stanno tutte sullo strike ATM: i veri muri di gamma si calcolano dal
-              profilo per strike, che vive in <code>/api/volumes</code> e questa pagina non lo scarica. Non sono livelli
-              stimati, sono segnaposto.
+              <span className={styles.chiave}>LONG</span> e <span className={styles.chiave}>SHORT</span> sono gli strike
+              col GEX pesato per open interest piu&apos; positivo e piu&apos; negativo (come Major Pos/Neg Gamma in
+              /spx-gamma), spostati su ES con la base ES-SPX: mediana degli ultimi ~5 minuti a cash aperto. Prima delle
+              15:30 la base non c&apos;e&apos; e i livelli restano sull&apos;ATM. CALL e PUT non si disegnano: il profilo
+              porta il GEX netto per strike, non call e put separate.
+            </p>
+            <p>
+              Se il poller si e&apos; fermato la linea si interrompe e una riga arancione dice quanti minuti mancano:
+              l&apos;asse e&apos; per punto, non per orario, e senza il buco sembrerebbe un movimento del prezzo.
             </p>
           </div>
 
@@ -133,7 +141,10 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
               {"         "}riportato sulla scala -100 / +100
             </span>
             <p>
-              I volumi sono cumulativi di giornata, quindi il flusso e&apos; la differenza fra due fotografie della catena.
+              Si parte dall&apos;apertura cash (9:30 di New York) e si riparte da zero dopo un minuto senza snapshot: il
+              02/11/2026 il primo valore dopo tre ore di buco conteneva tre ore di volume, e schiacciava lo z-score per
+              mezz&apos;ora. I volumi sono cumulativi di giornata, quindi il flusso e&apos; la differenza fra due
+              fotografie della catena.
               Il peso gamma conta perche&apos; e&apos; la copertura che i dealer devono inseguire: mille contratti su uno
               strike lontano muovono meno di cento sull&apos;ATM. Lo z-score sulla mezz&apos;ora serve perche&apos; il
               flusso cambia scala fra l&apos;apertura e le ore morte.
@@ -157,16 +168,29 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
               </li>
             </ul>
             <p>
-              <span className={styles.chiave}>Quanto vale davvero.</span> Correlazione fra questo indicatore e il movimento
-              del sottostante nel minuto successivo, misurata su cinque sessioni complete di volumi:{" "}
-              <span className={styles.chiave}>+0.226</span> sul flusso grezzo, <span className={styles.chiave}>+0.182</span>{" "}
-              nella forma disegnata qui, e positiva in <span className={styles.chiave}>cinque sessioni su cinque</span>
-              {" "}(+0.25, +0.16, +0.17, +0.32, +0.45).
+              <span className={styles.chiave}>Quanto vale davvero: non e&apos; un segnale.</span> Il primo studio, su
+              cinque sessioni, dava +0.18 di correlazione col minuto successivo. Rifatto il 03/11/2026 su dodici sessioni
+              (14/10-02/11):
             </p>
+            <ul>
+              <li>
+                col <span className={styles.chiave}>minuto dopo</span>: da -0.07 a +0.07, positiva in 6 sessioni su 12;
+              </li>
+              <li>
+                coi <span className={styles.chiave}>cinque minuti dopo</span>: da -0.10 a +0.12;
+              </li>
+              <li>
+                coi <span className={styles.chiave}>30 secondi prima</span>: da +0.08 a +0.21, positiva in 12 su 12;
+              </li>
+              <li>
+                oltre <span className={styles.chiave}>+/-60</span> la direzione del minuto dopo e&apos; giusta nel{" "}
+                <span className={styles.chiave}>48.5%</span> dei casi (355 segnali), cioe&apos; come tirare una moneta.
+              </li>
+            </ul>
             <p>
-              Va letto per quello che e&apos;: 0.18 di correlazione spiega il <span className={styles.chiave}>3% della
-              varianza</span>. Inclina le probabilita&apos;, non decide il prossimo minuto. Ma e&apos; un segnale vero, e
-              questo lo distingue da quello che c&apos;era prima.
+              Il flusso segue il prezzo: quando sale si comprano call, quando scende put. Le varianti col lato
+              dell&apos;aggressore (Lee-Ready, pesate per gamma o per delta) non fanno meglio. Va letto come{" "}
+              <span className={styles.chiave}>chi sta scambiando cosa adesso</span>, non come previsione.
             </p>
             <div className={styles.nota}>
               Cosa e&apos; stato scartato, e perche&apos;. Prima il riquadro mostrava il VOLFLOW, costruito sulle variazioni
@@ -201,8 +225,11 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
                 mercato.
               </li>
               <li>
+                <span className={styles.chiave}>LONG / SHORT GAMMA</span>: gli strike del profilo GEX OI, in prezzi ES.
+              </li>
+              <li>
                 <span className={styles.chiave}>GAMMA PRESSURE / VOLATILITY PRESSURE / REGIME</span>: fermi a zero e a
-                GAMMA STABLE. Vogliono il profilo per strike, che qui non c&apos;e&apos;.
+                GAMMA STABLE, non sono calcolati.
               </li>
             </ul>
           </div>
@@ -211,13 +238,15 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
             <h3>Cosa questa pagina non sa</h3>
             <ul>
               <li>
-                <span className={styles.chiave}>Nessun profilo GEX per strike.</span> I volumi si leggono per ricavarne il
-                flusso, ma il profilo per strike e i muri di gamma non vengono costruiti: il riquadro a destra lo dice
-                invece di disegnare barre.
+                <span className={styles.chiave}>Niente Zero Gamma.</span> La catena e&apos; solo 0DTE e 37+40 strike:
+                troppo incompleta per calcolarlo bene.
               </li>
               <li>
-                <span className={styles.chiave}>Solo la giornata di oggi.</span> Come tutte le rotte di questo progetto: non
-                esiste un parametro per le sessioni passate.
+                <span className={styles.chiave}>Le giornate passate solo in locale.</span> Il selettore GIORNO rilegge una
+                sessione dai file dei poller (<code>?date=</code>), mai da Supabase, per non spendere egress: sul sito
+                pubblicato resta vuoto. In una giornata passata il riquadro GEX mostra il profilo all&apos;orario sotto
+                il mouse (fotografie ogni 2 minuti); senza mouse, l&apos;ultimo momento in cui il gamma c&apos;era, perche&apos;
+                dopo la scadenza delle 0DTE vale zero.
               </li>
               <li>
                 <span className={styles.chiave}>Serve il poller acceso.</span> Senza TWS collegato la pagina resta in attesa
@@ -229,9 +258,9 @@ export const InfoModal: React.FC<InfoModalProps> = ({ aperto, onChiudi }) => {
               </li>
             </ul>
             <div className={styles.nota}>
-              Il flusso gamma dice chi sta spingendo adesso e inclina leggermente le probabilita&apos; sul minuto
-              successivo. Non e&apos; una previsione: un +80 dice che stanno comprando call con convinzione, non che il
-              prezzo salira&apos;.
+              Il flusso gamma dice chi sta scambiando cosa adesso, di solito dopo che il prezzo si e&apos; gia&apos; mosso.
+              Non e&apos; una previsione: un +80 dice che stanno comprando call con convinzione, non che il prezzo
+              salira&apos;.
             </div>
           </div>
         </div>

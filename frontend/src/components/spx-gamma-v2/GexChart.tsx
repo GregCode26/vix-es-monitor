@@ -12,7 +12,14 @@ interface GexChartProps {
   callGamma: number;
   putGamma: number;
   crosshairX?: number;
-  volflow?: number; // VOLFLOW 0-100 value
+  /**
+   * ES - SPX: gli strike sono SPX, l'asse dei prezzi e' quello del grafico a
+   * sinistra (ES). Zero se la base non c'e' ancora.
+   */
+  basis?: number;
+  /** Messaggio al posto delle barre quando il profilo non c'e'. */
+  avviso?: string | null;
+  volflow?: number; // flusso 0-100, 50 = neutro
   gexZoom?: { min: number; max: number } | null;
   onGexZoomChange?: (zoom: { min: number; max: number } | null) => void;
   timeZoom?: { start: number; end: number } | null;
@@ -40,6 +47,8 @@ export const GexChart: React.FC<GexChartProps> = ({
   callGamma,
   putGamma,
   crosshairX,
+  basis = 0,
+  avviso = null,
   volflow = 50,
   gexZoom: externalGexZoom = null,
   onGexZoomChange,
@@ -71,31 +80,20 @@ export const GexChart: React.FC<GexChartProps> = ({
     }
   };
 
-  console.log("[GexChart] Rendering with volflow:", volflow);
+  // Il riquadro e' il profilo per strike: asse verticale = prezzo (lo stesso
+  // intorno dello spot del grafico a sinistra), asse orizzontale = GEX.
+  const priceBounds = React.useMemo(() => ({ min: spot - 50, max: spot + 50 }), [spot]);
 
-  // Calculate GEX bounds
   const gexBounds = React.useMemo(() => {
-    // Use manual zoom if set
-    if (gexZoom) {
-      return gexZoom;
-    }
-
-    if (gexBars.length === 0) return { min: -2000, max: 2000 };
-
-    const values = gexBars.map((bar) => bar.gex);
-    const minGex = Math.min(...values, 0);
-    const maxGex = Math.max(...values, 0);
-    const range = Math.max(Math.abs(minGex), Math.abs(maxGex));
-
-    return { min: -range * 1.2, max: range * 1.2 };
-  }, [gexBars, gexZoom]);
-
-  // Calculate price bounds (same as price chart)
-  const priceBounds = React.useMemo(() => {
-    const spotMin = spot - 50;
-    const spotMax = spot + 50;
-    return { min: spotMin, max: spotMax };
-  }, [spot]);
+    if (gexZoom) return gexZoom;
+    const visibili = gexBars.filter((b) => {
+      const y = b.strike + basis;
+      return y >= priceBounds.min && y <= priceBounds.max;
+    });
+    if (visibili.length === 0) return { min: -1, max: 1 };
+    const massimo = Math.max(...visibili.map((b) => Math.abs(b.gex)), 1e-6);
+    return { min: -massimo * 1.15, max: massimo * 1.15 };
+  }, [gexBars, gexZoom, basis, priceBounds]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -116,10 +114,8 @@ export const GexChart: React.FC<GexChartProps> = ({
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
     ctx.scale(dpr, dpr);
 
-    // Layout constants
     const leftMargin = 60;
     const rightMargin = 140;
     const topMargin = 20;
@@ -127,161 +123,124 @@ export const GexChart: React.FC<GexChartProps> = ({
     const chartWidth = width - leftMargin - rightMargin;
     const chartHeight = height - topMargin - bottomMargin;
 
-    // Fill background
     ctx.fillStyle = COLORS.background;
     ctx.fillRect(0, 0, width, height);
 
-    // Draw grid
+    const priceToY = (price: number): number =>
+      topMargin + chartHeight - ((price - priceBounds.min) / (priceBounds.max - priceBounds.min)) * chartHeight;
+    const gexToX = (gex: number): number =>
+      leftMargin + ((gex - gexBounds.min) / (gexBounds.max - gexBounds.min)) * chartWidth;
+
+    // Griglia verticale sui valori di GEX, etichette in basso.
     ctx.strokeStyle = COLORS.grid;
     ctx.lineWidth = 0.5;
     ctx.setLineDash([2, 2]);
-
-    // Horizontal grid lines for GEX
-    const gexStep = (gexBounds.max - gexBounds.min) / 8;
-    for (let i = 0; i <= 8; i++) {
-      const gex = gexBounds.min + gexStep * i;
-      const y = topMargin + chartHeight - ((gex - gexBounds.min) / (gexBounds.max - gexBounds.min)) * chartHeight;
-
+    ctx.fillStyle = COLORS.text;
+    ctx.font = "10px monospace";
+    ctx.textAlign = "center";
+    for (let i = 0; i <= 4; i++) {
+      const gex = gexBounds.min + ((gexBounds.max - gexBounds.min) * i) / 4;
+      const x = gexToX(gex);
       ctx.beginPath();
-      ctx.moveTo(leftMargin, y);
-      ctx.lineTo(width - rightMargin, y);
+      ctx.moveTo(x, topMargin);
+      ctx.lineTo(x, topMargin + chartHeight);
       ctx.stroke();
-
-      // GEX labels
-      ctx.fillStyle = COLORS.text;
-      ctx.font = "11px monospace";
-      ctx.textAlign = "right";
-      const label = gex > 0 ? `+${Math.round(gex)}` : `${Math.round(gex)}`;
-      ctx.fillText(label, width - rightMargin + 5, y + 4);
+      const testo = Math.abs(gex) >= 100 ? gex.toFixed(0) : gex.toFixed(1);
+      ctx.fillText(gex > 0 ? `+${testo}` : testo, x, height - bottomMargin + 14);
     }
+    ctx.setLineDash([]);
 
-    // Zero line (more prominent)
-    const zeroY = topMargin + chartHeight - ((0 - gexBounds.min) / (gexBounds.max - gexBounds.min)) * chartHeight;
+    const zeroX = gexToX(0);
     ctx.strokeStyle = COLORS.zero;
     ctx.lineWidth = 1.5;
-    ctx.setLineDash([]);
     ctx.beginPath();
-    ctx.moveTo(leftMargin, zeroY);
-    ctx.lineTo(width - rightMargin, zeroY);
+    ctx.moveTo(zeroX, topMargin);
+    ctx.lineTo(zeroX, topMargin + chartHeight);
     ctx.stroke();
 
-    // Price to Y coordinate (right axis)
-    const priceToY = (price: number): number => {
-      return topMargin + chartHeight - ((price - priceBounds.min) / (priceBounds.max - priceBounds.min)) * chartHeight;
-    };
+    // Barre: una per strike, alta quattro quinti della distanza fra strike.
+    const pxPerPunto = chartHeight / (priceBounds.max - priceBounds.min);
+    const altezzaBarra = Math.max(2, 5 * pxPerPunto * 0.8);
+    let disegnate = 0;
+    for (const bar of gexBars) {
+      const prezzo = bar.strike + basis;
+      if (prezzo < priceBounds.min || prezzo > priceBounds.max) continue;
+      const y = priceToY(prezzo);
+      const x = gexToX(bar.gex);
+      ctx.fillStyle = bar.gex >= 0 ? COLORS.gexUp : COLORS.gexDown;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(Math.min(x, zeroX), y - altezzaBarra / 2, Math.max(1, Math.abs(x - zeroX)), altezzaBarra);
+      ctx.globalAlpha = 1;
+      disegnate++;
+      // Strike SPX a sinistra, uno ogni due per non sovrapporli.
+      if (bar.strike % 10 === 0) {
+        ctx.fillStyle = COLORS.text;
+        ctx.font = "9px monospace";
+        ctx.textAlign = "right";
+        ctx.fillText(String(bar.strike), leftMargin - 4, y + 3);
+      }
+    }
 
-    // GEX to Y coordinate
-    const gexToY = (gex: number): number => {
-      return topMargin + chartHeight - ((gex - gexBounds.min) / (gexBounds.max - gexBounds.min)) * chartHeight;
-    };
+    if (disegnate === 0) {
+      ctx.fillStyle = "#666666";
+      ctx.font = "11px 'Courier New', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(avviso ?? "Profilo GEX non ancora disponibile", leftMargin + chartWidth / 2, topMargin + chartHeight / 2);
+    }
 
-    // Draw gamma level lines
     const drawLevelLine = (price: number, color: string, label: string) => {
+      if (price < priceBounds.min || price > priceBounds.max) return;
       const y = priceToY(price);
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 1.5;
       ctx.setLineDash([4, 2]);
       ctx.beginPath();
       ctx.moveTo(leftMargin, y);
       ctx.lineTo(width - rightMargin, y);
       ctx.stroke();
-
-      // Label on right
+      ctx.setLineDash([]);
       ctx.fillStyle = color;
       ctx.font = "bold 11px monospace";
       ctx.textAlign = "left";
-      ctx.fillText(label, width - rightMargin + 10, y + 3);
+      ctx.fillText(label, width - rightMargin + 44, y + 3);
     };
-
-    ctx.setLineDash([]);
-
-    // Draw levels
     if (callGamma) drawLevelLine(callGamma, COLORS.callGamma, "CALL");
     if (longGamma) drawLevelLine(longGamma, COLORS.longGamma, "LONG");
     if (shortGamma) drawLevelLine(shortGamma, COLORS.shortGamma, "SHORT");
     if (putGamma) drawLevelLine(putGamma, COLORS.putGamma, "PUT");
 
-    // Senza barre si scrive perche' mancano, invece di lasciare una griglia
-    // vuota che sembra un GEX piatto: il profilo per strike sta in
-    // /api/volumes, che questa pagina non interroga.
-    if (gexBars.length === 0) {
-      ctx.fillStyle = "#666666";
-      ctx.font = "11px 'Courier New', monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("GEX non disponibile da /api/market", leftMargin + chartWidth / 2, topMargin + chartHeight / 2);
-      ctx.textAlign = "left";
-    }
+    // Spot
+    const spotY = priceToY(spot);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(leftMargin, spotY);
+    ctx.lineTo(width - rightMargin, spotY);
+    ctx.stroke();
+    ctx.setLineDash([]);
 
-    // Draw GEX bars (simplified - direct rendering)
-    if (gexBars.length > 0) {
-      const barPixelWidth = Math.max(3, chartWidth / Math.max(20, gexBars.length));
-      const barBodyWidth = Math.max(1.5, barPixelWidth - 1);
-      const zeroY = gexToY(0);
-
-      // Draw each bar
-      for (let i = 0; i < gexBars.length; i++) {
-        const bar = gexBars[i];
-        const x = leftMargin + (i / gexBars.length) * chartWidth + barPixelWidth / 2;
-        const gex = bar.gex;
-
-        // Skip if GEX is too small
-        if (Math.abs(gex) < 0.1) continue;
-
-        const barValueY = gexToY(gex);
-        const barY1 = Math.min(zeroY, barValueY);
-        const barHeight = Math.max(1, Math.abs(barValueY - zeroY));
-
-        // Draw bar
-        ctx.fillStyle = gex >= 0 ? COLORS.gexUp : COLORS.gexDown;
-        ctx.fillRect(x - barBodyWidth / 2, barY1, barBodyWidth, barHeight);
-
-        // Bar border
-        ctx.strokeStyle = gex >= 0 ? COLORS.gexUp : COLORS.gexDown;
-        ctx.lineWidth = 0.8;
-        ctx.strokeRect(x - barBodyWidth / 2, barY1, barBodyWidth, barHeight);
-      }
-    }
-
-    // Draw VOLFLOW indicator bar (inside chart, far right) - only if valid
+    // Barra del flusso corrente (0-100, 50 = neutro), sul bordo destro.
     if (volflow !== undefined && volflow >= 0 && volflow <= 100) {
-      const volflowBarX = width - rightMargin - 30; // Inside chart, near right edge
+      const volflowBarX = width - rightMargin - 30;
       const volflowBarWidth = 18;
-      const volflowZeroY = topMargin + chartHeight / 2; // Center at 50
-      const maxBarHeight = chartHeight / 3; // Limit to 1/3 of chart height
-
-      // VOLFLOW to Y coordinate (centered at 50, max ±33% of chart height)
-      const normalizedValue = (volflow - 50) / 50; // -1 to +1
+      const volflowZeroY = topMargin + chartHeight / 2;
+      const maxBarHeight = chartHeight / 3;
+      const normalizedValue = (volflow - 50) / 50;
       const volflowValueY = volflowZeroY - normalizedValue * maxBarHeight;
       const volflowBarHeight = Math.max(2, Math.abs(volflowValueY - volflowZeroY));
       const volflowBarTop = Math.min(volflowZeroY, volflowValueY);
-      const volflowColor = volflow > 50 ? "#00ff00" : volflow < 50 ? "#ff3333" : "#ffaa00";
+      const volflowColor = volflow > 55 ? "#00ff00" : volflow < 45 ? "#ff3333" : "#ffaa00";
 
-      // Draw VOLFLOW bar with strong visibility
       ctx.fillStyle = volflowColor;
       ctx.globalAlpha = 0.8;
       ctx.fillRect(volflowBarX, volflowBarTop, volflowBarWidth, volflowBarHeight);
       ctx.globalAlpha = 1;
-
-      // VOLFLOW bar border - thicker for visibility
-      ctx.strokeStyle = volflowColor;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(volflowBarX, volflowBarTop, volflowBarWidth, volflowBarHeight);
-
-      // VOLFLOW value label - larger, more visible
-      ctx.fillStyle = volflowColor;
-      ctx.font = "bold 11px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText(volflow.toFixed(0), volflowBarX + volflowBarWidth / 2, volflowZeroY + 16);
-
-      // VOLFLOW label
-      ctx.fillStyle = volflowColor;
       ctx.font = "bold 9px monospace";
-      ctx.fillText("VF", volflowBarX + volflowBarWidth / 2, volflowZeroY - 14);
-
-      console.log("[GexChart] VOLFLOW bar drawn:", { volflow, x: volflowBarX, y: volflowBarTop, height: volflowBarHeight });
+      ctx.textAlign = "center";
+      ctx.fillText("FG", volflowBarX + volflowBarWidth / 2, volflowZeroY - maxBarHeight - 6);
     }
 
-    // Draw crosshair if provided
     if (crosshairX !== undefined && crosshairX > 0) {
       ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
       ctx.lineWidth = 1;
@@ -290,27 +249,23 @@ export const GexChart: React.FC<GexChartProps> = ({
       ctx.moveTo(crosshairX, topMargin);
       ctx.lineTo(crosshairX, topMargin + chartHeight);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
 
-    // Left axis label
     ctx.fillStyle = COLORS.text;
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText("GEX ($M)", 20, height - bottomMargin + 20);
+    ctx.fillText("GEX OI ($M)", leftMargin + chartWidth / 2, height - 8);
 
-    // Right axis price labels (synchronized with price chart)
-    const priceStep = (priceBounds.max - priceBounds.min) / 10;
+    // Prezzi a destra (ES), sull'intorno dello spot.
     for (let i = 0; i <= 10; i++) {
-      const price = priceBounds.min + priceStep * i;
-      const y = priceToY(price);
-
+      const price = priceBounds.min + ((priceBounds.max - priceBounds.min) * i) / 10;
       ctx.fillStyle = COLORS.text;
       ctx.font = "10px monospace";
       ctx.textAlign = "left";
-      ctx.fillText(price.toFixed(0), width - rightMargin + 5, y + 3);
+      ctx.fillText(price.toFixed(0), width - rightMargin + 5, priceToY(price) + 3);
     }
-
-  }, [gexBars, gexBounds, priceBounds, spot, longGamma, shortGamma, callGamma, putGamma, crosshairX, gexZoom]);
+  }, [gexBars, gexBounds, priceBounds, spot, basis, avviso, longGamma, shortGamma, callGamma, putGamma, crosshairX, volflow]);
 
   const handleWheel = React.useCallback(
     (e: React.WheelEvent<HTMLDivElement>) => {
@@ -330,7 +285,7 @@ export const GexChart: React.FC<GexChartProps> = ({
           });
         }
       } else {
-        // Regular Wheel = zoom GEX (Y axis)
+        // Rotella = zoom sull'asse del GEX (orizzontale)
         const zoomFactor = e.deltaY > 0 ? 1.2 : 0.8;
 
         if (gexZoom) {

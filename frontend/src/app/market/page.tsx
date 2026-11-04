@@ -23,6 +23,8 @@ import { majorGamma, RigaGamma } from '@/lib/majorGamma';
 import { minutiRomaDaNy, oraRomaDaNy } from '@/lib/orarioNy';
 import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
 import AiSignalPanel, { type RispostaAi } from '@/components/AiSignalPanel';
+import ZeroGammaInput from '@/components/ZeroGammaInput';
+import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
 import {
     CHIAVE_AUTO, FINE_GEX_NY, GEX_FERMO_MS, PUNTO_RECENTE_MS, descriviArrivo, frecceAiPlugin, leggiFrecce,
     leggiScarichi, livelloToccato, prendiTurno, riarma, salvaFrecce, salvaScarichi,
@@ -163,7 +165,7 @@ const etichetteSinistraPlugin = {
         if (!scala || !area) return;
         const voci: { valore: number; testo: string; colore: string }[] = [...(chart.$etichette ?? [])];
         const xMin = Math.max(0, Math.ceil(chart.scales.x?.min ?? 0));
-        for (const [indice, testo] of [[6, 'GEX+'], [7, 'GEX-']] as const) {
+        for (const [indice, testo] of [[6, 'GEX+'], [7, 'GEX-'], [9, '0γ']] as const) {
             const ds = chart.data.datasets[indice];
             if (!ds || ds.hidden) continue;
             const valore = (ds.data as (number | null)[]).slice(xMin).find((v) => v !== null && v !== undefined);
@@ -512,7 +514,7 @@ function secondiDa(ora: string): number {
     return h * 3600 + m * 60 + (sec || 0);
 }
 
-/** Un cambio di regime dello smile: l'ora italiana e il verso. */
+/** Un pallino sul prezzo (divergenza SPX/VIX1D): l'ora italiana e il verso. */
 interface SegnaleIv {
     time: string;
     rialzista: boolean;
@@ -524,7 +526,8 @@ interface SegnaleIv {
  * `avanzaRegime` in /api/smile), con la chiave nuova sparisce.
  */
 function chiaveSegnaliIv() {
-    return `marketIvSegnali2_${getTodayKey()}`;
+    // `3`: dal 03/11/2026 sono le divergenze SPX/VIX1D, non i cambi di regime.
+    return `marketIvSegnali3_${getTodayKey()}`;
 }
 
 /** Dopo un pallino il segnale e' scarico: si riarma dopo questi secondi. */
@@ -602,14 +605,11 @@ export default function MarketPage() {
     const smileRef = useRef<DatiSmile | null>(null);
 
     /**
-     * I pallini sulla linea del prezzo: verde quando il regime dello smile
-     * diventa RIALZISTA, rosso quando diventa RIBASSISTA.
-     *
-     * /api/smile ricostruisce il regime solo sull'ultima mezz'ora di letture
-     * -- farlo su tutta la giornata vorrebbe dire uno z-score per ognuna
-     * contro tutto lo storico -- quindi i cambi si accumulano qui e si
-     * salvano, come la cache dei punti: ricaricando la pagina a meta' seduta
-     * i segnali della mattina restano dove sono.
+     * I pallini sulla linea del prezzo: le divergenze SPX/VIX1D di
+     * lib/volContesto.ts (dal 03/11/2026; prima erano i cambi di regime dello
+     * smile). Verde = SPX sceso di oltre 1 sigma in 30 minuti con il VIX1D che
+     * non sale (rimbalzo), rosso = con il VIX1D che sale piu' del solito
+     * (continuazione). In prova. La lista e' salvata per il primo disegno.
      */
     const [segnaliIv, setSegnaliIv] = useState<SegnaleIv[]>([]);
     const mostraSmileRef = useRef(true);
@@ -648,6 +648,14 @@ export default function MarketPage() {
      * del basis, come la linea SPX.
      */
     const [mostraGamma, setMostraGamma] = useState(true);
+    // Zero Gamma SPX (/api/zero-gamma), spostato del basis: la traccia del
+    // nostro poller nel tempo (dataset 9, gialla tratteggiata come GEXBot), il
+    // valore GEXBot a mano (orizzontale piena) e, solo se la traccia manca, il
+    // Cboe ritardato (orizzontale tratteggiata).
+    const zeroGamma = useZeroGamma();
+    const zgManuale = zeroGamma.manuale?.valore ?? null;
+    const zgCboe = zeroGamma.attuale?.fonte === 'cboe' ? zeroGamma.attuale.valore : null;
+    const zgTraccia = zeroGamma.traccia;
     const [tracciaGamma, setTracciaGamma] = useState<{ time: string; maxPos: number | null; maxNeg: number | null }[]>([]);
   const [activeTab, setActiveTab] = useState<'market'|'gex'>('market');
 
@@ -802,13 +810,17 @@ export default function MarketPage() {
                     giorno = getTodayKey();
                     setSegnaliIv([]);
                 }
-                // cambiRegime e' quello di tutta la giornata: sostituisce la
-                // lista, non si accumula (localStorage serve solo al primo disegno).
-                const cambi: [string, string][] | undefined = json?.smile?.cambiRegime;
-                if (cambi) {
-                    const segnali = conRiarmo(cambi
-                        .filter(([, r]) => r === 'RIALZISTA' || r === 'RIBASSISTA')
-                        .map(([time, regime]) => ({ time, rialzista: regime === 'RIALZISTA' })));
+                // Dal 03/11/2026 i pallini sono le divergenze SPX/VIX1D di
+                // /api/smile (`vol.divergenze`, lib/volContesto.ts), non piu'
+                // i cambi di regime dello smile: lo studio intraday non trova
+                // direzione nelle variazioni di vol, tranne in questo caso (in
+                // prova). Verde = SPX sceso con la vol che non sale (rimbalzo),
+                // rosso = sceso con la vol che sale piu' del solito
+                // (continuazione). La lista e' quella di tutta la giornata:
+                // sostituisce, non si accumula.
+                const div: { time: string; tipo: string }[] | undefined = json?.vol?.divergenze;
+                if (div) {
+                    const segnali = conRiarmo(div.map((d) => ({ time: d.time, rialzista: d.tipo === 'rimbalzo' })));
                     setSegnaliIv((prec) => {
                         if (prec.length === segnali.length && prec.every((s, i) => s.time === segnali[i].time && s.rialzista === segnali[i].rialzista)) return prec;
                         try {
@@ -1198,6 +1210,18 @@ export default function MarketPage() {
             chart.data.datasets[6].hidden = !mostraGamma;
             chart.data.datasets[7].hidden = !mostraGamma;
         }
+
+        // Zero Gamma dal poller: per ogni punto l'ultima lettura non
+        // successiva (una al minuto), spostata del basis di adesso.
+        if (chart.data.datasets[9]) {
+            const valori: (number | null)[] = [];
+            let j = -1;
+            for (const d of dataPoints) {
+                while (j + 1 < zgTraccia.length && zgTraccia[j + 1][0] <= d.time) j++;
+                valori.push(j >= 0 && basisSpx !== null ? suScalaSpx(zgTraccia[j][1]) : null);
+            }
+            chart.data.datasets[9].data = valori;
+        }
         
         // Ported from logica.zip: Add Cone datasets
         if (chart.data.datasets.length > 3) {
@@ -1212,9 +1236,9 @@ export default function MarketPage() {
 
 
 
-        // I pallini del regime: uno solo nel punto in cui il segnale nasce,
-        // alla quota di ES di quel momento. L'ora dei segnali e' quella dello
-        // smile (ogni 10 s) e non cade su un punto di /api/market (ogni 15 s):
+        // I pallini delle divergenze: uno solo nel punto in cui il segnale nasce,
+        // alla quota di ES di quel momento. L'ora dei segnali e' la fine di una
+        // barra da 5 minuti e non cade su un punto di /api/market (ogni 15 s):
         // si prende il primo punto da quell'ora in poi.
         if (chart.data.datasets[8]) {
             const colori: string[] = [];
@@ -1307,6 +1331,25 @@ export default function MarketPage() {
             }
         }
 
+        // Zero Gamma: prezzi SPX portati su ES col basis. Il manuale (GEXBot)
+        // pieno, il Cboe (ritardato 15 minuti) tratteggiato; se coincidono
+        // entro mezzo punto si disegna solo il manuale.
+        if (basisSpx !== null) {
+            const zg: [string, number | null, string, number[], string][] = [
+                ['zeroGamma', zgManuale, COLORE_ZERO_GAMMA, [], '0γ GEXBot'],
+                ['zeroGammaCboe', zgCboe !== null && (zgManuale === null || Math.abs(zgCboe - zgManuale) >= 0.5) ? zgCboe : null, COLORE_ZERO_GAMMA_CBOE, [5, 4], '0γ Cboe'],
+            ];
+            for (const [chiave, valore, colore, tratto, nome] of zg) {
+                if (valore === null) continue;
+                const y = suScalaSpx(valore);
+                newAnnotations[chiave] = {
+                    type: 'line', yMin: y, yMax: y, yScaleID: 'y-right',
+                    borderColor: colore, borderWidth: 1.5, borderDash: tratto,
+                };
+                etichette.push({ valore: y, testo: nome, colore });
+            }
+        }
+
         chart.$etichette = etichette;
 
         // I livelli che innescano l'analisi AI: i range disegnati e il GEX+/-
@@ -1332,6 +1375,9 @@ export default function MarketPage() {
                 if ((sec(oraUltimo) - sec(fatti[k].time)) * 1000 >= GEX_FERMO_MS) tracciati.push({ nome, valore: v });
             }
         }
+        // Lo Zero Gamma della traccia innesca l'analisi come un range.
+        const zgUltimo = zgTraccia[zgTraccia.length - 1];
+        if (zgUltimo && basisSpx !== null) tracciati.push({ nome: '0γ', valore: suScalaSpx(zgUltimo[1]) });
         livelliTracciatiRef.current = tracciati;
         chart.$frecceAi = frecceAi;
 
@@ -1474,7 +1520,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia]);
 
     // ---- Analisi AI sui livelli ----
     useEffect(() => {
@@ -2445,7 +2491,7 @@ export default function MarketPage() {
                 // Segnali IV: pallini sulla linea del prezzo, nessuna linea
                 // fra loro. `spanGaps: false` non basterebbe -- e' showLine a
                 // tenere separati due segnali lontani ore.
-                label: 'Segnali IV (regime smile)',
+                label: 'Divergenze SPX/VIX1D',
                 data: [] as (number | null)[],
                 showLine: false,
                 pointRadius: 5,
@@ -2453,6 +2499,19 @@ export default function MarketPage() {
                 pointBackgroundColor: [] as string[],
                 pointBorderColor: '#0f172a',
                 pointBorderWidth: 1.5,
+                yAxisID: 'y-right',
+                fill: false,
+            },
+            {
+                // Zero Gamma dal poller (lib/zeroGammaPoller.ts): la linea
+                // gialla tratteggiata di GEXBot, che lascia la traccia.
+                label: 'Zero Gamma',
+                data: [] as (number | null)[],
+                borderColor: COLORE_ZERO_GAMMA_TRACCIA,
+                borderWidth: 2,
+                borderDash: TRATTO_ZERO_GAMMA_TRACCIA,
+                pointRadius: 0,
+                pointHoverRadius: 0,
                 yAxisID: 'y-right',
                 fill: false,
             },
@@ -2783,6 +2842,8 @@ export default function MarketPage() {
                         >
                             ⚙️ Ref Lines
                         </button>
+
+                        <ZeroGammaInput />
 
                         {/* Range Calculator button */}
                         <button

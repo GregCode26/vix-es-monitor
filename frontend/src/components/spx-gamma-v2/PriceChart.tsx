@@ -194,12 +194,16 @@ export const PriceChart: React.FC<PriceChartProps> = ({
       ctx.lineTo(width - rightMargin, y);
       ctx.stroke();
 
-      // GEX labels (left)
+      // GEX labels (left): solo se ci sono barre GEX in questo riquadro.
+      // Coi dati veri il profilo sta nel riquadro a destra, e una scala da
+      // -3000 a +8000 senza niente sopra sembrava un valore.
       ctx.fillStyle = COLORS.text;
       ctx.font = "11px monospace";
-      ctx.textAlign = "right";
-      const label = gex > 0 ? `+${Math.round(gex)}` : `${Math.round(gex)}`;
-      ctx.fillText(label, leftMargin - 5, y + 4);
+      if (gexBars.length > 0) {
+        ctx.textAlign = "right";
+        const label = gex > 0 ? `+${Math.round(gex)}` : `${Math.round(gex)}`;
+        ctx.fillText(label, leftMargin - 5, y + 4);
+      }
 
       // Price labels (right)
       ctx.textAlign = "left";
@@ -266,25 +270,46 @@ export const PriceChart: React.FC<PriceChartProps> = ({
     // Check if this is price line data (all OHLC equal = point on line)
     const isPriceLine = candles.length > 0 && candles.every((c) => c.open === c.close && c.high === c.low && c.open === c.high);
 
-    console.log("[PriceChart] Candles:", candles.length, "isPriceLine:", isPriceLine, "Sample:", candles[0]);
-
     if (isPriceLine) {
       // Draw continuous price line
       ctx.strokeStyle = COLORS.spot;
       ctx.lineWidth = 2;
       ctx.beginPath();
 
+      // L'asse e' per indice, non per orario: un buco del poller (il 02/11/2026
+      // tre ore, 16:11-19:03) diventerebbe un segmento fra due punti vicini
+      // che sembra un movimento del prezzo. Li' la linea si interrompe e una
+      // riga verticale tratteggiata dice quanto manca.
+      const buchi: { x: number; minuti: number }[] = [];
       for (let i = 0; i < candles.length; i++) {
         const x = leftMargin + (i / candles.length) * chartWidth;
         const y = priceToY(candles[i].close);
+        const silenzio = i > 0 ? candles[i].timestamp - candles[i - 1].timestamp : 0;
 
-        if (i === 0) {
+        if (i === 0 || silenzio > 120_000) {
+          if (i > 0) buchi.push({ x, minuti: Math.round(silenzio / 60000) });
           ctx.moveTo(x, y);
         } else {
           ctx.lineTo(x, y);
         }
       }
       ctx.stroke();
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 170, 0, 0.6)";
+      ctx.fillStyle = "rgba(255, 170, 0, 0.9)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.font = "10px monospace";
+      ctx.textAlign = "left";
+      for (const b of buchi) {
+        ctx.beginPath();
+        ctx.moveTo(b.x, topMargin);
+        ctx.lineTo(b.x, topMargin + chartHeight);
+        ctx.stroke();
+        ctx.fillText(`dati assenti ${b.minuti} min`, b.x + 4, topMargin + 12);
+      }
+      ctx.restore();
 
       // Draw dots at each point
       ctx.fillStyle = COLORS.spot;
@@ -367,7 +392,7 @@ export const PriceChart: React.FC<PriceChartProps> = ({
     ctx.fillStyle = COLORS.text;
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
-    ctx.fillText("GEX ($M)", 20, height - bottomMargin + 20);
+    if (gexBars.length > 0) ctx.fillText("GEX ($M)", 20, height - bottomMargin + 20);
 
   }, [candles, spot, longGamma, shortGamma, callGamma, putGamma, priceBounds, crosshairX]);
 

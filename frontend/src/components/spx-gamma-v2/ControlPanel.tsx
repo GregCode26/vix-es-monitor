@@ -18,6 +18,9 @@ interface ControlPanelProps {
   onPauseToggle: () => void;
   onResetZoom?: () => void;
   onInfo?: () => void;
+  /** Giornata passata (YYYY-MM-DD) in revisione, null = oggi dal vivo. */
+  giorno?: string | null;
+  onGiornoChange?: (giorno: string | null) => void;
 }
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
@@ -35,6 +38,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onPauseToggle,
   onResetZoom,
   onInfo,
+  giorno = null,
+  onGiornoChange,
 }) => {
   return (
     <div className={styles.controlPanel}>
@@ -81,6 +86,28 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
             ))}
           </div>
         </div>
+        {/* Giornata: oggi dal vivo, o una passata dai file locali */}
+        {onGiornoChange && (
+          <div className={styles.group}>
+            <label>Giorno</label>
+            <div className={styles.buttons}>
+              <input
+                type="date"
+                className={styles.select}
+                value={giorno ?? ""}
+                onChange={(e) => onGiornoChange(e.target.value || null)}
+                title="Rivedi una giornata passata (solo in locale: si legge dai file dei poller)"
+              />
+              <button
+                className={`${styles.btn} ${giorno === null ? styles.active : ""}`}
+                onClick={() => onGiornoChange(null)}
+              >
+                LIVE
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Timeframe */}
         <div className={styles.group}>
           <label>Timeframe</label>

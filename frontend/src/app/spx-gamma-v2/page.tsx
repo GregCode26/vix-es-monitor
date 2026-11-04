@@ -1,9 +1,10 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { MockDataProvider } from "@/data/mockProvider";
 import { RealDataProvider } from "@/data/realDataProvider";
 import { VolumiProvider } from "@/data/volumiProvider";
+import { GexProvider, DatiGex, profiloAlle, livelliDi } from "@/data/gexProvider";
 import { PriceChart } from "@/components/spx-gamma-v2/PriceChart";
 import { GexChart } from "@/components/spx-gamma-v2/GexChart";
 import { StatusBar } from "@/components/spx-gamma-v2/StatusBar";
@@ -48,9 +49,9 @@ export default function SpxGammaPage() {
   const [flussoCorrente, setFlussoCorrente] = useState(0);
   /**
    * Il pannello in basso vive sui volumi realmente scambiati, non sui premi
-   * ATM: e' l'unica sorgente di questo progetto risultata legata al movimento
-   * successivo del prezzo (+0.18 a un minuto, positiva in 5 sessioni su 5),
-   * mentre ogni costruzione sui premi dava zero.
+   * ATM. Descrive chi sta scambiando cosa, non prevede il prezzo: rifatto su
+   * 12 sessioni (03/11/2026) va con i 30 secondi PRIMA, non col minuto dopo
+   * (vedi engines/flussoGamma.ts).
    */
   const volumiRef = useRef<VolumiProvider | null>(null);
   /** Perche' non c'e' ancora niente da mostrare, se non c'e'. */
@@ -58,32 +59,84 @@ export default function SpxGammaPage() {
   /** Timestamp dell'ultimo punto di mercato gia' dato al motore VOLFLOW. */
   const ultimoTsVolflow = useRef<number>(0);
   const updateIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  /** Il profilo GEX per strike, da /api/gex?flow=0. */
+  const gexRef = useRef<GexProvider | null>(null);
+  const giriRef = useRef(0);
+  const [avvisoGex, setAvvisoGex] = useState<string | null>(null);
+  /** ES - SPX per spostare gli strike sul grafico ES; null prima del cash. */
+  const [basis, setBasis] = useState<number | null>(null);
+  /**
+   * Giornata in revisione (YYYY-MM-DD), null = oggi dal vivo. Sta anche
+   * nell'URL (?date=) cosi' un link riapre la stessa giornata. Una giornata
+   * passata si legge solo dai file locali: su Vercel resta vuota.
+   */
+  // Letto all'avvio: sul server window non c'e', ma fino al primo snapshot
+  // la pagina mostra solo "Initializing..." e il giorno non entra nell'HTML.
+  const [giorno, setGiorno] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    const d = new URLSearchParams(window.location.search).get("date");
+    return d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+  });
+
+  const cambiaGiorno = useCallback((d: string | null) => {
+    const url = new URL(window.location.href);
+    if (d) url.searchParams.set("date", d);
+    else url.searchParams.delete("date");
+    window.history.replaceState(null, "", url);
+    setGiorno(d);
+  }, []);
+
+  /** Profilo GEX e sua serie a 2 minuti, come li ha dati l'ultima lettura. */
+  const [datiGex, setDatiGex] = useState<DatiGex | null>(null);
+
+  /** Dopo ogni snapshot reale: la base ES-SPX e il profilo GEX, se ce n'e' uno nuovo. */
+  const dopoSnapshot = useCallback(async (aggiornaGex: boolean) => {
+    const reale = providerRef.current instanceof RealDataProvider ? providerRef.current : null;
+    setBasis(reale?.basis ?? null);
+    const gex = gexRef.current;
+    if (gex && aggiornaGex) {
+      const nuovi = await gex.aggiorna();
+      if (nuovi) setDatiGex(nuovi);
+      setAvvisoGex(gex.avviso);
+    }
+  }, []);
 
   // Initialize provider and VOLFLOW engine
   useEffect(() => {
     const initProvider = async () => {
       volflowEngineRef.current = new VolflowEngine(2.3, 3.0);
+      setSnapshot(null);
+      setVolflowHistory([]);
+      setFlussoCorrente(0);
+      setAvvisoGex(null);
+      setDatiGex(null);
+      gexRef.current = null;
 
       if (dataSource === "REAL") {
         // Use real data from IBKR via API
-        const realProvider = new RealDataProvider();
+        const realProvider = new RealDataProvider(giorno);
         await realProvider.initialize();
         providerRef.current = realProvider;
+
+        gexRef.current = new GexProvider(giorno);
+        await dopoSnapshot(true);
 
         // La sessione dei volumi si ripercorre tutta al primo giro: il motore
         // arriva al presente con la finestra di z-score gia' piena, e il
         // riquadro in basso copre lo stesso tratto di tempo del grafico dei
         // prezzi invece di ripartire vuoto a ogni ricaricamento.
-        const volumi = new VolumiProvider();
+        const volumi = new VolumiProvider(giorno);
         volumiRef.current = volumi;
         const puntiFlusso = await volumi.nuoviPunti();
         if (puntiFlusso.length > 0) {
-          setVolflowHistory(puntiFlusso.map((p) => ({ timestamp: p.timestamp, value: p.valore })).slice(-720));
+          setVolflowHistory(puntiFlusso.map((p) => ({ timestamp: p.timestamp, value: p.valore })).slice(-3000));
           setFlussoCorrente(puntiFlusso[puntiFlusso.length - 1].valore);
         }
 
         const snap = await realProvider.generateSnapshot();
         if (snap) setSnapshot(snap);
+        else setAvviso(realProvider.ultimoAvviso);
+        setBasis(realProvider.basis);
       } else {
         // Use mock data
         const mockProvider = new MockDataProvider(14, 50);
@@ -111,11 +164,13 @@ export default function SpxGammaPage() {
     };
 
     initProvider();
-  }, [symbol, dataSource]);
+  }, [symbol, dataSource, giorno, dopoSnapshot]);
 
   // Update loop
   useEffect(() => {
     if (!providerRef.current) return;
+    // Una giornata passata e' tutta nel primo caricamento: niente da interrogare.
+    if (giorno && dataSource === "REAL") return;
 
     const update = async () => {
       if (isPaused) return;
@@ -135,6 +190,9 @@ export default function SpxGammaPage() {
       if (newSnapshot) {
         setAvviso(null);
         setSnapshot(newSnapshot);
+        // Il profilo GEX ogni 15 s (un giro su tre), incrementale con ?since=.
+        giriRef.current += 1;
+        await dopoSnapshot(giriRef.current % 3 === 0);
 
         if (dataSource === "REAL" && volumiRef.current) {
           // Incrementale con ?since=: ~2 KB a giro invece della sessione
@@ -143,7 +201,7 @@ export default function SpxGammaPage() {
           if (nuovi.length > 0) {
             setFlussoCorrente(nuovi[nuovi.length - 1].valore);
             setVolflowHistory((prev) =>
-              [...prev, ...nuovi.map((p) => ({ timestamp: p.timestamp, value: p.valore }))].slice(-720),
+              [...prev, ...nuovi.map((p) => ({ timestamp: p.timestamp, value: p.valore }))].slice(-3000),
             );
           }
         } else if (newSnapshot.atmCall && newSnapshot.atmPut && volflowEngineRef.current) {
@@ -181,7 +239,7 @@ export default function SpxGammaPage() {
         clearInterval(updateIntervalRef.current);
       }
     };
-  }, [isPaused, snapshot, dataSource]);
+  }, [isPaused, snapshot, dataSource, giorno, dopoSnapshot]);
 
   const handleCrosshairMove = useCallback(
     (x: number, y: number, timestamp?: number) => {
@@ -198,6 +256,28 @@ export default function SpxGammaPage() {
     [snapshot]
   );
 
+  /**
+   * Barre e livelli GEX da disegnare: GEX OI (il posizionamento) per strike,
+   * LONG/SHORT agli strike piu' positivo e piu' negativo, spostati su ES con
+   * la base. In una giornata passata il profilo segue l'orario sotto il
+   * mouse; senza mouse e' l'ultimo momento in cui il gamma c'era.
+   */
+  const vistaGex = useMemo(() => {
+    if (!snapshot || !datiGex || basis === null) return null;
+    const oraMouse = giorno && hoveredCandle
+      ? new Date(hoveredCandle.timestamp).toLocaleTimeString("it-IT", { hour12: false })
+      : null;
+    const righe = giorno ? profiloAlle(datiGex, oraMouse) : datiGex.profilo;
+    if (righe.length === 0) return null;
+    const { positivo, negativo, totale } = livelliDi(righe);
+    return {
+      bars: righe.map((r) => ({ timestamp: snapshot.timestamp, strike: r.strike, gex: r.gexOi, callGex: 0, putGex: 0 })),
+      long: positivo !== null ? positivo + basis : null,
+      short: negativo !== null ? negativo + basis : null,
+      totale,
+    };
+  }, [snapshot, datiGex, basis, giorno, hoveredCandle]);
+
   if (!snapshot) {
     return (
       <div className={styles.container}>
@@ -208,7 +288,22 @@ export default function SpxGammaPage() {
     );
   }
 
-  const metrics = snapshot.gammaMetrics;
+  // Il profilo porta il GEX netto per strike, non call e put separate: niente
+  // muri CALL/PUT (0 = non disegnati) invece di inventarli.
+  const metrics = vistaGex
+    ? {
+        ...snapshot.gammaMetrics,
+        majorLongGamma: vistaGex.long ?? snapshot.gammaMetrics.majorLongGamma,
+        majorShortGamma: vistaGex.short ?? snapshot.gammaMetrics.majorShortGamma,
+        callGamma: 0,
+        putGamma: 0,
+        totalGex: vistaGex.totale,
+      }
+    : dataSource === "REAL"
+      ? // Senza profilo i livelli non ci sono: prima stavano tutti e quattro
+        // sullo strike ATM come segnaposto, uno sopra l'altro.
+        { ...snapshot.gammaMetrics, majorLongGamma: 0, majorShortGamma: 0, callGamma: 0, putGamma: 0 }
+      : snapshot.gammaMetrics;
   const volatilityMetrics = snapshot.volatilityMetrics;
 
   return (
@@ -227,6 +322,8 @@ export default function SpxGammaPage() {
         isPaused={isPaused}
         onPauseToggle={() => setIsPaused(!isPaused)}
         onInfo={() => setMostraSpiegazione(true)}
+        giorno={giorno}
+        onGiornoChange={dataSource === "REAL" ? cambiaGiorno : undefined}
         onResetZoom={() => {
           setPriceZoom(null);
           setGexZoom(null);
@@ -240,7 +337,7 @@ export default function SpxGammaPage() {
           <div className={styles.priceChartContainer}>
             <PriceChart
               candles={snapshot.priceCandles}
-              gexBars={snapshot.gexBars}
+              gexBars={[]}
               spot={metrics.spot}
               longGamma={metrics.majorLongGamma}
               shortGamma={metrics.majorShortGamma}
@@ -270,14 +367,19 @@ export default function SpxGammaPage() {
         <div className={styles.rightColumn}>
           <div className={styles.gexChartContainer}>
             <GexChart
-              gexBars={snapshot.gexBars}
+              gexBars={vistaGex?.bars ?? (dataSource === "MOCK" ? snapshot.gexBars : [])}
               spot={metrics.spot}
               longGamma={metrics.majorLongGamma}
               shortGamma={metrics.majorShortGamma}
               callGamma={metrics.callGamma}
               putGamma={metrics.putGamma}
               crosshairX={crosshairX}
-              volflow={flussoCorrente}
+              basis={basis ?? 0}
+              avviso={
+                avvisoGex ??
+                (dataSource === "REAL" && basis === null ? "GEX: base ES-SPX dopo l'apertura cash" : null)
+              }
+              volflow={flussoCorrente / 2 + 50}
               gexZoom={gexZoom}
               onGexZoomChange={setGexZoom}
               timeZoom={timeZoom}

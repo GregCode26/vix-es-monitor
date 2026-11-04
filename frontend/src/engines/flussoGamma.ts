@@ -1,5 +1,5 @@
 /**
- * FLUSSO GAMMA - pressione dalle opzioni realmente scambiate.
+ * FLUSSO GAMMA - chi sta scambiando cosa, dalle opzioni realmente scambiate.
  *
  * Sostituisce il VOLFLOW, che misurava le variazioni dei premi ATM. Quella
  * costruzione aveva due difetti misurati sui dati veri:
@@ -13,16 +13,17 @@
  *    volte piu' grande del segnale, che dominava gli z-score.
  *
  * Qui si guardano invece i contratti scambiati, strike per strike, pesati per
- * il loro gamma: e' la domanda di copertura che i dealer devono seguire, ed
- * e' l'unica cosa in questo progetto che sia risultata legata al movimento
- * successivo del prezzo.
+ * il loro gamma.
  *
- * Correlazione col movimento del sottostante nel minuto successivo, misurata
- * su cinque sessioni complete: +0.226 grezzo, +0.182 nella forma qui sotto
- * (z-score piu' EMA), positiva in cinque sessioni su cinque. Non e' una
- * previsione -- 0.18 di correlazione spiega il 3% della varianza -- ma e' un
- * segnale vero, a differenza dello zero che davano tutte le costruzioni sui
- * premi.
+ * NON E' UN SEGNALE (verificato 03/11/2026 su 12 sessioni, 14/10-02/11). Lo
+ * studio iniziale dava +0.18 di correlazione col minuto successivo su cinque
+ * sessioni; rifatto sulle dodici, il minuto successivo va da -0.07 a +0.07
+ * (positivo in 6 su 12) e i cinque minuti da -0.10 a +0.12, mentre coi 30
+ * secondi PRIMA la correlazione e' +0.08...+0.21, positiva in 12 su 12. I
+ * valori oltre +/-60 indovinano la direzione del minuto dopo nel 48.5% dei
+ * casi (355 segnali). Dice cosa si e' appena scambiato dopo un movimento,
+ * non dove va il prezzo; le varianti con il lato Lee-Ready (pesate gamma o
+ * delta) non fanno meglio.
  */
 
 /** Una riga della catena come la manda /api/volumes. */
@@ -50,24 +51,41 @@ export interface PuntoFlusso {
  * Snapshot indietro su cui si misura il flusso.
  *
  * Gli snapshot arrivano ogni ~10 secondi, quindi 3 fanno mezzo minuto.
- * Misurato: 30s da' +0.226, un minuto +0.215, due minuti +0.155, cinque
- * +0.104. Piu' corto di cosi' non si puo' andare, meno di tre snapshot e si
- * finisce dentro il rumore di arrotondamento dei contatori.
+ * Lo studio iniziale (5 sessioni) aveva scelto 30 s su quella base: +0.226,
+ * contro +0.215/+0.155/+0.104 a 1/2/5 minuti. Quella correlazione non ha
+ * retto su 12 sessioni (vedi sopra). Meno di tre snapshot e si finisce
+ * dentro il rumore di arrotondamento dei contatori.
  */
 const FINESTRA_FLUSSO = 3;
 
 /** Finestra del z-score: 180 snapshot, cioe' mezz'ora. */
 const FINESTRA_ZSCORE = 180;
 
-/** EMA da 3 punti (~30s): tiene +0.182 e porta il salto medio a 4.6 punti. */
+/** EMA da 3 punti (~30s): porta il salto medio a 4.6 punti. */
 const EMA_PUNTI = 3;
 
 const CLIP = 3;
+
+/**
+ * Oltre questo silenzio fra due snapshot si riparte da zero.
+ *
+ * Il 02/11/2026 i poller sono rimasti fermi dalle 16:11 alle 19:03: il primo
+ * "flusso" dopo il buco erano tre ore di volume in una finestra sola, e
+ * dentro lo z-score schiacciava tutto il resto a +5 per mezz'ora.
+ */
+const BUCO_MS = 60_000;
 
 export class MotoreFlussoGamma {
   private storia: { timestamp: number; grezzo: number }[] = [];
   private catenaPrecedente: Map<number, { calls: number; puts: number }>[] = [];
   private emaPrecedente: number | null = null;
+  private ultimoTs: number | null = null;
+
+  private azzera(): void {
+    this.storia = [];
+    this.catenaPrecedente = [];
+    this.emaPrecedente = null;
+  }
 
   /**
    * Il flusso pesato gamma fra due fotografie della catena.
@@ -108,6 +126,9 @@ export class MotoreFlussoGamma {
   public aggiungi(snapshot: SnapshotVolumi, timestamp: number): PuntoFlusso | null {
     const righe = Array.isArray(snapshot.volumes) ? (snapshot.volumes as RigaVolumi[]) : null;
     if (!righe || righe.length === 0) return null;
+
+    if (this.ultimoTs !== null && timestamp - this.ultimoTs > BUCO_MS) this.azzera();
+    this.ultimoTs = timestamp;
 
     this.catenaPrecedente.push(MotoreFlussoGamma.indicizza(righe));
     if (this.catenaPrecedente.length > FINESTRA_FLUSSO + 1) this.catenaPrecedente.shift();

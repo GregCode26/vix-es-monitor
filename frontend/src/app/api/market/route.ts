@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
 import { oraRomaDaNy } from '@/lib/orarioNy';
+import { giornoRichiesto, mezzogiornoDi } from '@/lib/giornoRichiesto';
 
 // Initialize Supabase client
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co';
@@ -110,7 +111,7 @@ function livelliDa(punto: PuntoStorico | null, campi: { c: string; ca: string; p
     };
 }
 
-function calcolaRange(storico: PuntoStorico[]) {
+function calcolaRange(storico: PuntoStorico[], giorno: Date = new Date()) {
     return {
         // La mattina si usa la chain ES: alle 10:35 a New York sono le 4:35 e
         // le SPX quotano larghe. Il pomeriggio, a mercato aperto, quella SPX.
@@ -119,7 +120,7 @@ function calcolaRange(storico: PuntoStorico[]) {
             { c: 'esCallBid', ca: 'esCallAsk', p: 'esPutBid', pa: 'esPutAsk' },
         ),
         ob: livelliDa(
-            puntoAllOra(storico, oraRomaDaNy('09:35'), ['callBid', 'callAsk', 'putBid', 'putAsk']),
+            puntoAllOra(storico, oraRomaDaNy('09:35', giorno), ['callBid', 'callAsk', 'putBid', 'putAsk']),
             { c: 'callBid', ca: 'callAsk', p: 'putBid', pa: 'putAsk' },
         ),
     };
@@ -223,16 +224,14 @@ export async function GET(request: Request) {
             }));
         };
 
-        // Le sessioni passate restano nel database ma non si servono: qui si
-        // risponde solo sulla giornata corrente, e non c'e' un `?date=` da
-        // cui chiedere il resto.
-
-        // --- Intraday history for today ---
+        // --- Intraday history: oggi, o `?date=` per una giornata passata ---
+        // Le giornate passate si leggono solo dal file locale, mai da
+        // Supabase (vedi lib/giornoRichiesto.ts). L'ultimo punto resta di oggi.
         if (historyMode) {
-            const today = getTodayKey();
+            const { data: today, passato } = giornoRichiesto(searchParams);
             let data = null;
 
-            if (isSupabaseConfigured) {
+            if (isSupabaseConfigured && !passato) {
                 try {
                     data = await fetchDayRows(today, `time, vix, esf, spx, created_at, volTide, coneUp, coneDown, vwap, ${QUOTE_COLUMNS}`);
                 } catch (e) { console.error('Supabase fetch failed:', e); }
@@ -245,7 +244,7 @@ export async function GET(request: Request) {
             }
 
             const storico = formatHistory(data);
-            return NextResponse.json({ history: storico, range: calcolaRange(storico) }, { status: 200 });
+            return NextResponse.json({ date: today, history: storico, range: calcolaRange(storico, mezzogiornoDi(today)) }, { status: 200 });
 
         } else {
             // --- Latest price mode ---

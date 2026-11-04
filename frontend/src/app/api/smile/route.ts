@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { calcolaVol } from '@/lib/volContesto';
 
 export const dynamic = 'force-dynamic';
 
@@ -439,6 +440,8 @@ export async function GET(request: Request) {
                 storiaVertice,
             },
             punti: [],
+            // Divergenze e contesto restano anche dopo la chiusura (bande no: la seduta e' finita).
+            vol: calcolaVol(dati, date),
         });
     }
     const spot = q.spot;
@@ -505,5 +508,7 @@ export async function GET(request: Request) {
             storiaVertice,
         },
         punti,
+        // Bande di chiusura 68/95%, divergenze SPX/VIX1D e contesto (lib/volContesto.ts).
+        vol: calcolaVol(dati, date),
     });
 }

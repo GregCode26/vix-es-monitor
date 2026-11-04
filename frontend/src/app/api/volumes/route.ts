@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
+import { giornoRichiesto } from '@/lib/giornoRichiesto';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,14 +15,6 @@ interface VolumeSnapshot {
     spxPrice?: number | null;
     isOpening?: boolean;
     volumes: unknown;
-}
-
-function getTodayKey() {
-    const now = new Date();
-    const y = now.getFullYear();
-    const m = String(now.getMonth() + 1).padStart(2, '0');
-    const d = String(now.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
 }
 
 /** `since` e' un orario 'HH:MM:SS': confrontabile con < e > perche' zero-padded. */
@@ -52,15 +45,15 @@ function readLocalSnapshots(targetDate: string): VolumeSnapshot[] | null {
 export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
-        // Solo la giornata corrente: le sessioni passate restano nel database
-        // ma non si servono, e non c'e' un parametro per chiederle.
-        const targetDate = getTodayKey();
+        // Oggi, oppure `?date=` per una giornata passata: quella si legge solo
+        // dal file locale, mai da Supabase (vedi lib/giornoRichiesto.ts).
+        const { data: targetDate, passato } = giornoRichiesto(searchParams);
         const sinceParam = searchParams.get('since');
         const since = isValidTime(sinceParam) ? sinceParam : null;
 
         // Su Vercel esiste solo questa strada: il filesystem non ha i JSON
         // dei poller, che girano sulla macchina locale.
-        if (supabase) {
+        if (supabase && !passato) {
             // PostgREST tronca a 1000 righe senza segnalarlo, e a uno snapshot
             // ogni 10 secondi il tetto arriva dopo meno di tre ore: senza
             // paginare, il primo caricamento perdeva tutto il resto della

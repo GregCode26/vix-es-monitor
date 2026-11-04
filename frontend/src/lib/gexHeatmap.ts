@@ -111,6 +111,11 @@ function colore(scala: Tappa[], q: number): [number, number, number, number] {
   return [c[0], c[1], c[2], Math.round(alfa * 255)];
 }
 
+/** La scala termica di Bookmap per una quota 0..1, [r, g, b, alfa 0..255]: la usa anche /bookmap. */
+export function coloreTermico(q: number): [number, number, number, number] {
+  return colore(SCALA_TERMICA, q);
+}
+
 /** Gradiente CSS di una scala, per la legenda. */
 export function gradienteCss(modo: ModoMappa, verso: 'pos' | 'neg'): string {
   const scala = modo === 'termico' ? SCALA_TERMICA

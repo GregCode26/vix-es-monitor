@@ -32,6 +32,7 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
+import { giornoRichiesto } from '@/lib/giornoRichiesto';
 
 export const dynamic = 'force-dynamic';
 
@@ -166,14 +167,6 @@ const CONTRACT_SIZE = 100;
  * i volumi e il monitor IV. Adesso l'orario che esce di qui e' lo stesso che
  * il poller ha scritto, cioe' quello dell'orologio locale.
  */
-
-function getTodayKey() {
-    const now = new Date();
-    const y = now.getFullYear();
-    const m = String(now.getMonth() + 1).padStart(2, '0');
-    const d = String(now.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-}
 
 /**
  * Gamma exposure di uno strike, in milioni di dollari per un movimento
@@ -419,10 +412,10 @@ function readLocalSnapshots(dateStr: string): Snapshot[] | null {
  * profilo di una risposta incrementale sostituisce quello del client, e senza
  * quella riga gli strike esterni sparirebbero per i 50 s fra una riga e l'altra.
  */
-async function leggiEsterni(dateStr: string, since: string | null): Promise<Snapshot[]> {
+async function leggiEsterni(dateStr: string, since: string | null, usaDb: boolean): Promise<Snapshot[]> {
     const daRiga = (r: { time: string; spx_price: number | null; und_price: number | null; volumes: unknown }): Snapshot =>
         ({ time: r.time, spxPrice: r.spx_price, undPrice: r.und_price, volumes: r.volumes as StrikeRow[], esterno: true });
-    if (supabase) {
+    if (supabase && usaDb) {
         const righe: Snapshot[] = [];
         let errore = false;
         if (since) {
@@ -466,8 +459,8 @@ async function leggiEsterni(dateStr: string, since: string | null): Promise<Snap
  * una richiesta incrementale. Una riga sola, quindi non paga la pena di
  * paginare.
  */
-async function leggiSnapshotPrecedente(dateStr: string, since: string): Promise<Snapshot | null> {
-    if (supabase) {
+async function leggiSnapshotPrecedente(dateStr: string, since: string, usaDb: boolean): Promise<Snapshot | null> {
+    if (supabase && usaDb) {
         const { data, error } = await supabase
             .from('volumes_snapshots')
             .select('time, spx_price, und_price, volumes')
@@ -494,9 +487,10 @@ async function leggiSnapshotPrecedente(dateStr: string, since: string): Promise<
 export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
-        // Solo la giornata corrente: le sessioni passate restano nel database
-        // ma non si servono, e non c'e' un parametro per chiederle.
-        const targetDate = getTodayKey();
+        // Oggi, oppure `?date=` per una giornata passata: quella si legge solo
+        // dai file locali, mai da Supabase (vedi lib/giornoRichiesto.ts).
+        const { data: targetDate, passato } = giornoRichiesto(searchParams);
+        const usaDb = !passato;
         const sinceParam = searchParams.get('since');
         // Ogni snapshot vale ~37 punti: senza `since` la pagina riscaricherebbe
         // l'intera giornata a ogni giro.
@@ -508,7 +502,7 @@ export async function GET(request: Request) {
 
         let snapshots: Snapshot[] | null = null;
 
-        if (supabase) {
+        if (supabase && usaDb) {
             // PostgREST tronca a 1000 righe (`db-max-rows`) senza dire niente.
             // Il poller scrive uno snapshot ogni 10 secondi, quindi il tetto
             // arriva dopo meno di tre ore di sessione: da li' in poi il primo
@@ -561,7 +555,7 @@ export async function GET(request: Request) {
         // ogni giro da 30 secondi perderebbe un pezzo di scambiato.
         let base: Map<number, Netti> | null = null;
         if (since && snapshots.length > 0) {
-            const precedente = await leggiSnapshotPrecedente(targetDate, since);
+            const precedente = await leggiSnapshotPrecedente(targetDate, since, usaDb);
             if (precedente) {
                 base = new Map();
                 for (const row of precedente.volumes ?? []) {
@@ -581,7 +575,7 @@ export async function GET(request: Request) {
         // strike, dopo quello in streaming dello stesso secondo. Una risposta
         // incrementale senza snapshot nuovi resta vuota come prima.
         if (!since || snapshots.length > 0) {
-            const esterni = await leggiEsterni(targetDate, since);
+            const esterni = await leggiEsterni(targetDate, since, usaDb);
             if (esterni.length > 0) {
                 snapshots = [...snapshots, ...esterni].sort((a, b) =>
                     a.time < b.time ? -1 : a.time > b.time ? 1 : Number(!!a.esterno) - Number(!!b.esterno));

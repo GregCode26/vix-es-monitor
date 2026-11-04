@@ -6,6 +6,9 @@ import { Chart as ChartJS, registerables, type Scale, type ScriptableContext } f
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
 import { oraRomaDaNy } from '@/lib/orarioNy';
+import { disegnaCob, LARGHEZZA_COB, mappaBook, type MappaBook } from '@/lib/bookHeatmap';
+import { gradienteCss } from '@/lib/gexHeatmap';
+import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
 
 ChartJS.register(...registerables);
 
@@ -95,6 +98,15 @@ const LARGHEZZA_ASSE = 64;
  * erano 4 pixel, e il prezzo di adesso finiva schiacciato sul bordo.
  */
 const MARGINE_DESTRO_PX = 38;
+/** Con la heatmap il margine fa posto anche alla colonna del book (COB), come in Bookmap. */
+const MARGINE_DESTRO_HEATMAP_PX = LARGHEZZA_COB + 30;
+
+/**
+ * Come si disegnano gli ordini limit: `heatmap` (scala termica di Bookmap,
+ * sfumata, con la colonna del book a destra) o `linee` (i segmenti verde/rosso
+ * di prima, con durata minima e spessore).
+ */
+type StileOrdini = 'heatmap' | 'linee';
 
 const VERDE = '#34d399';
 const ROSSO = '#f43f5e';
@@ -672,6 +684,10 @@ export default function BookmapPage() {
   const [vistaBook, setVistaBook] = useState<VistaBook>('mlofi');
   const [livelliOfi, setLivelliOfi] = useState<LivelliOfi>('10');
   const [durataMin, setDurataMin] = useState<DurataMin>('5');
+  const [stileOrdini, setStileOrdini] = useState<StileOrdini>('heatmap');
+  const [contrasto, setContrasto] = useState(1);
+  /** Il fondo scala della heatmap in contratti, per la legenda. */
+  const [fondoHeatmap, setFondoHeatmap] = useState(0);
   const [mostraAss, setMostraAss] = useState(true);
   const [minAss, setMinAss] = useState<MinAss>('60');
 
@@ -712,6 +728,32 @@ export default function BookmapPage() {
   const vistaBookRef = useRef<VistaBook>('mlofi');
   const livelliOfiRef = useRef<LivelliOfi>('10');
   const durataMinRef = useRef<DurataMin>('5');
+  const stileOrdiniRef = useRef<StileOrdini>('heatmap');
+  const contrastoRef = useRef(1);
+  /** L'ultima immagine della heatmap: si rifa' solo se cambiano vista, dati o impostazioni. */
+  const mappaBookRef = useRef<MappaBook | null>(null);
+  /** Zero Gamma in prezzi SPX (GEXBot a mano, Cboe calcolato): il plugin dei range li porta su ES con l'ultima base. */
+  const zeroGammaRef = useRef<{ valore: number; colore: string; etichetta: string; tratteggio: number[] }[]>([]);
+  /** La traccia dal poller (gialla tratteggiata come GEXBot): [secondi da mezzanotte, SPX]. */
+  const zgTracciaRef = useRef<[number, number][]>([]);
+  const zeroGamma = useZeroGamma();
+  const zgManuale = zeroGamma.manuale?.valore ?? null;
+  // Il Cboe ritardato solo quando la traccia del poller manca.
+  const zgCboe = zeroGamma.attuale?.fonte === 'cboe' ? zeroGamma.attuale.valore : null;
+  const zgTraccia = zeroGamma.traccia;
+  useEffect(() => {
+    zgTracciaRef.current = zgTraccia.map(([t, v]) => [secondi(t), v]);
+    chartPrezzo.current?.draw();
+  }, [zgTraccia]);
+  useEffect(() => {
+    const l: { valore: number; colore: string; etichetta: string; tratteggio: number[] }[] = [];
+    if (zgManuale !== null) l.push({ valore: zgManuale, colore: COLORE_ZERO_GAMMA, etichetta: '0γ GEXBot', tratteggio: [] });
+    if (zgCboe !== null && (zgManuale === null || Math.abs(zgCboe - zgManuale) >= 0.5)) {
+      l.push({ valore: zgCboe, colore: COLORE_ZERO_GAMMA_CBOE, etichetta: '0γ Cboe', tratteggio: [5, 4] });
+    }
+    zeroGammaRef.current = l;
+    chartPrezzo.current?.draw();
+  }, [zgManuale, zgCboe]);
   const mostraAssRef = useRef(true);
   const minAssRef = useRef<MinAss>('60');
   /** Assorbimenti da disegnare, gia' filtrati per dimensione. */
@@ -875,7 +917,8 @@ export default function BookmapPage() {
       // dell'area del grafico, qualunque sia la finestra e la larghezza.
       const ampiezza = ampiezzaRef.current ?? Number(finestraRef.current) * 60;
       const larghezza = cp.chartArea ? cp.chartArea.right - cp.chartArea.left : cp.width - 2 * LARGHEZZA_ASSE;
-      const margine = larghezza > MARGINE_DESTRO_PX * 2 ? (ampiezza * MARGINE_DESTRO_PX) / larghezza : 0;
+      const px = mostraOrdiniRef.current && stileOrdiniRef.current === 'heatmap' ? MARGINE_DESTRO_HEATMAP_PX : MARGINE_DESTRO_PX;
+      const margine = larghezza > px * 2 ? (ampiezza * px) / larghezza : 0;
       a = xs[xs.length - 1] + margine;
       da = a - ampiezza;
       for (const c of [cp, cl, cf]) {
@@ -891,7 +934,9 @@ export default function BookmapPage() {
     const visibili = pts.filter((_, i) => xs[i] >= da && xs[i] <= a);
     // CVD spento: linea nascosta, asse destro vuoto ma largo uguale, cosi' i
     // due grafici restano allineati sul tempo.
-    segmentiRef.current = mostraOrdiniRef.current ? segmentiBook(pts, xs, sogliaRef.current, Number(durataMinRef.current)) : [];
+    segmentiRef.current = mostraOrdiniRef.current && stileOrdiniRef.current === 'linee'
+      ? segmentiBook(pts, xs, sogliaRef.current, Number(durataMinRef.current))
+      : [];
     eventiRef.current = mostraAssRef.current ? eventiDi(pts, Number(minAssRef.current)) : [];
 
     const cvdAcceso = mostraCvdRef.current;
@@ -1085,6 +1130,30 @@ export default function BookmapPage() {
           const segmenti = segmentiRef.current;
           const sx = chart.scales.x;
           const sy = chart.scales.yPrezzo;
+          if (mostraOrdiniRef.current && stileOrdiniRef.current === 'heatmap' && sx && sy) {
+            const area = chart.chartArea;
+            const pts = pointsRef.current;
+            const m = mappaBook(
+              pts, pts.map((p) => secondi(p.time)),
+              { xMin: sx.min, xMax: sx.max, yMin: sy.min, yMax: sy.max, larghezza: area.right - area.left, altezza: area.bottom - area.top },
+              TICK, sogliaRef.current, contrastoRef.current, mappaBookRef.current,
+            );
+            mappaBookRef.current = m;
+            if (!m) return;
+            const yA = sy.getPixelForValue(m.prezzoAlto);
+            const yB = sy.getPixelForValue(m.prezzoBasso);
+            const c = chart.ctx;
+            c.save();
+            c.beginPath();
+            c.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+            c.clip();
+            // Niente smoothing: in orizzontale l'immagine e' gia' larga quanto
+            // l'area (la sfumatura e' nei dati), in verticale ogni tick resta netto.
+            c.imageSmoothingEnabled = false;
+            c.drawImage(m.immagine, area.left, yA, area.right - area.left, yB - yA);
+            c.restore();
+            return;
+          }
           if (segmenti.length === 0 || !sx || !sy) return;
           const s = sogliaRef.current;
           const { ctx, chartArea: a } = chart;
@@ -1109,15 +1178,69 @@ export default function BookmapPage() {
         },
       };
 
+      /** La colonna del book di adesso (COB), sopra la linea del prezzo, solo con la heatmap. */
+      const cob = {
+        id: 'cob',
+        afterDatasetsDraw: (chart: ChartJS) => {
+          const sy = chart.scales.yPrezzo;
+          if (!sy || !mostraOrdiniRef.current || stileOrdiniRef.current !== 'heatmap') return;
+          const pts = pointsRef.current;
+          let ultimo: BookmapPoint | undefined;
+          for (let i = pts.length - 1; i >= 0 && !ultimo; i--) if (pts[i].book) ultimo = pts[i];
+          disegnaCob(chart.ctx, chart.chartArea, (v) => sy.getPixelForValue(v), TICK, ultimo);
+        },
+      };
+
       /** I range ES del grafico principale: linee orizzontali con l'etichetta a destra. */
       const range = {
         id: 'range',
         afterDatasetsDraw: (chart: ChartJS) => {
-          const livelli = rangeRef.current;
           const sy = chart.scales.yPrezzo;
-          if (!mostraRangeRef.current || livelli.length === 0 || !sy) return;
+          // Lo Zero Gamma e' in SPX: si sposta con l'ultima base ES - SPX misurata.
+          const serieBase = baseRef.current;
+          const base = serieBase.length > 0 ? serieBase[serieBase.length - 1].base : null;
+          const zg = base === null ? [] : zeroGammaRef.current.map((z) => ({ ...z, valore: z.valore + base, etichetta: `${z.etichetta} SPX ${z.valore.toFixed(1)}` }));
+          const livelli = [...(mostraRangeRef.current ? rangeRef.current : []), ...zg];
+          const traccia = base === null ? [] : zgTracciaRef.current;
+          if ((livelli.length === 0 && traccia.length === 0) || !sy) return;
           const { ctx, chartArea: a } = chart;
           ctx.save();
+          // La traccia dello Zero Gamma: una lettura al minuto, l'ultima fino al bordo destro.
+          const sx = chart.scales.x;
+          if (traccia.length > 0 && sx && base !== null) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(a.left, a.top, a.right - a.left, a.bottom - a.top);
+            ctx.clip();
+            ctx.beginPath();
+            ctx.setLineDash(TRATTO_ZERO_GAMMA_TRACCIA);
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = COLORE_ZERO_GAMMA_TRACCIA;
+            traccia.forEach(([t, v], i) => {
+              const x = sx.getPixelForValue(t);
+              const y = sy.getPixelForValue(v + base);
+              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            const ultimo = traccia[traccia.length - 1];
+            const yU = sy.getPixelForValue(ultimo[1] + base);
+            const xU = Math.max(sx.getPixelForValue(ultimo[0]), a.left);
+            if (xU < a.right) ctx.lineTo(a.right, yU);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            if (yU >= a.top && yU <= a.bottom) {
+              ctx.font = 'bold 10px Arial';
+              ctx.textBaseline = 'middle';
+              ctx.textAlign = 'left';
+              const testo = `0γ SPX ${ultimo[1].toFixed(1)}`;
+              const w = ctx.measureText(testo).width + 8;
+              ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+              // Oltre le etichette dell'asse SPX, che stanno sul bordo sinistro.
+              ctx.fillRect(a.left + 72, yU - 8, w, 16);
+              ctx.fillStyle = COLORE_ZERO_GAMMA_TRACCIA;
+              ctx.fillText(testo, a.left + 76, yU);
+            }
+            ctx.restore();
+          }
           ctx.font = 'bold 10px Arial';
           ctx.textBaseline = 'middle';
           ctx.textAlign = 'right';
@@ -1337,7 +1460,7 @@ export default function BookmapPage() {
 
       chartPrezzo.current = new ChartJS(prezzoRef.current, {
         type: 'line',
-        plugins: [ordini, range, eventiPlugin, spxAsse, mirino],
+        plugins: [ordini, cob, range, eventiPlugin, spxAsse, mirino],
         data: {
           datasets: [
             {
@@ -1616,7 +1739,7 @@ export default function BookmapPage() {
   /** Solo le linee cambiano: si rifanno i segmenti e si ridisegna, senza ricalcolare il resto a ogni scatto del cursore. */
   const rifaiOrdini = () => {
     const pts = pointsRef.current;
-    segmentiRef.current = mostraOrdiniRef.current
+    segmentiRef.current = mostraOrdiniRef.current && stileOrdiniRef.current === 'linee'
       ? segmentiBook(pts, pts.map((p) => secondi(p.time)), sogliaRef.current, Number(durataMinRef.current))
       : [];
     chartPrezzo.current?.draw();
@@ -1825,6 +1948,51 @@ export default function BookmapPage() {
     applica();
   };
 
+  const cambiaStileOrdini = (v: StileOrdini) => {
+    stileOrdiniRef.current = v;
+    setStileOrdini(v);
+    salva('bookmap_stile_ordini', v);
+    mappaBookRef.current = null;
+    // Cambia anche il margine a destra (posto per il COB): si rifanno gli assi.
+    rifaiOrdini();
+    applica();
+  };
+
+  const cambiaContrasto = (v: number) => {
+    contrastoRef.current = v;
+    setContrasto(v);
+    salva('bookmap_contrasto', String(v));
+    chartPrezzo.current?.draw();
+  };
+
+  useEffect(() => {
+    try {
+      const st = localStorage.getItem('bookmap_stile_ordini');
+      if (st === 'heatmap' || st === 'linee') {
+        stileOrdiniRef.current = st;
+        setStileOrdini(st);
+      }
+      const c = Number(localStorage.getItem('bookmap_contrasto'));
+      if (c >= 0.3 && c <= 4) {
+        contrastoRef.current = c;
+        setContrasto(c);
+      }
+    } catch {
+      // niente preferenza salvata
+    }
+  }, []);
+
+  // Il fondo scala della heatmap per la legenda: lo calcola il plugin a ogni
+  // immagine nuova, qui lo si legge una volta al secondo invece di toccare lo
+  // stato React dentro il disegno.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const f = mappaBookRef.current?.fondo ?? 0;
+      setFondoHeatmap((prec) => (Math.abs(prec - f) < 0.5 ? prec : f));
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
   const cambiaDurataMin = (v: DurataMin) => {
     durataMinRef.current = v;
     setDurataMin(v);
@@ -1990,7 +2158,11 @@ export default function BookmapPage() {
                 title={mostraOrdini ? 'Nascondi le linee degli ordini limit' : 'Mostra le linee degli ordini limit'}
               >
                 {mostraOrdini ? 'ON' : 'OFF'}
-              </button>              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title="Da quanti contratti in su un livello diventa una linea">
+              </button>
+              <div className={mostraOrdini ? '' : 'opacity-40 pointer-events-none'} title="Heatmap: scala termica di Bookmap, sfumata, con il book di adesso a destra. Linee: i segmenti verde bid / rosso ask">
+                <Selettore titolo="Stile" valore={stileOrdini} opzioni={[['heatmap', 'Heatmap'], ['linee', 'Linee']]} onChange={cambiaStileOrdini} />
+              </div>
+              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title={stileOrdini === 'heatmap' ? "Da quanti contratti in su un livello si vede: sotto sfuma fino a meta' soglia" : 'Da quanti contratti in su un livello diventa una linea'}>
                 <input
                   type="range"
                   min={SOGLIA_MIN}
@@ -2004,8 +2176,22 @@ export default function BookmapPage() {
                 <span className="text-white font-bold tabular-nums w-10">≥{soglia}</span>
               </label>
             </div>
+            {stileOrdini === 'heatmap' && (
+              <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`} title="Contrasto della heatmap: verso destra i livelli piccoli si accendono e i grandi saturano. Doppio clic per tornare a 1">
+                <span className="text-slate-500">Contrasto</span>
+                <input
+                  type="range" min={0.3} max={4} step={0.05} value={contrasto}
+                  disabled={!mostraOrdini}
+                  onChange={(e) => cambiaContrasto(Number(e.target.value))}
+                  onDoubleClick={() => cambiaContrasto(1)}
+                  className="w-24 accent-sky-500"
+                />
+                <span className="inline-block w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('termico', 'pos') }} />
+                {fondoHeatmap > 0 && <span className="text-slate-500 tabular-nums" title="Contratti a cui la scala arriva al colore pieno">pieno ≈ {Math.round(fondoHeatmap)}</span>}
+              </label>
+            )}
             <div
-              className={mostraOrdini ? '' : 'opacity-40 pointer-events-none'}
+              className={mostraOrdini && stileOrdini === 'linee' ? '' : 'opacity-40 pointer-events-none'}
               title="Nascondi gli ordini rimasti nel book meno di cosi': quelli fugaci, messi e tolti per saggiare il book, sembrano muri e non lo sono"
             >
               <Selettore
@@ -2029,7 +2215,7 @@ export default function BookmapPage() {
                 <Selettore titolo="≥" valore={minAss} opzioni={[['30', '30'], ['60', '60'], ['100', '100'], ['200', '200']]} onChange={cambiaMinAss} />
               </div>
             </div>
-            <label className={`flex items-center gap-2 ${mostraOrdini ? '' : 'opacity-40'}`}>
+            <label className={`flex items-center gap-2 ${mostraOrdini && stileOrdini === 'linee' ? '' : 'opacity-40'}`}>
               <span className="text-slate-500">Spessore</span>
               <input
                 type="range"
@@ -2037,7 +2223,7 @@ export default function BookmapPage() {
                 max={5}
                 step={0.5}
                 value={spessore}
-                disabled={!mostraOrdini}
+                disabled={!mostraOrdini || stileOrdini !== 'linee'}
                 onChange={(e) => cambiaSpessore(Number(e.target.value))}
                 className="w-24 accent-slate-400"
               />

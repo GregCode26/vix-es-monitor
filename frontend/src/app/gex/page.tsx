@@ -18,6 +18,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
+import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
 import { costruisciMappa, disegnaColonna, disegnaMappa, gradienteCss, LARGHEZZA_COLONNA, type MappaGex, type ModoMappa } from '@/lib/gexHeatmap';
 
 // Base registration (safe for SSR).
@@ -173,6 +174,13 @@ export default function GexPage() {
   // sito pubblicato -- e fanno da base: quelli locali, se ci sono, vincono.
   const [rangeServer, setRangeServer] = useState<Record<string, string>>({});
   const [refLineVisibility, setRefLineVisibility] = useState<Record<string, boolean>>({});
+  // Zero Gamma SPX, l'asse qui e' gia' in SPX: la traccia del nostro poller
+  // (dataset gialla tratteggiata, come GEXBot), GEXBot a mano (orizzontale
+  // piena) e il Cboe ritardato solo se la traccia manca.
+  const zeroGamma = useZeroGamma();
+  const zgManuale = zeroGamma.manuale?.valore ?? null;
+  const zgCboe = zeroGamma.attuale?.fonte === 'cboe' ? zeroGamma.attuale.valore : null;
+  const zgTraccia = zeroGamma.traccia;
 
   useEffect(() => {
     const rileggi = () => {
@@ -592,8 +600,36 @@ export default function GexPage() {
       }
     });
 
+    // Zero Gamma: il manuale pieno, il Cboe tratteggiato (solo se diverso di almeno mezzo punto).
+    for (const [chiave, valore, colore, tratto, nome] of [
+      ['zg', zgManuale, COLORE_ZERO_GAMMA, [], '0γ GEXBot'],
+      ['zgCboe', zgCboe !== null && (zgManuale === null || Math.abs(zgCboe - zgManuale) >= 0.5) ? zgCboe : null, COLORE_ZERO_GAMMA_CBOE, [5, 4], '0γ Cboe'],
+    ] as [string, number | null, string, number[], string][]) {
+      if (valore === null) continue;
+      annotations[chiave] = {
+        type: 'line', yMin: valore, yMax: valore, borderColor: colore, borderWidth: 1.5, borderDash: tratto,
+        label: {
+          display: true, content: `${nome} ${valore.toFixed(1)}`, position: 'start', xAdjust: 8,
+          backgroundColor: 'rgba(15, 23, 42, 0.9)', color: colore, font: { size: 10, weight: 'bold' as const },
+          padding: { top: 2, bottom: 2, left: 4, right: 4 }, borderRadius: 4,
+        },
+      };
+    }
+
+    // Il valore attuale della traccia, in fondo alla linea.
+    const zgUltimo = zgTraccia[zgTraccia.length - 1];
+    if (zgUltimo) {
+      annotations.zgTraccia = {
+        type: 'label', xScaleID: 'xTime', yScaleID: 'y',
+        xValue: new Date(`${new Date().toISOString().slice(0, 10)}T${zgUltimo[0]}`), yValue: zgUltimo[1],
+        content: `0γ ${zgUltimo[1].toFixed(1)}`, position: { x: 'end', y: 'end' }, xAdjust: -150, yAdjust: -4,
+        backgroundColor: 'rgba(15, 23, 42, 0.9)', color: COLORE_ZERO_GAMMA_TRACCIA, font: { size: 10, weight: 'bold' as const },
+        padding: { top: 2, bottom: 2, left: 4, right: 4 }, borderRadius: 4,
+      };
+    }
+
     return annotations;
-  }, [gexProfile, scalaDisegno, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis]);
+  }, [zgTraccia, zgManuale, zgCboe, gexProfile, scalaDisegno, viewMode, spxHistory, lineDate, livelli, refLineVisibility, currentBasis]);
 
   // ─── Build datasets helper ───
   const buildDatasets = useCallback((currentSpxHistory: SpxHistoryPoint[], currentGexProfile: { strike: number; gex: number }[]) => {
@@ -612,6 +648,17 @@ export default function GexPage() {
       type: 'line' as const, chiave: 'prezzo', label: 'SPX Price', data: priceData,
       xAxisID: 'xTime', yAxisID: 'y', borderColor: '#00f0ff',
       borderWidth: 2.5, pointRadius: 0, fill: false, tension: 0.1,
+      showLine: true,
+    };
+
+    // Zero Gamma dal poller, una lettura al minuto: resta la traccia della giornata.
+    const zgDati = zgTraccia
+      .map(([t, v]) => ({ x: new Date(`${todayStr}T${t}`), y: v }))
+      .filter((pt) => !isNaN(pt.x.getTime()));
+    const zgDataset = {
+      type: 'line' as const, chiave: 'zeroGamma', label: 'Zero Gamma', data: zgDati,
+      xAxisID: 'xTime', yAxisID: 'y', borderColor: COLORE_ZERO_GAMMA_TRACCIA,
+      borderWidth: 2, borderDash: TRATTO_ZERO_GAMMA_TRACCIA, pointRadius: 0, fill: false, tension: 0,
       showLine: true,
     };
 
@@ -638,7 +685,7 @@ export default function GexPage() {
         fotogrammi.push({ t: ultimoT, valori: strikeSerie.map((k) => mappa.get(k) ?? 0) });
       }
       mappaRef.current = costruisciMappa(strikeSerie, fotogrammi, modoMappa, lookbackMin, contrasto);
-      return [priceDataset];
+      return [priceDataset, zgDataset];
     }
     mappaRef.current = null;
 
@@ -668,8 +715,8 @@ export default function GexPage() {
       borderColor: (ctx: any) => `rgba(248, 113, 113, ${intensita(ctx, 0.2, 0.95)})`,
       borderWidth: 1, barThickness: 8, indexAxis: 'y' as const,
     };
-    return [priceDataset, posGexDataset, negGexDataset];
-  }, [viewMode, gexBasis, modoMappa, lookbackMin, contrasto]);
+    return [priceDataset, zgDataset, posGexDataset, negGexDataset];
+  }, [viewMode, gexBasis, modoMappa, lookbackMin, contrasto, zgTraccia]);
 
   const handleTimeWindowChange = useCallback((w: number | 'all') => {
     setTimeWindow(w);

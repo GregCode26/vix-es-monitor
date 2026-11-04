@@ -1,7 +1,9 @@
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
@@ -60,6 +62,19 @@ namespace GregDashboard
         [InputParameter("Liquidita' Bookmap", 30)]
         public bool MostraLiquidita = true;
 
+        /// <summary>
+        /// Heatmap: la scala termica di Bookmap, come /bookmap (lib/bookHeatmap.ts):
+        /// ogni colonna di pixel e' la media dei contratti per tick nei secondi
+        /// che copre, blu il book normale, arancio-bianco i muri, e un livello
+        /// sfuma invece di accendersi alla soglia. Linee: i segmenti di prima.
+        /// </summary>
+        [InputParameter("Stile liquidita'", 29, variants: new object[] { "Heatmap (Bookmap)", 0, "Linee", 1 })]
+        public int StileLiquidita = 0;
+
+        /// <summary>Solo heatmap: sopra 1 il colore pieno arriva prima e i livelli piccoli si accendono.</summary>
+        [InputParameter("Contrasto heatmap", 38, 0.3, 4, 0.05, 2)]
+        public double ContrastoHeatmap = 1;
+
         // Il minimo e' quello dell'add-on: sotto MIN_CONTRATTI_BOOK (20) i livelli non arrivano proprio.
         [InputParameter("Soglia contratti limit", 31, 20, 5000, 1, 0)]
         public int SogliaContratti = 50;
@@ -105,17 +120,42 @@ namespace GregDashboard
         [InputParameter("Tenuta assorbimento (s)", 42, 1, TENUTA_MAX, 1, 0)]
         public int TenutaAssorbimento = 1;
 
+        /// <summary>
+        /// La regola trovata il 04/11/2026 su 12 sessioni (vedi CalcolaConferme): IN PROVA,
+        /// da validare con execution/studio_conferma_range.py sulle sessioni nuove.
+        /// </summary>
+        [InputParameter("Conferma sui range OB (in prova)", 45)]
+        public bool MostraConferme = true;
+
+        // Stessa regola sulle wall GEX e sullo Zero Gamma, a richiesta (04/11/2026). Rifatta sulle
+        // stesse giornate: GEX+/GEX- 28 operazioni, 43% vinte, -0,25 pt a operazione (perde);
+        // Zero Gamma 30, 53%, +0,48 (t 0,8: non si sa). Il conto in basso e' separato per tipo.
+        [InputParameter("Conferma anche su GEX+/GEX- (in prova)", 46)]
+        public bool ConfermeGex = true;
+
+        [InputParameter("Conferma anche sullo Zero Gamma (in prova)", 47)]
+        public bool ConfermeZeroGamma = true;
+
         [InputParameter("Smile IV (SPX 0DTE)", 50)]
         public bool MostraSmile = true;
 
         [InputParameter("Larghezza smile (px)", 51, 100, 400, 10, 0)]
         public int LarghezzaSmile = 180;
 
-        [InputParameter("Linee Spot +-1/2 sigma", 52)]
+        [InputParameter("Linee bande chiusura 68/95% (o Spot +-1/2 sigma)", 52)]
         public bool MostraSigma = true;
 
         [InputParameter("Linea IV MIN", 53)]
         public bool MostraIvMin = true;
+
+        /// <summary>
+        /// Lo Zero Gamma SPX di /api/zero-gamma, portato su ES con la base:
+        /// il valore di GEXBot inserito a mano su /market (linea piena) e la traccia
+        /// in tempo reale dal nostro poller (gialla tratteggiata, come GEXBot); il
+        /// Cboe ritardato di 15 minuti solo quando la traccia manca.
+        /// </summary>
+        [InputParameter("Zero Gamma (GEXBot / Cboe)", 60)]
+        public bool MostraZeroGamma = true;
 
         #endregion
 
@@ -167,6 +207,21 @@ namespace GregDashboard
             public volatile bool Ceduto;
         }
 
+        /// <summary>Un'entrata a conferma su un range OB. Esito null = ancora aperta.</summary>
+        private sealed class Conferma
+        {
+            /// <summary>"range", "gex" o "0γ": il conto si tiene separato.</summary>
+            public string Tipo;
+            public string Livello;
+            public double Prezzo;
+            public int Tocco;
+            public int Sec;
+            public int Verso;
+            public double Entrata;
+            public double? Esito;
+            public int? FineSec;
+        }
+
         private sealed class CampioneBook
         {
             public int Sec;
@@ -209,6 +264,17 @@ namespace GregDashboard
             /// <summary>(secondi da mezzanotte ora locale, strike) a ogni cambio del vertice.</summary>
             public List<(int sec, double strike)> StoriaVertice;
             public List<PuntoSmile> Punti;
+            /// <summary>Bande di chiusura 68/95% in prezzi SPX (vol.bande di /api/smile, lib/volContesto.ts); null = si ripiega su +-1/2 sigma.</summary>
+            public double[] Bande;   // su95, su68, giu68, giu95
+            public double BandaQ68Pt, BandaQ95Pt, Vix1d;
+            public double? RvIv;
+            /// <summary>Contesto della giornata: "GIORNATA AMPIA x1.20" e le righe delle misure.</summary>
+            public string Attesa;
+            public double AttesaRange;
+            public List<string> VociContesto = new List<string>();
+            public string UltimaRiga;
+            public string Divergenza;
+            public bool DivRimbalzo;
         }
 
         /// <summary>La traccia IV MIN di un giorno passato (/api/smile?giorni=), con la basis ES-SPX di quel giorno.</summary>
@@ -227,6 +293,8 @@ namespace GregDashboard
         private volatile List<Livello> livelliRange = new List<Livello>();
         private volatile List<RigaGex> profilo = new List<RigaGex>();
         private volatile List<Segmento> segmentiPronti = new List<Segmento>();
+        /// <summary>I campioni del book per la heatmap: copia fatta dal thread delle richieste, i campioni non cambiano dopo l'arrivo.</summary>
+        private volatile CampioneBook[] campioniPronti = Array.Empty<CampioneBook>();
         private volatile List<Assorbimento> assorbimentiPronti = new List<Assorbimento>();
         private volatile DatiSmile smile;
         // Le tracce dei giorni passati: si rileggono al cambio di giorno e ogni 30 minuti.
@@ -234,6 +302,16 @@ namespace GregDashboard
         private DateTime prossimeTracce = DateTime.MinValue;
         private const int GIORNI_TRACCE = 5;
         private volatile string stato = "in attesa della dashboard...";
+        // Zero Gamma in prezzi SPX; NaN = assente. Double non e' volatile: si scrive tutto insieme con un array.
+        private volatile double[] zeroGamma = { double.NaN, double.NaN };
+        // La traccia dal poller (una lettura al minuto, ora italiana = di questo PC); null se manca.
+        private volatile TracciaZeroGamma zgTraccia;
+
+        private sealed class TracciaZeroGamma
+        {
+            public DateTime Mezzanotte;
+            public (int sec, double valore)[] Punti;
+        }
 
         /// <summary>Giorno (yyyy-MM-dd) dei segmenti: i secondi sono dall'inizio di quel giorno, ora locale.</summary>
         private volatile string giornoBook;
@@ -248,6 +326,16 @@ namespace GregDashboard
         private readonly Dictionary<(bool, double), Segmento> aperti = new Dictionary<(bool, double), Segmento>();
         private readonly List<Segmento> chiusi = new List<Segmento>();
         private readonly List<Assorbimento> assorbimenti = new List<Assorbimento>();
+        /// <summary>Il mid Bookmap di ogni secondo della giornata, in ordine: serve alla conferma sui range.</summary>
+        private readonly List<(int sec, double mid)> midGiorno = new List<(int, double)>();
+        private volatile List<Conferma> confermePronte = new List<Conferma>();
+        /// <summary>
+        /// GEX+ / GEX- (strike SPX) come li ha visti l'indicatore, ogni 15 s: l'API da' solo il
+        /// profilo di adesso, e rileggere la sessione intera da /api/gex vorrebbe dire scaricarla
+        /// da Supabase. Si salva in un file temporaneo per ritrovarla dopo un riavvio di Quantower.
+        /// </summary>
+        private readonly List<(int sec, double pos, double neg)> serieGex = new List<(int, double, double)>();
+        private string giornoSerieGex;
         /// <summary>Bid/ask degli ultimi secondi: un assorbimento arriva dopo il secondo a cui e' datato.</summary>
         private readonly List<(int sec, double bid, double ask)> quoteRecenti = new List<(int, double, double)>();
         private string ultimoTempoBook;
@@ -320,12 +408,18 @@ namespace GregDashboard
                 if (MostraSmile && dati != null)
                 {
                     var em = dati.Em ?? 0;
-                    if (MostraSigma && em > 0)
+                    if (MostraSigma && dati.Bande != null)
+                        foreach (var p in dati.Bande) livelli.Add(p + b.Value);
+                    else if (MostraSigma && em > 0)
                         foreach (var k in new[] { -2, -1, 1, 2 }) livelli.Add(dati.Spot + k * em + b.Value);
                     var vertice = dati.StoriaVertice.Count > 0 ? dati.StoriaVertice[^1].strike : dati.VerticeStrike;
                     if (MostraIvMin && vertice != null) livelli.Add(vertice.Value + b.Value);
                 }
             }
+
+            var b0 = BaseCorrente();
+            if (MostraZeroGamma && b0 != null)
+                foreach (var v in zeroGamma) if (!double.IsNaN(v)) livelli.Add(v + b0.Value);
 
             AppDomain.CurrentDomain.SetData(CHIAVE_LIVELLI, livelli.ToArray());
         }
@@ -338,6 +432,7 @@ namespace GregDashboard
             var prossimoStorico = DateTime.MinValue;
             var prossimoGex = DateTime.MinValue;
             var prossimoSmile = DateTime.MinValue;
+            var prossimoZg = DateTime.MinValue;
             while (!token.IsCancellationRequested)
             {
                 var ora = DateTime.Now;
@@ -361,6 +456,7 @@ namespace GregDashboard
                     if (ora >= prossimoGex)
                     {
                         if (MostraGex) await LeggiGex(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("gex"); });
+                        if (MostraGex) RegistraGex();
                         prossimoGex = ora.AddSeconds(15);
                     }
                     // Come /market: ogni 10 s (~3 KB, solo locale).
@@ -374,6 +470,12 @@ namespace GregDashboard
                         }
                         prossimoSmile = ora.AddSeconds(10);
                     }
+                    // Lo Zero Gamma cambia piano (Cboe ogni 5 minuti, il manuale quando lo si inserisce).
+                    if (ora >= prossimoZg)
+                    {
+                        if (MostraZeroGamma) await LeggiZeroGamma(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("zero gamma"); });
+                        prossimoZg = ora.AddSeconds(60);
+                    }
                     if (MostraLiquidita || MostraAssorbimenti) await LeggiBookmap(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("bookmap"); });
                     PubblicaLivelli();
 
@@ -385,6 +487,104 @@ namespace GregDashboard
                 }
                 try { await Task.Delay(2000, token); } catch (TaskCanceledException) { return; }
             }
+        }
+
+        private async Task LeggiZeroGamma(CancellationToken token)
+        {
+            using var doc = await Get("/api/zero-gamma", token);
+            if (doc == null) return;
+            var r = doc.RootElement;
+            var manuale = r.TryGetProperty("manuale", out var m) && m.ValueKind == JsonValueKind.Object ? Numero(m, "valore") : null;
+            var cboe = r.TryGetProperty("cboe", out var c) && c.ValueKind == JsonValueKind.Object ? Numero(c, "principale") : null;
+            // La traccia del nostro poller (stessa definizione di GEXBot, in tempo reale): se c'e',
+            // il suo ultimo valore prende il posto del Cboe ritardato di 15 minuti.
+            TracciaZeroGamma traccia = null;
+            if (r.TryGetProperty("poller", out var pl) && pl.ValueKind == JsonValueKind.Object
+                && pl.TryGetProperty("serie", out var serie) && serie.ValueKind == JsonValueKind.Array
+                && r.TryGetProperty("date", out var dt)
+                && DateTime.TryParseExact(dt.GetString(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte))
+            {
+                var punti = new List<(int, double)>();
+                foreach (var e in serie.EnumerateArray())
+                    if (e.ValueKind == JsonValueKind.Array && e.GetArrayLength() >= 2)
+                        punti.Add((Secondi(e[0].GetString()), e[1].GetDouble()));
+                if (punti.Count > 0) traccia = new TracciaZeroGamma { Mezzanotte = mezzanotte, Punti = punti.ToArray() };
+            }
+            zgTraccia = traccia;
+            var attuale = traccia != null ? traccia.Punti[^1].valore : cboe;
+            zeroGamma = new[] { manuale ?? double.NaN, attuale ?? double.NaN };
+        }
+
+        /// <summary>Le linee dello Zero Gamma, con il nome a sinistra (a destra ci sono profilo GEX e smile).</summary>
+        private void DisegnaZeroGamma(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
+        {
+            var b = BaseCorrente();
+            var zg = zeroGamma;
+            if (b == null) return;
+            using var font = new Font("Arial", 9f, FontStyle.Bold, GraphicsUnit.Pixel);
+            for (var i = 0; i < 2; i++)
+            {
+                var v = zg[i];
+                if (double.IsNaN(v)) continue;
+                // La traccia del poller, quando c'e', al posto della linea Cboe.
+                if (i == 1 && zgTraccia is { } traccia) { DisegnaTracciaZeroGamma(g, area, conv, traccia, b.Value, font); continue; }
+                // Il Cboe solo se diverso dal manuale di almeno mezzo punto, come nelle pagine.
+                if (i == 1 && !double.IsNaN(zg[0]) && Math.Abs(v - zg[0]) < 0.5) continue;
+                var y = (float)conv.GetChartY(v + b.Value);
+                if (y < area.Top || y > area.Bottom) continue;
+                var colore = i == 0 ? ZG_COLORE : Color.FromArgb(190, ZG_COLORE);
+                using var pen = new Pen(colore, 1.5f);
+                if (i == 1) pen.DashPattern = new float[] { 5, 4 };
+                g.DrawLine(pen, area.Left, y, area.Right, y);
+                var testo = $"{(i == 0 ? "0γ GEXBot" : "0γ Cboe")} SPX {v:0.0}";
+                var dim = g.MeasureString(testo, font);
+                using (var fondo = new SolidBrush(Color.FromArgb(220, 15, 23, 42)))
+                    g.FillRectangle(fondo, area.Left + 4, y - dim.Height / 2 - 1, dim.Width + 4, dim.Height + 2);
+                using var br = new SolidBrush(colore);
+                g.DrawString(testo, font, br, area.Left + 6, y - dim.Height / 2);
+            }
+        }
+
+        private static readonly Color ZG_COLORE = ColorTranslator.FromHtml("#fb923c");
+        private static readonly Color ZG_TRACCIA = ColorTranslator.FromHtml("#eab308");
+
+        /// <summary>
+        /// Lo Zero Gamma nel tempo, come la linea gialla tratteggiata di GEXBot: una
+        /// lettura al minuto dal poller, tutta portata su ES con la base di adesso
+        /// (come la traccia IV MIN), l'ultima prolungata fino al bordo destro.
+        /// </summary>
+        private static void DisegnaTracciaZeroGamma(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv,
+            TracciaZeroGamma traccia, double baseEs, Font font)
+        {
+            var punti = new List<PointF>(traccia.Punti.Length + 1);
+            foreach (var (sec, valore) in traccia.Punti)
+            {
+                var x = (float)conv.GetChartX(Utc(traccia.Mezzanotte, sec));
+                if (x < area.Left - 50 || x > area.Right + 50) continue;
+                punti.Add(new PointF(x, (float)conv.GetChartY(valore + baseEs)));
+            }
+            var ultimo = traccia.Punti[^1].valore;
+            var yU = (float)conv.GetChartY(ultimo + baseEs);
+            var xU = (float)conv.GetChartX(Utc(traccia.Mezzanotte, traccia.Punti[^1].sec));
+            if (xU < area.Right) punti.Add(new PointF(area.Right, yU));
+            var stato = g.Save();
+            g.SetClip(area);
+            if (punti.Count >= 2)
+            {
+                using var pen = new Pen(ZG_TRACCIA, 2f) { DashPattern = new float[] { 4, 2 } };
+                g.DrawLines(pen, punti.ToArray());
+            }
+            if (yU >= area.Top && yU <= area.Bottom)
+            {
+                var testo = $"0γ SPX {ultimo:0.0}";
+                var dim = g.MeasureString(testo, font);
+                var xT = Math.Clamp(xU + 6, area.Left + 4, area.Right - dim.Width - 8);
+                using (var fondo = new SolidBrush(Color.FromArgb(220, 15, 23, 42)))
+                    g.FillRectangle(fondo, xT - 2, yU - dim.Height - 3, dim.Width + 4, dim.Height + 2);
+                using var br = new SolidBrush(ZG_TRACCIA);
+                g.DrawString(testo, font, br, xT, yU - dim.Height - 2);
+            }
+            g.Restore(stato);
         }
 
         private async Task<JsonDocument> Get(string percorso, CancellationToken token)
@@ -619,7 +819,54 @@ namespace GregDashboard
                     Conv = Numero(p, "conv"),
                 });
             }
+            LeggiVol(root, d);
             smile = d;
+        }
+
+        /// <summary>vol di /api/smile (dal 03/11/2026): bande calibrate, divergenze SPX/VIX1D, contesto. Come lib/smileChart.ts.</summary>
+        private static void LeggiVol(JsonElement root, DatiSmile d)
+        {
+            if (!root.TryGetProperty("vol", out var vol) || vol.ValueKind != JsonValueKind.Object) return;
+            if (vol.TryGetProperty("bande", out var b) && b.ValueKind == JsonValueKind.Object &&
+                Numero(b, "su95") is double su95 && Numero(b, "su68") is double su68 &&
+                Numero(b, "giu68") is double giu68 && Numero(b, "giu95") is double giu95)
+            {
+                d.Bande = new[] { su95, su68, giu68, giu95 };
+                var em = Numero(b, "emResto") ?? 0;
+                d.BandaQ68Pt = (Numero(b, "q68") ?? 0) * em;
+                d.BandaQ95Pt = (Numero(b, "q95") ?? 0) * em;
+                d.Vix1d = Numero(b, "vix1d") ?? 0;
+                d.RvIv = Numero(b, "rvIv");
+            }
+            if (vol.TryGetProperty("contesto", out var c) && c.ValueKind == JsonValueKind.Object)
+            {
+                d.Attesa = Stringa(c, "attesa");
+                d.AttesaRange = Numero(c, "rangeRelativo") ?? 1;
+                if (c.TryGetProperty("voci", out var voci) && voci.ValueKind == JsonValueKind.Array)
+                    foreach (var v in voci.EnumerateArray())
+                    {
+                        var nome = Stringa(v, "nome");
+                        if (nome == null || nome == "VIX" || nome == "VIX/VIX3M") continue;
+                        var valore = Numero(v, "valore") ?? 0;
+                        var testo = nome == "SKEW" ? valore.ToString("0", CultureInfo.InvariantCulture) : valore.ToString("0.00", CultureInfo.InvariantCulture);
+                        var rel = (Numero(v, "rangeRelativo") ?? 1).ToString("0.00", CultureInfo.InvariantCulture);
+                        d.VociContesto.Add($"{nome} {testo} ({Numero(v, "percentile") ?? 0}°) ×{rel}");
+                    }
+            }
+            if (vol.TryGetProperty("ultima", out var u) && u.ValueKind == JsonValueKind.Object)
+            {
+                var ds = Numero(u, "dS") ?? 0;
+                var res = Numero(u, "residuo") ?? 0;
+                d.UltimaRiga = $"SPX 30' {(ds >= 0 ? "+" : "")}{F1(ds)}σ · res VIX1D {(res >= 0 ? "+" : "")}{res.ToString("0.00", CultureInfo.InvariantCulture)}";
+            }
+            if (vol.TryGetProperty("divergenze", out var dv) && dv.ValueKind == JsonValueKind.Array && dv.GetArrayLength() > 0)
+            {
+                var ultima = dv[dv.GetArrayLength() - 1];
+                var tipo = Stringa(ultima, "tipo");
+                var ora = Stringa(ultima, "time") ?? "";
+                d.DivRimbalzo = tipo == "rimbalzo";
+                d.Divergenza = $"div. {tipo} {(ora.Length >= 5 ? ora.Substring(0, 5) : ora)} (in prova)";
+            }
         }
 
         private async Task LeggiBookmap(CancellationToken token)
@@ -629,7 +876,7 @@ namespace GregDashboard
             if (sogliaUsata != SogliaContratti || aliasUsato != alias)
             {
                 sogliaUsata = SogliaContratti;
-                if (aliasUsato != alias) { campioni.Clear(); assorbimenti.Clear(); quoteRecenti.Clear(); ultimoTempoBook = null; }
+                if (aliasUsato != alias) { campioni.Clear(); assorbimenti.Clear(); quoteRecenti.Clear(); midGiorno.Clear(); ultimoTempoBook = null; }
                 aliasUsato = alias;
                 RifaiSegmenti();
             }
@@ -648,10 +895,13 @@ namespace GregDashboard
                 chiusi.Clear();
                 assorbimenti.Clear();
                 quoteRecenti.Clear();
+                midGiorno.Clear();
+                confermePronte = new List<Conferma>();
                 if (since != null)
                 {
                     ultimoTempoBook = null;
                     segmentiPronti = new List<Segmento>();
+                    campioniPronti = Array.Empty<CampioneBook>();
                     assorbimentiPronti = new List<Assorbimento>();
                     return;
                 }
@@ -659,6 +909,8 @@ namespace GregDashboard
             if (!root.TryGetProperty("points", out var punti) || punti.ValueKind != JsonValueKind.Array) return;
 
             var nuovi = 0;
+            // Primo giro: la finestra arriva solo alle ultime 3 ore, gli assorbimenti di prima a parte.
+            if (since == null) nuovi += await LeggiAssorbimentiPrima(alias, token);
             foreach (var p in punti.EnumerateArray())
             {
                 var t = Stringa(p, "time");
@@ -667,6 +919,7 @@ namespace GregDashboard
                 if (alias.Length > 0 && Stringa(p, "alias") != alias) continue;
                 // Prima il secondo nuovo allunga le tenute aperte, poi arrivano gli assorbimenti nuovi.
                 if (Quota(Secondi(t), Numero(p, "bid"), Numero(p, "ask"))) nuovi++;
+                if (AggiungiMid(Secondi(t), Numero(p, "bid"), Numero(p, "ask"))) nuovi++;
                 nuovi += LeggiAssorbimenti(p);
                 if (!p.TryGetProperty("book", out var book) || book.ValueKind != JsonValueKind.Object) continue;
                 var c = new CampioneBook { Sec = Secondi(t), B = Righe(book, "b"), A = Righe(book, "a") };
@@ -681,8 +934,204 @@ namespace GregDashboard
             var limite = ultimoSec - MAX_SEC_BOOK;
             campioni.RemoveAll(c => c.Sec < limite);
             chiusi.RemoveAll(s => s.A < limite);
-            assorbimenti.RemoveAll(a => a.Sec < limite);
+            // Gli assorbimenti no: sono pochi (~2.000 al giorno) e devono restare tutta la giornata.
             Pubblica();
+            if (MostraConferme) CalcolaConferme();
+        }
+
+        private static string FileSerieGex(string giorno) => Path.Combine(Path.GetTempPath(), $"GregDashboard-gex-{giorno}.txt");
+
+        /// <summary>Lo strike piu' positivo e piu' negativo del profilo di adesso (NaN se manca), accodato alla serie del giorno.</summary>
+        private void RegistraGex()
+        {
+            var oggi = Oggi();
+            if (giornoSerieGex != oggi)
+            {
+                serieGex.Clear();
+                giornoSerieGex = oggi;
+                try
+                {
+                    foreach (var riga in File.ReadAllLines(FileSerieGex(oggi)))
+                    {
+                        var c = riga.Split(';');
+                        if (c.Length == 3 && int.TryParse(c[0], out var t)
+                            && double.TryParse(c[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var ps)
+                            && double.TryParse(c[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var ng))
+                            serieGex.Add((t, ps, ng));
+                    }
+                }
+                catch (IOException) { }
+            }
+            var righe = profilo;
+            var sec = (int)DateTime.Now.TimeOfDay.TotalSeconds;
+            if (righe.Count == 0 || !DentroCash(sec)) return;
+            double Valore(RigaGex r) => BaseGex switch { 0 => r.Gex, 2 => r.GexLr, _ => r.GexOi };
+            var major = righe.OrderByDescending(Valore).First();
+            var minor = righe.OrderBy(Valore).First();
+            var pos = Valore(major) > 0 ? major.Strike : double.NaN;
+            var neg = Valore(minor) < 0 ? minor.Strike : double.NaN;
+            if (serieGex.Count > 0 && sec <= serieGex[^1].sec) return;
+            serieGex.Add((sec, pos, neg));
+            try
+            {
+                File.AppendAllText(FileSerieGex(oggi), string.Format(CultureInfo.InvariantCulture, "{0};{1};{2}\n", sec, pos, neg));
+            }
+            catch (IOException) { }
+        }
+
+        /// <summary>La base ES-SPX a un secondo: mediana delle letture dei 5 minuti prima (come BaseCorrente, ma nel passato).</summary>
+        private double?[] BaseAlSecondo(int s0, int n)
+        {
+            var out_ = new double?[n];
+            if (BaseManuale != 0) { for (var k = 0; k < n; k++) out_[k] = BaseManuale; return out_; }
+            List<(int sec, double valore)> serie;
+            lock (lockBase)
+            {
+                if (giornoBase != Oggi()) return out_;
+                serie = new List<(int, double)>(serieBase);
+            }
+            var j = 0;
+            var finestra = new List<double>();
+            for (var k = 0; k < n; k += 15)
+            {
+                var s = s0 + k;
+                while (j < serie.Count && serie[j].sec <= s) j++;
+                if (j == 0) continue;
+                finestra.Clear();
+                var ultimo = serie[j - 1].sec;
+                for (var i = j - 1; i >= 0 && serie[i].sec > ultimo - BASE_FINESTRA_SEC; i--) finestra.Add(serie[i].valore);
+                finestra.Sort();
+                var m = finestra.Count / 2;
+                var v = finestra.Count % 2 == 1 ? finestra[m] : (finestra[m - 1] + finestra[m]) / 2;
+                for (var q = k; q < Math.Min(n, k + 15); q++) out_[q] = v;
+            }
+            return out_;
+        }
+
+        /// <summary>Punti (sec, prezzo SPX) a gradini, in ES: l'ultimo valore entro etaMax secondi, piu' la base. NaN = assente.</summary>
+        private static double[] AGradini(IReadOnlyList<(int sec, double valore)> punti, int s0, int n, int etaMax, double?[] base_)
+        {
+            var out_ = new double[n];
+            var j = 0;
+            for (var k = 0; k < n; k++)
+            {
+                var s = s0 + k;
+                while (j < punti.Count && punti[j].sec <= s) j++;
+                out_[k] = j == 0 || s - punti[j - 1].sec > etaMax || base_[k] == null || double.IsNaN(punti[j - 1].valore)
+                    ? double.NaN : punti[j - 1].valore + base_[k].Value;
+            }
+            return out_;
+        }
+
+        private bool AggiungiMid(int sec, double? bid, double? ask)
+        {
+            if (bid == null || ask == null || ask <= bid) return false;
+            if (midGiorno.Count > 0 && sec <= midGiorno[^1].sec) return false;
+            midGiorno.Add((sec, (bid.Value + ask.Value) / 2));
+            return true;
+        }
+
+        // La regola, come in execution/studio_conferma_range.py: non cambiare un numero qui senza cambiarlo li'.
+        private const double CONF_RIARMO = 5, CONF_TOCCO = 0.5, CONF_PUNTI = 1.5, CONF_STOP = 3, CONF_TARGET = 4;
+        private const int CONF_FINESTRA = 120, CONF_DURATA = 1800;
+
+        /// <summary>
+        /// Entrata a conferma sui range OB, la sola regola rimasta in piedi nella ricerca del
+        /// 04/11/2026 (12 sessioni, prime 6 per cercare e ultime 6 per verificare, netto di
+        /// 0,25 pt di costi: +0,64 e +0,97 pt a operazione, 56-60% vinte; sui livelli finti
+        /// spostati di 7 pt la stessa regola perde in tutte le 81 varianti provate).
+        /// Livello armato con ES ad almeno 5 pt; tocco entro 0,5 pt; se entro 120 s ES riparte
+        /// di 1,5 pt dalla parte da cui e' arrivato, prima di passare 1,5 pt oltre, si entra
+        /// li': stop 3, target 4, chiusura a mercato dopo 30 minuti. Si ricalcola da capo a
+        /// ogni giro: sono ~25.000 secondi per 6 livelli.
+        /// </summary>
+        private void CalcolaConferme()
+        {
+            if (midGiorno.Count < 2) { confermePronte = new List<Conferma>(); return; }
+            int s0 = midGiorno[0].sec, s1 = midGiorno[^1].sec, n = s1 - s0 + 1;
+            var mid = new double[n];
+            var j = 0;
+            for (var s = s0; s <= s1; s++)
+            {
+                while (j + 1 < midGiorno.Count && midGiorno[j + 1].sec <= s) j++;
+                mid[s - s0] = midGiorno[j].mid;
+            }
+            // Ogni livello e' una serie al secondo (NaN = assente): i range sono fermi, GEX e 0γ si muovono.
+            var livelli = new List<(string tipo, string nome, double[] prezzi)>();
+            foreach (var l in livelliRange.Where(l => !l.Tratteggiato))
+                livelli.Add(("range", l.Etichetta, Enumerable.Repeat(l.Prezzo, n).ToArray()));
+            if ((ConfermeGex && serieGex.Count > 0) || (ConfermeZeroGamma && zgTraccia != null))
+            {
+                var base_ = BaseAlSecondo(s0, n);
+                if (ConfermeGex && serieGex.Count > 0)
+                {
+                    livelli.Add(("gex", "GEX+", AGradini(serieGex.Select(g => (g.sec, g.pos)).ToList(), s0, n, 300, base_)));
+                    livelli.Add(("gex", "GEX-", AGradini(serieGex.Select(g => (g.sec, g.neg)).ToList(), s0, n, 300, base_)));
+                }
+                if (ConfermeZeroGamma && zgTraccia is { } zg)
+                    livelli.Add(("0γ", "0γ", AGradini(zg.Punti, s0, n, 180, base_)));
+            }
+            if (livelli.Count == 0) { confermePronte = new List<Conferma>(); return; }
+            var da = Math.Max(s0, Secondi(OraLocaleDaNy(9, 35) + ":00"));
+            var fine = Math.Min(s1, Secondi(OraLocaleDaNy(16, 0) + ":00") - 60);
+            var trovate = new List<Conferma>();
+            foreach (var (tipo, nome, prezzi) in livelli)
+            {
+                var armato = false;
+                var lato = 0;
+                for (var s = da; s <= fine; s++)
+                {
+                    var L = prezzi[s - s0];
+                    var prima = s > s0 ? prezzi[s - s0 - 1] : double.NaN;
+                    // Livello assente o saltato su uno strike nuovo: si riarma da capo (un salto sul prezzo non e' un tocco).
+                    if (double.IsNaN(L) || double.IsNaN(prima) || Math.Abs(L - prima) > 1) { armato = false; continue; }
+                    var x = mid[s - s0] - L;
+                    if (Math.Abs(x) >= CONF_RIARMO) { armato = true; lato = x > 0 ? 1 : -1; continue; }
+                    if (!armato || Math.Abs(x) > CONF_TOCCO) continue;
+                    armato = false;
+                    int? k = null;
+                    for (var t = s + 1; t <= Math.Min(s1, s + CONF_FINESTRA); t++)
+                    {
+                        var y = lato * (mid[t - s0] - L);
+                        if (y <= -CONF_PUNTI) break;
+                        if (y >= CONF_PUNTI) { k = t; break; }
+                    }
+                    if (k == null) continue;
+                    var c = new Conferma { Tipo = tipo, Livello = nome, Prezzo = L, Tocco = s, Sec = k.Value, Verso = lato, Entrata = mid[k.Value - s0] };
+                    for (var t = k.Value + 1; t <= s1; t++)
+                    {
+                        var z = lato * (mid[t - s0] - c.Entrata);
+                        if (z >= CONF_TARGET) { c.Esito = CONF_TARGET; c.FineSec = t; break; }
+                        if (z <= -CONF_STOP) { c.Esito = -CONF_STOP; c.FineSec = t; break; }
+                        if (t - k.Value >= CONF_DURATA) { c.Esito = z; c.FineSec = t; break; }
+                    }
+                    trovate.Add(c);
+                }
+            }
+            confermePronte = trovate.OrderBy(c => c.Sec).ToList();
+        }
+
+        /// <summary>
+        /// Gli assorbimenti di prima della finestra iniziale (/api/bookmap?assorbimenti=1),
+        /// coi secondi di bid/ask che servono alla tenuta. Fino al 04/11/2026 sparivano
+        /// insieme al book dopo 3 ore: a sera non c'erano frecce prima delle 17:40.
+        /// </summary>
+        private async Task<int> LeggiAssorbimentiPrima(string alias, CancellationToken token)
+        {
+            using var doc = await Get("/api/bookmap?assorbimenti=1", token);
+            if (doc == null || Stringa(doc.RootElement, "date") != giornoBook) return 0;
+            if (!doc.RootElement.TryGetProperty("points", out var punti) || punti.ValueKind != JsonValueKind.Array) return 0;
+            var n = 0;
+            foreach (var p in punti.EnumerateArray())
+            {
+                var t = Stringa(p, "time");
+                if (t == null) continue;
+                if (alias.Length > 0 && Stringa(p, "alias") != alias) continue;
+                Quota(Secondi(t), Numero(p, "bid"), Numero(p, "ask"));
+                AggiungiMid(Secondi(t), Numero(p, "bid"), Numero(p, "ask"));
+                n += LeggiAssorbimenti(p);
+            }
+            return n;
         }
 
         /// <summary>Gli assorbimenti del campione: [prezzo, contratti, verso, "HH:MM:SS"]. Le righe rotte si saltano.</summary>
@@ -799,6 +1248,7 @@ namespace GregDashboard
             lista.AddRange(chiusi.Select(Clona));
             lista.AddRange(aperti.Values.Select(Clona));
             segmentiPronti = lista;
+            campioniPronti = campioni.ToArray();
             // Gli assorbimenti non cambiano dopo l'arrivo: basta copiare la lista.
             assorbimentiPronti = new List<Assorbimento>(assorbimenti);
         }
@@ -825,8 +1275,10 @@ namespace GregDashboard
                 if (MostraLiquidita) DisegnaLiquidita(g, area, conv);
                 if (MostraRangeOb || MostraRangeMattino) DisegnaRange(g, area, conv);
                 if (MostraGex) DisegnaGex(g, area, conv);
+                if (MostraZeroGamma) DisegnaZeroGamma(g, area, conv);
                 if (MostraSmile) DisegnaSmile(g, area, conv);
                 if (MostraAssorbimenti) DisegnaAssorbimenti(g, area, conv);
+                if (MostraConferme) DisegnaConferme(g, area, conv);
 
                 var s = stato;
                 if (s != null)
@@ -843,6 +1295,7 @@ namespace GregDashboard
 
         private void DisegnaLiquidita(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
         {
+            if (StileLiquidita == 0) { DisegnaHeatmap(g, area, conv); return; }
             var segmenti = segmentiPronti;
             var giorno = giornoBook;
             if (segmenti.Count == 0 || giorno == null) return;
@@ -878,6 +1331,216 @@ namespace GregDashboard
             }
             LegendaLiquidita(g, area, soglia, pieno);
         }
+
+        #region Heatmap stile Bookmap
+
+        /// <summary>La scala termica di /bookmap e /gex (SCALA_TERMICA in lib/gexHeatmap.ts): q, r, g, b.</summary>
+        private static readonly double[][] SCALA_TERMICA =
+        {
+            new double[] { 0.0, 12, 22, 48 }, new double[] { 0.18, 22, 60, 130 }, new double[] { 0.36, 30, 125, 200 },
+            new double[] { 0.5, 70, 185, 215 }, new double[] { 0.64, 215, 205, 85 }, new double[] { 0.78, 238, 140, 45 },
+            new double[] { 0.9, 222, 72, 38 }, new double[] { 1.0, 255, 236, 220 },
+        };
+
+        /// <summary>Colore e opacita' (0-255) a quota q, come coloreTermico(): l'opacita' sale piu' in fretta all'inizio.</summary>
+        private static (int r, int g, int b, int a) Termico(double q)
+        {
+            q = Math.Clamp(q, 0, 1);
+            var s = SCALA_TERMICA;
+            int i = 1;
+            while (i < s.Length - 1 && q > s[i][0]) i++;
+            var f = Math.Clamp((q - s[i - 1][0]) / (s[i][0] - s[i - 1][0]), 0, 1);
+            int Mix(int k) => (int)Math.Round(s[i - 1][k] + (s[i][k] - s[i - 1][k]) * f);
+            var alfa = Math.Min(1, Math.Pow(q, 0.6) * 1.15);
+            return (Mix(1), Mix(2), Mix(3), (int)Math.Round(alfa * 255));
+        }
+
+        private Bitmap heatmap;
+        private string chiaveHeatmap;
+        private double heatmapAlto, heatmapBasso, heatmapPieno;
+        private const int RIGHE_MAX = 1200;
+
+        /// <summary>
+        /// La liquidita' come immagine larga quanto il grafico, una colonna per
+        /// pixel e una riga per tick (o piu' tick per riga se la vista e' molto
+        /// alta). Si ricostruisce solo se cambiano vista, dati o impostazioni.
+        /// </summary>
+        private void DisegnaHeatmap(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
+        {
+            var camp = campioniPronti;
+            var giorno = giornoBook;
+            if (camp.Length == 0 || giorno == null || area.Width <= 0 || area.Height <= 0) return;
+            if (!DateTime.TryParseExact(giorno, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) return;
+
+            double SecDi(DateTime t)
+            {
+                var utc = t.Kind == DateTimeKind.Local ? t.ToUniversalTime() : DateTime.SpecifyKind(t, DateTimeKind.Utc);
+                return (utc.ToLocalTime() - mezzanotte).TotalSeconds;
+            }
+
+            var pAlto = conv.GetPrice(area.Top);
+            var pBasso = conv.GetPrice(area.Bottom);
+            if (!(pAlto > pBasso)) return;
+            var sx0 = SecDi(conv.GetTime(area.Left));
+            var sx1 = SecDi(conv.GetTime(area.Right));
+            var soglia = Math.Max(1, sogliaUsata);
+            var chiave = string.Join("|", area.Width, area.Height, pAlto, pBasso, sx0, sx1, camp.Length, camp[^1].Sec,
+                soglia, ContrastoHeatmap, ContrattiPieno, TrasparenzaLiquidita);
+            if (chiave != chiaveHeatmap || heatmap == null) CostruisciHeatmap(area, conv, camp, SecDi, pAlto, pBasso, soglia, chiave);
+            if (heatmap == null) return;
+
+            var yA = (float)conv.GetChartY(heatmapAlto);
+            var yB = (float)conv.GetChartY(heatmapBasso);
+            var interp = g.InterpolationMode;
+            var offset = g.PixelOffsetMode;
+            // Niente sfumatura in verticale: ogni tick resta netto, come in Bookmap.
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(heatmap, new RectangleF(area.Left, yA, area.Width, yB - yA));
+            g.InterpolationMode = interp;
+            g.PixelOffsetMode = offset;
+            LegendaHeatmap(g, area, soglia, heatmapPieno);
+        }
+
+        private void CostruisciHeatmap(Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv,
+            CampioneBook[] camp, Func<DateTime, double> secDi, double pAlto, double pBasso, double soglia, string chiave)
+        {
+            var C = area.Width;
+            var livAlto = (int)Math.Ceiling(pAlto / TICK);
+            var livBasso = (int)Math.Floor(pBasso / TICK);
+            var tickPerRiga = Math.Max(1, (int)Math.Ceiling((livAlto - livBasso + 1) / (double)RIGHE_MAX));
+            var R = (int)Math.Ceiling((livAlto - livBasso + 1) / (double)tickPerRiga);
+            var somma = new float[C * R];
+            var presente = new bool[C];
+            var riga = new float[R];
+
+            // Il tempo di ogni colonna lo dice Quantower: l'asse puo' non essere
+            // lineare (barre, buchi di sessione), quindi niente proporzioni.
+            var bordi = new double[C + 1];
+            for (var c = 0; c <= C; c++) bordi[c] = secDi(conv.GetTime(area.Left + c));
+
+            int PrimoDa(double v)
+            {
+                int lo = 0, hi = camp.Length;
+                while (lo < hi) { var m = (lo + hi) >> 1; if (camp[m].Sec < v) lo = m + 1; else hi = m; }
+                return lo;
+            }
+
+            for (var c = 0; c < C; c++)
+            {
+                double t0 = Math.Min(bordi[c], bordi[c + 1]), t1 = Math.Max(bordi[c], bordi[c + 1]);
+                var i0 = PrimoDa(t0);
+                var i1 = PrimoDa(t1);
+                if (i1 <= i0)
+                {
+                    // Colonna piu' stretta di un secondo: il campione piu' vicino al centro, se c'e'.
+                    var centro = (t0 + t1) / 2;
+                    var migliore = -1;
+                    foreach (var j in new[] { i0 - 1, i0 })
+                        if (j >= 0 && j < camp.Length && Math.Abs(camp[j].Sec - centro) <= 1.5 &&
+                            (migliore < 0 || Math.Abs(camp[j].Sec - centro) < Math.Abs(camp[migliore].Sec - centro))) migliore = j;
+                    if (migliore < 0) continue;
+                    i0 = migliore;
+                    i1 = migliore + 1;
+                }
+                var quanti = 0;
+                for (var i = i0; i < i1; i++)
+                {
+                    quanti++;
+                    Array.Clear(riga, 0, R);
+                    foreach (var lato in new[] { camp[i].B, camp[i].A })
+                        foreach (var (prezzo, contratti) in lato)
+                        {
+                            var r = (livAlto - (int)Math.Round(prezzo / TICK)) / tickPerRiga;
+                            if (r < 0 || r >= R) continue;
+                            if (contratti > riga[r]) riga[r] = (float)contratti;
+                        }
+                    for (var r = 0; r < R; r++) if (riga[r] > 0) somma[r * C + c] += riga[r];
+                }
+                if (quanti == 0) continue;
+                presente[c] = true;
+                for (var r = 0; r < R; r++) somma[r * C + c] /= quanti;
+            }
+
+            // Sfumatura leggera fra colonne vicine (1-2-1, due passate), mai attraverso un buco.
+            var tmp = new float[C];
+            for (var passata = 0; passata < 2; passata++)
+                for (var r = 0; r < R; r++)
+                {
+                    var b = r * C;
+                    for (var c = 0; c < C; c++)
+                    {
+                        if (!presente[c]) { tmp[c] = 0; continue; }
+                        var sx = c > 0 && presente[c - 1] ? somma[b + c - 1] : somma[b + c];
+                        var dx = c < C - 1 && presente[c + 1] ? somma[b + c + 1] : somma[b + c];
+                        tmp[c] = (sx + 2 * somma[b + c] + dx) / 4;
+                    }
+                    Array.Copy(tmp, 0, somma, b, C);
+                }
+
+            // Fondo scala: il 99esimo percentile dei livelli in vista, diviso il
+            // contrasto (o i contratti fissati a mano nelle impostazioni).
+            double pieno;
+            if (ContrattiPieno > 0) pieno = ContrattiPieno;
+            else
+            {
+                var valori = new List<float>();
+                for (var k = 0; k < somma.Length; k += 3) if (somma[k] > 0) valori.Add(somma[k]);
+                valori.Sort();
+                pieno = valori.Count > 0 ? valori[(int)(0.99 * (valori.Count - 1))] : soglia;
+                pieno = Math.Max(soglia, pieno) / Math.Max(0.05, ContrastoHeatmap);
+            }
+
+            var trasp = 1 - Math.Clamp(TrasparenzaLiquidita, 0, 90) / 100.0;
+            var mezza = soglia / 2;
+            var bmp = new Bitmap(C, R, PixelFormat.Format32bppArgb);
+            var dati = bmp.LockBits(new Rectangle(0, 0, C, R), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            var pixel = new int[C * R];
+            for (var k = 0; k < pixel.Length; k++)
+            {
+                var v = somma[k];
+                if (!(v > mezza)) continue;
+                // Lineare, come la pagina: con la radice il book normale diventava tutto giallo.
+                var (cr, cg, cb, ca) = Termico(v / pieno);
+                var rampa = Math.Min(1, (v - mezza) / Math.Max(1, soglia - mezza));
+                var a = (int)Math.Round(ca * rampa * trasp);
+                pixel[k] = (a << 24) | (cr << 16) | (cg << 8) | cb;
+            }
+            // Righe una per una: lo stride della bitmap puo' essere piu' largo di C * 4.
+            for (var r = 0; r < R; r++)
+                System.Runtime.InteropServices.Marshal.Copy(pixel, r * C, dati.Scan0 + r * dati.Stride, C);
+            bmp.UnlockBits(dati);
+
+            heatmap?.Dispose();
+            heatmap = bmp;
+            chiaveHeatmap = chiave;
+            heatmapAlto = (livAlto + 0.5) * TICK;
+            heatmapBasso = (livAlto - R * tickPerRiga + 0.5) * TICK;
+            heatmapPieno = pieno;
+        }
+
+        /// <summary>In basso a sinistra: la scala termica con la soglia e i contratti del colore pieno.</summary>
+        private static void LegendaHeatmap(Graphics g, Rectangle area, double soglia, double pieno)
+        {
+            const int largo = 120, alto = 8, passi = 40;
+            float x0 = area.Left + 8, y0 = area.Bottom - 28;
+            using var font = new Font("Arial", 9f, FontStyle.Regular, GraphicsUnit.Pixel);
+            using (var fondo = new SolidBrush(Color.FromArgb(200, 15, 23, 42)))
+                g.FillRectangle(fondo, x0 - 4, y0 - 4, largo + 8, alto + 20);
+            using var pennello = new SolidBrush(Color.Empty);
+            for (var i = 0; i < passi; i++)
+            {
+                var (r, gg, b, a) = Termico(i / (double)(passi - 1));
+                pennello.Color = Color.FromArgb(Math.Max(a, 60), r, gg, b);
+                g.FillRectangle(pennello, x0 + i * largo / (float)passi, y0, largo / (float)passi + 0.5f, alto);
+            }
+            var ty = y0 + alto + 2;
+            g.DrawString($"{soglia:0}", font, Brushes.Silver, x0, ty);
+            using var sfDestra = new StringFormat { Alignment = StringAlignment.Far };
+            g.DrawString($"pieno {pieno:0}", font, Brushes.Silver, x0 + largo, ty, sfDestra);
+        }
+
+        #endregion
 
         // Dal quasi bianco al verde / rosso scuro: la tinta chiara tiene distinti i due lati anche sui livelli piccoli.
         private static readonly Color BID_CHIARO = ColorTranslator.FromHtml("#f0fdf4");
@@ -984,6 +1647,63 @@ namespace GregDashboard
                 new PointF(x - mezzoStelo, y + v * testa),
                 new PointF(x - mezzaTesta, y + v * testa),
             };
+        }
+
+        /// <summary>
+        /// Le entrate a conferma: triangolo giallo sull'entrata (punta nel verso), target verde
+        /// e stop rosso tratteggiati fino all'esito (o fino a destra se aperta), etichetta col
+        /// livello e l'esito; in basso a sinistra il conto della giornata. Netto = meno 0,25 pt
+        /// a operazione, come nella ricerca.
+        /// </summary>
+        private void DisegnaConferme(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
+        {
+            var lista = confermePronte;
+            var giorno = giornoBook;
+            using var font = new Font("Arial", 8f, FontStyle.Bold);
+            var parti = new List<string>();
+            foreach (var tipo in new[] { "range", "gex", "0γ" })
+            {
+                var diTipo = lista.Where(c => c.Tipo == tipo).ToList();
+                if (diTipo.Count == 0) continue;
+                var chiuse = diTipo.Where(c => c.Esito != null).ToList();
+                var netto = chiuse.Sum(c => c.Esito.Value - 0.25);
+                parti.Add($"{tipo} {chiuse.Count(c => c.Esito > 0)}/{chiuse.Count} vinti {netto:+0.00;-0.00} pt");
+            }
+            var riassunto = "Conferma (in prova): " + (parti.Count == 0 ? "nessun segnale oggi" : string.Join(" | ", parti));
+            g.DrawString(riassunto, font, Brushes.Gold, area.Left + 8, area.Bottom - 34);
+            if (lista.Count == 0 || giorno == null) return;
+            if (!DateTime.TryParseExact(giorno, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) return;
+
+            var modo = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var giallo = new SolidBrush(Color.FromArgb(235, 250, 204, 21));
+            using var bordo = new Pen(Color.FromArgb(230, 15, 23, 42), 1f);
+            using var verde = new Pen(Color.FromArgb(220, 34, 197, 94), 1.5f) { DashStyle = DashStyle.Dash };
+            using var rosso = new Pen(Color.FromArgb(220, 239, 68, 68), 1.5f) { DashStyle = DashStyle.Dash };
+            using var sfondo = new SolidBrush(Color.FromArgb(200, 15, 23, 42));
+            foreach (var c in lista)
+            {
+                var x = (float)conv.GetChartX(Utc(mezzanotte, c.Sec));
+                var x2 = c.FineSec != null ? (float)conv.GetChartX(Utc(mezzanotte, c.FineSec.Value)) : area.Right;
+                if (x2 < area.Left - 20 || x > area.Right + 20) continue;
+                var y = (float)conv.GetChartY(c.Entrata);
+                var yT = (float)conv.GetChartY(c.Entrata + c.Verso * CONF_TARGET);
+                var yS = (float)conv.GetChartY(c.Entrata - c.Verso * CONF_STOP);
+                g.DrawLine(verde, x, yT, Math.Max(x + 6, x2), yT);
+                g.DrawLine(rosso, x, yS, Math.Max(x + 6, x2), yS);
+                const float r = 7;
+                var v = c.Verso > 0 ? 1 : -1; // punta in alto per i long: il corpo sta sotto
+                var tri = new[] { new PointF(x, y), new PointF(x - r, y + v * 1.6f * r), new PointF(x + r, y + v * 1.6f * r) };
+                g.FillPolygon(giallo, tri);
+                g.DrawPolygon(bordo, tri);
+                var esito = c.Esito == null ? "aperta" : $"{c.Esito.Value:+0.00;-0.00}";
+                var testo = $"{(c.Verso > 0 ? "LONG" : "SHORT")} {c.Livello} {esito}";
+                var dim = g.MeasureString(testo, font);
+                var ty = c.Verso > 0 ? y + 1.6f * r + 2 : y - 1.6f * r - dim.Height - 2;
+                g.FillRectangle(sfondo, x - dim.Width / 2, ty, dim.Width, dim.Height);
+                g.DrawString(testo, font, Brushes.Gold, x - dim.Width / 2, ty);
+            }
+            g.SmoothingMode = modo;
         }
 
         private void DisegnaRange(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
@@ -1187,7 +1907,16 @@ namespace GregDashboard
                 g.SetClip(RectangleF.FromLTRB(area.Left, top, x1, bottom), CombineMode.Intersect);
                 using var font9 = new Font("Arial", 9f, FontStyle.Regular, GraphicsUnit.Pixel);
                 var livelli = new List<(double prezzo, Color colore, float[] tratto, string nome)>();
-                if (MostraSigma && em > 0)
+                // Dal 03/11/2026 le bande di chiusura calibrate (VIX1D x quantili
+                // osservati); lo Spot +-1/2 sigma dell'IV 0DTE solo se mancano.
+                if (MostraSigma && dati.Bande != null)
+                {
+                    livelli.Add((dati.Bande[0], COLORE_2S, new float[] { 2, 4 }, "95%"));
+                    livelli.Add((dati.Bande[1], COLORE_1S, new float[] { 6, 4 }, "68%"));
+                    livelli.Add((dati.Bande[2], COLORE_1S, new float[] { 6, 4 }, "68%"));
+                    livelli.Add((dati.Bande[3], COLORE_2S, new float[] { 2, 4 }, "95%"));
+                }
+                else if (MostraSigma && em > 0)
                 {
                     livelli.Add((dati.Spot + 2 * em, COLORE_2S, new float[] { 2, 4 }, "+2σ"));
                     livelli.Add((dati.Spot + em, COLORE_1S, new float[] { 6, 4 }, "+1σ"));
@@ -1380,10 +2109,27 @@ namespace GregDashboard
         {
             var grigio = ColorTranslator.FromHtml("#64748b");
             var righe = new List<(bool grassetto, Color colore, string testo)>();
+            var chiaro = ColorTranslator.FromHtml("#94a3b8");
+            // In testa il contesto (prevede l'ampiezza, non la direzione), poi
+            // bande e divergenze; il regime dello smile resta solo come informazione.
+            if (s.Attesa != null)
+            {
+                righe.Add((true, s.Attesa == "AMPIA" ? SM_ARANCIO : s.Attesa == "STRETTA" ? SM_AZZURRO : ColorTranslator.FromHtml("#cbd5e1"),
+                    $"GIORNATA {s.Attesa} ×{s.AttesaRange.ToString("0.00", CultureInfo.InvariantCulture)}"));
+                foreach (var v in s.VociContesto) righe.Add((false, chiaro, v));
+            }
+            if (s.Bande != null)
+            {
+                righe.Add((false, ColorTranslator.FromHtml("#e2e8f0"), $"chiusura 68% ±{Math.Round(s.BandaQ68Pt)} · 95% ±{Math.Round(s.BandaQ95Pt)}"));
+                var rviv = s.RvIv != null ? s.RvIv.Value.ToString("0.00", CultureInfo.InvariantCulture) : "—";
+                righe.Add((false, grigio, $"VIX1D {F1(s.Vix1d)} · RV/IV {rviv}"));
+            }
+            if (s.UltimaRiga != null) righe.Add((false, grigio, s.UltimaRiga));
+            if (s.Divergenza != null) righe.Add((false, s.DivRimbalzo ? SM_VERDE : SM_ROSSO, s.Divergenza));
             var coloreRegime = s.Regime == null ? grigio
                 : COLORE_REGIME.TryGetValue(s.Regime, out var cr) ? cr : ColorTranslator.FromHtml("#cbd5e1");
-            righe.Add((true, coloreRegime,
-                s.Regime ?? (s.Chiuso ? "MERCATO CHIUSO" : s.Sospeso ? $"SOSPESO dalle {OraLocaleDaNy(15, 15)}" : s.Base == "in raccolta" ? "IN RACCOLTA" : "IN CONFERMA")));
+            righe.Add((false, coloreRegime,
+                "smile: " + (s.Regime ?? (s.Chiuso ? "MERCATO CHIUSO" : s.Sospeso ? $"sospeso dalle {OraLocaleDaNy(15, 15)}" : s.Base == "in raccolta" ? "in raccolta" : "in conferma"))));
             if (s.IvAtm != null)
                 righe.Add((false, ColorTranslator.FromHtml("#94a3b8"), $"IV ATM {F1(s.IvAtm.Value)}%{(s.Em != null ? $" · 1σ {F1(s.Em.Value)}" : "")}"));
             if (s.VerticeStrike != null)
