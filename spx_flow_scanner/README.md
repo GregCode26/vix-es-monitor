@@ -149,3 +149,30 @@ della notturna (20:15-9:25 NY) non e' compreso in quello del cash. Quindi:
   Le migrazioni ora possono avere una parte Python `NNN_*.py` con `migra(db)`.
 
 Fra le 9:25 e le 9:30 NY il mercato opzioni e' chiuso: lo scanner aspetta.
+
+## Singoli trade (05/11/2026, richiesta dell'utente)
+
+Il filtro "n contratti" vale per il **singolo trade**, non per il volume
+cumulativo: per ogni contratto si sommano solo le stampe che da sole sono
+>= N. Le stampe non si uniscono (un ordine eseguito come 400+200+200+200 allo
+stesso secondo e prezzo, con N = 500, non conta): scelta dell'utente.
+
+    python -m spx_flow_scanner.main trade        # accanto a `scansiona`, a oltranza
+
+- Fonte: `reqHistoricalTicks(..., 'TRADES')`, 1000 stampe per richiesta,
+  risoluzione al secondo, con prezzo e borsa. Non usa linee di market data.
+- Quali contratti: un trade >= N puo' esserci solo dove il volume della
+  sessione e' salito di >= N dall'ultima lettura dei trade, quindi i candidati
+  vengono da `volume_latest`. Con soglia di base 500 (scelta dell'utente) ~95 per ciclo da
+  10 minuti (con 100 sarebbero ~200, misurato il 05/11).
+- Si salvano solo le stampe >= `SCANNER_TRADE_MIN` (default 500) nella tabella
+  `trades`; `trade_cursor` dice fin dove e' stato letto ogni contratto. La
+  pagina non puo' filtrare sotto la soglia di base e lo dice.
+- Ritmo misurato: 60 richieste a 1/s senza errori di pacing, ma dopo ~20 IBKR
+  rallenta da solo a 5-12 s l'una (~280 richieste ogni 10 minuti). Errore
+  162 di pacing: pausa di 10 minuti.
+- Un contratto molto scambiato ha decine di migliaia di stampe al giorno (7500P
+  0DTE del 05/11: ~10.000 stampe nelle prime 10 pagine): al massimo
+  `SCANNER_TRADE_PAGINE` (10) pagine per contratto per giro, poi si passa agli
+  altri. La pagina mostra quanti contratti hanno volume salito di >= N e
+  trade non ancora verificati.

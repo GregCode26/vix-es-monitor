@@ -4,6 +4,8 @@ SPX Options Volume Scanner - punto d'ingresso.
 Dalla radice del repo:
     python -m spx_flow_scanner.main verifica   # Fase 1: connessione e stato TWS
     python -m spx_flow_scanner.main sonda      # Fase 1: cosa restituisce IBKR (snapshot vs streaming)
+    python -m spx_flow_scanner.main scansiona  # volumi 0-90 DTE a cicli
+    python -m spx_flow_scanner.main trade      # singoli trade >= SCANNER_TRADE_MIN dei contratti saliti di volume
 """
 
 import argparse
@@ -147,6 +149,50 @@ def comando_scansiona(cli: ClienteIbkr, cicli: int = 0) -> int:
             time.sleep(30)
 
 
+def comando_trade(cli: ClienteIbkr, giri: int = 0) -> int:
+    """
+    Gira a oltranza accanto a `scansiona`: ogni minuto legge dallo storico
+    tick i trade dei contratti il cui volume e' salito di almeno
+    `trade_minimo` (vedi scanner/trade_scanner.py). Non usa linee di market
+    data. `giri` > 0 (solo per prova) si ferma dopo quel numero di giri.
+    """
+    from spx_flow_scanner.database.repository import Archivio
+    from spx_flow_scanner.scanner.trade_scanner import PAUSA_PACING_S, LettoreTrade, PacingIbkr
+
+    cfg = IMPOSTAZIONI
+    archivio = Archivio()
+    lettore = LettoreTrade(cli, archivio.db, cfg)
+    numero = 0
+    while True:
+        try:
+            if not cli.assicura_connessione():
+                _attendi(cli, 60)
+                continue
+            numero += 1
+            t0 = time.monotonic()
+            r = lettore.giro(budget_s=240)
+            log.info('trade giro %d: candidati %d, letti %d (in pari %d), pagine %d, stampe %d, salvate >=%d: %d, '
+                     'rimasti %d, %ss', numero, r['candidati'], r['letti'], r['in_pari'], r['pagine'], r['stampe'],
+                     cfg.trade_minimo, r['salvati'], r['rimasti'], r['secondi'])
+            archivio.imposta_stato('trade', {'stato': 'attivo', 'giro': numero, **r, 'soglia': cfg.trade_minimo})
+            if giri and numero >= giri:
+                return 0
+            _attendi(cli, 60 - (time.monotonic() - t0))
+        except PacingIbkr as e:
+            log.warning('pacing IBKR sullo storico tick (%s): pausa %d s', e, PAUSA_PACING_S)
+            archivio.imposta_stato('trade', {'stato': 'pausa_pacing', 'errore': str(e)})
+            _attendi(cli, PAUSA_PACING_S)
+        except KeyboardInterrupt:
+            archivio.imposta_stato('trade', {'stato': 'fermato'})
+            archivio.chiudi()
+            raise
+        except Exception as e:
+            log.exception('lettura trade interrotta, si riparte fra 30 s')
+            archivio.imposta_stato('trade', {'stato': 'errore', 'errore': f'{type(e).__name__}: {e}'})
+            cli.disconnetti()
+            time.sleep(30)
+
+
 def comando_analisi(args) -> int:
     """Tabelle LARGE CALL / LARGE PUT dal database, senza TWS."""
     from spx_flow_scanner.database.repository import Archivio
@@ -200,9 +246,9 @@ def comando_analisi(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='SPX Options Volume Scanner')
-    parser.add_argument('comando', choices=['verifica', 'sonda', 'catena', 'scansiona', 'analisi'])
+    parser.add_argument('comando', choices=['verifica', 'sonda', 'catena', 'scansiona', 'trade', 'analisi'])
     parser.add_argument('--forza', action='store_true', help='catena: ignora la cache del giorno')
-    parser.add_argument('--cicli', type=int, default=0, help='scansiona: fermati dopo N cicli (prova)')
+    parser.add_argument('--cicli', type=int, default=0, help='scansiona/trade: fermati dopo N cicli o giri (prova)')
     analisi = parser.add_argument_group('analisi (non serve TWS)')
     analisi.add_argument('--giorno', help='YYYY-MM-DD, default il giorno di borsa in corso')
     analisi.add_argument('--sessione', choices=['notturna', 'cash'], help='default la sessione in corso')
@@ -221,13 +267,15 @@ def main() -> int:
 
     cli = ClienteIbkr(IMPOSTAZIONI)
     # scansiona riprova da sola a oltranza; gli altri comandi si fermano.
-    if not cli.connetti() and args.comando != 'scansiona':
+    if not cli.connetti() and args.comando not in ('scansiona', 'trade'):
         log.error('TWS non raggiungibile su %s:%s: e\' aperto, con le API abilitate?',
                   IMPOSTAZIONI.host, IMPOSTAZIONI.porta)
         return 1
     try:
         if args.comando == 'scansiona':
             return comando_scansiona(cli, cicli=args.cicli)
+        if args.comando == 'trade':
+            return comando_trade(cli, giri=args.cicli)
         if args.comando == 'catena':
             return comando_catena(cli, forza=args.forza)
         return {'verifica': comando_verifica, 'sonda': comando_sonda}[args.comando](cli)

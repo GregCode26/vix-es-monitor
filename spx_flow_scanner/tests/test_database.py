@@ -43,7 +43,7 @@ class TestArchivio(unittest.TestCase):
         for t in ('options_contracts', 'volume_snapshots', 'market_quotes', 'scanner_alerts',
                   'scan_history', 'system_status', 'volume_latest'):
             self.assertIn(t, tabelle)
-        self.assertEqual(self.a.db.execute('PRAGMA user_version').fetchone()[0], 3)
+        self.assertEqual(self.a.db.execute('PRAGMA user_version').fetchone()[0], 4)
         # Riaprire non riapplica le migrazioni.
         Archivio(self.percorso).db.close()
 

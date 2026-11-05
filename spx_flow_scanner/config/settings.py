@@ -66,6 +66,13 @@ class Impostazioni:
     # Secondi lasciati liberi a fine ciclo (catena, scrittura file).
     margine_ciclo_s: int = 20
 
+    # Singoli trade (storico tick IBKR). Si salvano solo le stampe >= trade_minimo:
+    # e' il filtro piu' basso che la pagina potra' usare.
+    trade_minimo: int = field(default_factory=lambda: _int('SCANNER_TRADE_MIN', 500))
+    # Pagine da 1000 stampe per contratto a ogni giro: un contratto molto
+    # scambiato non deve tenere fermi gli altri.
+    trade_pagine_per_giro: int = field(default_factory=lambda: _int('SCANNER_TRADE_PAGINE', 10))
+
     # Database (Fase 5).
     postgres_dsn: str = field(default_factory=lambda: os.environ.get('SCANNER_PG_DSN', ''))
 
