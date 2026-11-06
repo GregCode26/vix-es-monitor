@@ -127,6 +127,16 @@ class MarketTide:
        per il suo prezzo e nel suo verso (comprato = premio pagato).
 
     Trade al mid, o senza quotazione prima, non contano.
+
+    Dal 06/11/2026 tiene anche i conti per strike (`strike` nella fotografia,
+    solo file locale): {strike: [call comprate, call vendute, put comprate,
+    put vendute]}, con la stessa regola. Le gambe di un vertical vanno ognuna
+    sul suo strike nel verso dello spread (bull call comprato = call bassa
+    comprata, alta venduta). Servono a confrontare il comprato/venduto per
+    strike con lo strumento esterno dell'utente (barre "IMB", 0DTE, destra =
+    comprato): il 06/11 i cb/cs/pb/ps di LeeReady, che classificano gli
+    incrementi di volume ogni 10 s, concordavano sul segno in 13 strike su 23
+    (Spearman +0.20), cioe' a caso.
     """
 
     VERSIONE = 2
@@ -136,6 +146,8 @@ class MarketTide:
         self.npp = 0.0  # net put premium, $
         self.ncv = 0    # net call volume, contratti
         self.npv = 0    # net put volume, contratti
+        # strike -> [cb, cs, pb, ps], trade per trade
+        self.per_strike = {}
 
     def riprendi(self, snapshots):
         """Riparte dai totali dell'ultimo snapshot: un riavvio a meta' sessione
@@ -151,8 +163,14 @@ class MarketTide:
                 self.npp = float(tide.get("npp", 0))
                 self.ncv = int(tide.get("ncv", 0))
                 self.npv = int(tide.get("npv", 0))
+                for k, c in (tide.get("strike") or {}).items():
+                    self.per_strike[float(k)] = [int(x) for x in c]
                 print(f"Market Tide ripreso dalle {snap.get('time')}: NCP {self.ncp:,.0f}, NPP {self.npp:,.0f}")
                 return
+
+    def _conta(self, strike, lato, segno, size):
+        c = self.per_strike.setdefault(float(strike), [0, 0, 0, 0])
+        c[(0 if lato == 'C' else 2) + (0 if segno > 0 else 1)] += size
 
     def _somma(self, lato, segno, prezzo, size):
         premio = segno * prezzo * size * 100
@@ -169,22 +187,27 @@ class MarketTide:
         if bid is None or ask is None:
             return
         mid = (bid + ask) / 2
-        if t["prezzo"] > mid + 1e-9:
-            self._somma(t["lato"], 1, t["prezzo"], t["size"])
-        elif t["prezzo"] < mid - 1e-9:
-            self._somma(t["lato"], -1, t["prezzo"], t["size"])
+        segno = 1 if t["prezzo"] > mid + 1e-9 else -1 if t["prezzo"] < mid - 1e-9 else 0
+        if segno:
+            self._somma(t["lato"], segno, t["prezzo"], t["size"])
+            self._conta(t["strike"], t["lato"], segno, t["size"])
 
     def vertical(self, v):
         """Un vertical: una volta sola, al suo prezzo. Comprato = bull call o
         bear put, cioe' premio pagato sul suo lato; venduto il contrario."""
-        if v["verso"] == "comprato":
-            self._somma(v["lato"], 1, v["prezzo"], v["size"])
-        elif v["verso"] == "venduto":
-            self._somma(v["lato"], -1, v["prezzo"], v["size"])
+        segno = 1 if v["verso"] == "comprato" else -1 if v["verso"] == "venduto" else 0
+        if not segno:
+            return
+        self._somma(v["lato"], segno, v["prezzo"], v["size"])
+        # Gamba cara (call bassa, put alta) nel verso dello spread, l'altra al contrario.
+        cara, economica = (v["k1"], v["k2"]) if v["lato"] == 'C' else (v["k2"], v["k1"])
+        self._conta(cara, v["lato"], segno, v["size"])
+        self._conta(economica, v["lato"], -segno, v["size"])
 
     def fotografia(self):
         return {"ncp": round(self.ncp), "npp": round(self.npp), "ncv": self.ncv, "npv": self.npv,
-                "v": self.VERSIONE}
+                "v": self.VERSIONE,
+                "strike": {f"{k:g}": c for k, c in sorted(self.per_strike.items())}}
 
 
 class LeeReady:
@@ -372,7 +395,9 @@ def push_snapshot_to_supabase(date_key, snapshot):
             "und_price": snapshot.get("undPrice"),
             "is_opening": snapshot["isOpening"],
             "volumes": snapshot["volumes"],
-            "tide": snapshot.get("tide"),
+            # Senza i conti per strike (~2 KB): servono solo in locale, e su
+            # Supabase si pagherebbero a ogni lettura di /api/market-tide.
+            "tide": {k: v for k, v in snapshot["tide"].items() if k != "strike"} if snapshot.get("tide") else None,
         }
         if _colonna_tide_manca_dal is not None and time.time() - _colonna_tide_manca_dal < _RIPROVA_COLONNA_TIDE_SEC:
             riga.pop("tide", None)
