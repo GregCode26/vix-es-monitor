@@ -13,7 +13,7 @@ export const runtime = 'nodejs';
  *
  * `?giorno=YYYY-MM-DD` (default: l'ultimo giorno nel DB), `?sessione=cash|notturna`
  * (default: la sessione dell'ultimo ciclo), `?min=N` (default 500): soglia del
- * singolo trade. Volume NULL = non disponibile: viene restituito come null,
+ * singolo trade, `?leggero=1`: senza l'elenco dei contratti. Volume NULL = non disponibile: viene restituito come null,
  * mai come 0. Solo locale: niente Supabase.
  */
 
@@ -38,7 +38,9 @@ export async function GET(req: NextRequest) {
             `SELECT scan_id, numero, started_at, finished_at, spx, spx_source, atm, universe, priority, read_ok,
                     unavailable, fresh_60min, never_read, rate
              FROM scan_history WHERE giorno = ? AND sessione = ? ORDER BY started_at DESC LIMIT 1`).get(giorno, sessione);
-        const contratti = db.prepare(
+        // `?leggero=1`: solo i trade (per i pentagoni su /hedging-pressure), senza i ~7.000 contratti.
+        const leggero = q.get('leggero') === '1';
+        const contratti = leggero ? [] : db.prepare(
             `SELECT con_id, trading_class, real_expiry, dte, strike, opt_right, volume, ts, delta_last,
                     inc_30m, inc_60m, bid, ask, last_price, data_type, last_attempt_status, anomaly
              FROM volume_latest WHERE giorno = ? AND sessione = ?`).all(giorno, sessione);

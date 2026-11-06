@@ -10,8 +10,10 @@ const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false }) 
  * X = DTE, Y = strike (linea gialla = ATM), Z = somma dei soli trade da almeno
  * N contratti del contratto, ogni stampa presa da sola (un ordine eseguito come
  * 400+200+200+200 con N = 500 non conta). Non e' il volume cumulativo.
- * CALL verdi, PUT rosse: mai sommate. Le put sono spostate di -0.2 DTE e le
- * call di +0.2, le SPX AM di +0.45, solo per non sovrapporle.
+ * CALL verdi, PUT rosse: mai sommate. Asse DTE fisso da 0 al filtro (90).
+ * Le put sono spostate a sinistra della scadenza e le call a destra (le SPX AM
+ * un po' di piu'), di una frazione della larghezza della barra, solo per non
+ * sovrapporle.
  * I trade vengono da `python -m spx_flow_scanner.main trade`, che li legge solo
  * per i contratti saliti di volume: quelli non ancora letti sono contati in alto.
  */
@@ -106,14 +108,15 @@ export default function SpxScannerPage() {
         const maxZ = Math.max(1, ...barre.map(b => b.p.somma));
         const strikeVicini = [...new Set(dati.contratti.filter(c => c.dte <= 1).map(c => c.strike))].sort((a, b) => a - b);
         const passo = strikeVicini.length > 1 ? Math.max(1, Math.min(...strikeVicini.slice(1).map((v, i) => v - strikeVicini[i]))) : 5;
-        const dteVisti = barre.map(b => b.c.dte);
-        const xMin = -0.5, xMax = Math.max(1, ...dteVisti) + 1;
+        // Asse DTE fisso da 0 al filtro "DTE <=" (90 di base), anche se le scadenze lontane non hanno trade.
+        const xMin = -0.5, xMax = Math.max(1, dteMax) + 0.5;
+        const larghezza = Math.max(0.35, xMax / 120);   // con 90 giorni una barra da 0.35 sparirebbe
         const series: any[] = (['C', 'P'] as const).filter(r => tipo === 'CP' || tipo === r).map(r => ({
             type: 'bar3D', name: r === 'C' ? 'CALL' : 'PUT',
             data: barre.filter(b => b.c.opt_right === r).map(({ p, c }) => ({
-                value: [c.dte + (r === 'C' ? 0.2 : -0.2) + (c.trading_class === 'SPX' ? 0.45 : 0), c.strike, p.somma], p, c,
+                value: [c.dte + (r === 'C' ? 0.55 : -0.55) * larghezza + (c.trading_class === 'SPX' ? 1.3 * larghezza : 0), c.strike, p.somma], p, c,
             })),
-            barSize: [0.35, passo * 0.8],
+            barSize: [larghezza, passo * 0.8],
             shading: 'lambert',
             itemStyle: { color: r === 'C' ? '#22c55e' : '#ef4444', opacity: 0.95 },
             emphasis: { itemStyle: { color: '#facc15' } },
@@ -171,6 +174,10 @@ export default function SpxScannerPage() {
                     onChange={e => setMinimo(Math.max(1, +e.target.value || 1))} /> contratti</label>
                 <label className="text-sm">DTE ≤ <input type="number" className={`${sel} w-16`} value={dteMax} onChange={e => setDteMax(+e.target.value)} /></label>
                 <label className="text-sm">ATM ± <input type="number" step={50} className={`${sel} w-20`} value={range} onChange={e => setRange(+e.target.value)} /></label>
+                <div className="ml-auto flex gap-2">
+                    <a href="/hedging-pressure" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET MAKER</a>
+                    <a href="/market" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">CHART</a>
+                </div>
             </div>
             {errore && <div className="text-red-400 mb-2">{errore}</div>}
             {dati && vista && (
@@ -187,7 +194,7 @@ export default function SpxScannerPage() {
                             <span className={ver.da_leggere ? 'text-amber-400' : ''}>
                                 {fmt(ver.da_leggere)} contratti con volume salito di ≥ {fmt(dati.min)} non ancora verificati
                             </span></> : <span className="text-amber-400">nessun trade letto: avvia python -m spx_flow_scanner.main trade</span>}
-                        {' '}· CALL e PUT spostate ±0.2 DTE, SPX AM +0.45, solo per non sovrapporle
+                        {' '}· CALL a destra e PUT a sinistra della loro scadenza, SPX AM un po' più a destra, solo per non sovrapporle
                     </div>
                 </div>
             )}

@@ -51,6 +51,20 @@ const TOP_STRIKE = 5;
 
 type ViewMode = 'profile' | 'timeseries' | 'heatmap';
 
+/** Un singolo trade grande dallo scanner (`/api/spx-scanner`, `python -m spx_flow_scanner.main trade`). */
+interface GrandeTrade {
+    con_id: number; ts: number; seq: number; size: number; price: number | null; exchange: string | null;
+    trading_class: string; real_expiry: string; strike: number; opt_right: 'C' | 'P';
+}
+/** Soglia del singolo trade: la stessa che salva lo scanner (SCANNER_TRADE_MIN). */
+const MIN_GRANDE_TRADE = 500;
+const GRANDI_TRADE_MS = 60_000;
+/** Pentagono regolare, punta in alto. */
+const PENTAGONO = 'path://M50 0 L97.6 34.5 L79.4 90.5 L20.6 90.5 L2.4 34.5 Z';
+
+const oraNyTrade = (ts: number) => new Date(ts * 1000).toLocaleTimeString('it-IT',
+    { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
 interface PressureHistoryPoint {
     time: string;
     strike: number;
@@ -154,6 +168,30 @@ export default function HedgingPressurePage() {
             setLoading(false);
         }
     }, []);
+
+    /**
+     * Large trade CALL e PUT dello scanner, del giorno della pagina, sessione cash: i singoli trade
+     * da almeno MIN_GRANDE_TRADE contratti (ogni stampa da sola, non il volume cumulativo).
+     * Solo locale: senza scanner la route risponde 503 e i pentagoni semplicemente non ci sono.
+     */
+    const [grandiTrade, setGrandiTrade] = useState<GrandeTrade[]>([]);
+    const giornoPagina = data?.date ?? null;
+    useEffect(() => {
+        if (!giornoPagina) return;
+        let attivo = true;
+        const carica = async () => {
+            try {
+                const r = await fetch(`/api/spx-scanner?leggero=1&sessione=cash&min=${MIN_GRANDE_TRADE}&giorno=${giornoPagina}`,
+                    { cache: 'no-store' });
+                if (!r.ok) { if (attivo) setGrandiTrade([]); return; }
+                const j = await r.json();
+                if (attivo) setGrandiTrade(j.giorno === giornoPagina ? (j.trade ?? []) : []);
+            } catch { /* scanner assente: nessun pentagono */ }
+        };
+        carica();
+        const id = setInterval(carica, GRANDI_TRADE_MS);
+        return () => { attivo = false; clearInterval(id); };
+    }, [giornoPagina]);
 
     useEffect(() => {
         fetchHedgingPressure();
@@ -395,6 +433,48 @@ export default function HedgingPressurePage() {
             });
         }
 
+        // Large trade: un pentagono per strike, lato e scadenza (mai sommate fra loro), CALL verde a
+        // destra, PUT rosso a sinistra; pieno = 0DTE, solo bordo = scadenze successive (piu' all'interno).
+        // Grandezza = contratti dei trade >= MIN_GRANDE_TRADE su quello strike.
+        const categorie = new Set(data.strikes.map((s) => s.toString()));
+        const scad0 = data.date.replaceAll('-', '');
+        type Gruppo = { k: string; right: 'C' | 'P'; zero: boolean; scad: string; somma: number; trade: GrandeTrade[] };
+        const gruppi = new Map<string, Gruppo>();
+        let fuoriAsse = 0;
+        for (const t of grandiTrade) {
+            const k = String(t.strike);
+            if (!categorie.has(k)) { fuoriAsse++; continue; }
+            const chiave = `${k}|${t.opt_right}|${t.trading_class}|${t.real_expiry}`;
+            const g = gruppi.get(chiave) ?? { k, right: t.opt_right, zero: t.real_expiry === scad0,
+                scad: `${t.trading_class} ${t.real_expiry}`, somma: 0, trade: [] };
+            g.somma += t.size;
+            g.trade.push(t);
+            gruppi.set(chiave, g);
+        }
+        const maxSomma = Math.max(1, ...[...gruppi.values()].map((g) => g.somma));
+        const pentagoni = (['C', 'P'] as const).map((right) => ({
+            name: right === 'C' ? 'Large CALL trades' : 'Large PUT trades',
+            type: 'scatter',
+            symbol: PENTAGONO,
+            z: 5,
+            itemStyle: { color: right === 'C' ? '#22c55e' : '#ef4444' },
+            data: [...gruppi.values()].filter((g) => g.right === right).map((g) => {
+                const colore = right === 'C' ? '#22c55e' : '#ef4444';
+                return {
+                    value: [(right === 'C' ? 1 : -1) * scale.xMax * (g.zero ? 0.9 : 0.75), g.k],
+                    symbolSize: 12 + 22 * Math.sqrt(g.somma / maxSomma),
+                    itemStyle: g.zero
+                        ? { color: colore, borderColor: '#0c0d10', borderWidth: 1 }
+                        : { color: 'rgba(0,0,0,0)', borderColor: colore, borderWidth: 2 },
+                    label: {
+                        show: true, position: right === 'C' ? 'left' : 'right', color: colore, fontSize: 10,
+                        formatter: () => (g.somma >= 1000 ? `${(g.somma / 1000).toFixed(1)}k` : String(g.somma)),
+                    },
+                    gruppo: g,
+                };
+            }),
+        }));
+
         return {
             backgroundColor: '#0c0d10',
             tooltip: {
@@ -402,7 +482,17 @@ export default function HedgingPressurePage() {
                 axisPointer: { type: 'cross' },
                 formatter: (params: any) => {
                     if (!Array.isArray(params) || params.length === 0) return '';
-                    const param = params[0];
+                    const grandi = params.filter((p: any) => p.data?.gruppo).map((p: any) => {
+                        const g: Gruppo = p.data.gruppo;
+                        const colore = g.right === 'C' ? '#22c55e' : '#ef4444';
+                        const righe = [...g.trade].sort((a, b) => a.ts - b.ts).map((t) =>
+                            `${oraNyTrade(t.ts)} NY · <b>${t.size.toLocaleString('it-IT')}</b> @ ${t.price ?? 'n.d.'}`).join('<br/>');
+                        return `<div style="margin-top:4px;color:${colore}"><b>⬟ ${g.right === 'C' ? 'CALL' : 'PUT'} ${g.k} ${g.scad}</b>` +
+                            ` · ${g.trade.length} trade ≥ ${MIN_GRANDE_TRADE}, ${g.somma.toLocaleString('it-IT')} contratti</div>` +
+                            `<div style="color:#cbd5e1">${righe}</div>`;
+                    }).join('');
+                    const param = params.find((p: any) => !p.data?.gruppo);
+                    if (!param) return `<div style="font-size:11px">${grandi}</div>`;
                     const strike = param.value[1];
                     const row = chartData.profile.find((r) => r.strike === strike);
                     if (!row) return '';
@@ -415,12 +505,13 @@ export default function HedgingPressurePage() {
   <div><strong>Vanna Proxy:</strong> ${row.vannaPressure ? row.vannaPressure.toFixed(2) : 'N/A'}</div>
   <div><strong>GEX:</strong> ${row.gex.toFixed(2)}</div>
   <div><strong>Proximity:</strong> ${(row.proximity * 100).toFixed(0)}%</div>
+  ${grandi}
 </div>
 `.trim();
                 },
             },
             legend: {
-                data: ['Bullish Pressure', 'Bearish Pressure'],
+                data: ['Bullish Pressure', 'Bearish Pressure', 'Large CALL trades', 'Large PUT trades'],
                 textStyle: { color: '#94a3b8', fontSize: 10 },
                 top: 10,
                 right: 10,
@@ -481,9 +572,14 @@ export default function HedgingPressurePage() {
                     itemStyle: { color: '#ef4444', opacity: 0.85 },
                     barWidth: '60%',
                 },
+                ...pentagoni,
             ],
+            graphic: fuoriAsse > 0 ? [{
+                type: 'text', left: 70, bottom: 8,
+                style: { text: `${fuoriAsse} large trade su strike fuori dal grafico`, fill: '#64748b', fontSize: 10 },
+            }] : [],
         };
-    }, [chartData, scale, data]);
+    }, [chartData, scale, data, grandiTrade]);
 
     const pronto = data !== null && !loading;
 
@@ -547,6 +643,13 @@ export default function HedgingPressurePage() {
                             title="CVD, liquidita' e ordini limit di ES da Bookmap (solo locale)"
                         >
                             Bookmap
+                        </button>
+                        <button
+                            onClick={() => router.push('/spx-scanner')}
+                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
+                            title="Trade singoli da almeno N contratti sulle opzioni SPX 0-90 DTE, in 3D (scanner locale)"
+                        >
+                            Scanner trade 3D
                         </button>
                         <button
                             onClick={() => router.push('/market')}

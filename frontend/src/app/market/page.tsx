@@ -2808,6 +2808,7 @@ export default function MarketPage() {
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraRangeSpxOb ? '◉' : '◌'} Range SPX OB
+                            <button onClick={() => router.push('/spx-scanner')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Singoli trade da almeno 500 contratti sulle opzioni SPX 0-90 DTE, in 3D">SCANNER 3D</button>
                         </button>
 
                         {/* I dodici livelli R1/R2/R3, che sono un'altra cosa */}
