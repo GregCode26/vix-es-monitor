@@ -19,7 +19,7 @@ import {
 import 'chartjs-adapter-date-fns';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
 import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
-import { costruisciMappa, disegnaColonna, disegnaMappa, gradienteCss, LARGHEZZA_COLONNA, type MappaGex, type ModoMappa } from '@/lib/gexHeatmap';
+import { costruisciMappa, disegnaColonna, disegnaMappa, disegnaPicchi, gradienteCss, LARGHEZZA_COLONNA, type MappaGex, type ModoMappa } from '@/lib/gexHeatmap';
 
 // Base registration (safe for SSR).
 // I *Controller servono quanto gli Element: qui il grafico si costruisce a
@@ -77,7 +77,16 @@ interface SpxHistoryPoint {
  * sessione: se un giorno i livelli li superano, il metro si allunga da solo
  * (e non si accorcia piu' fino a domani), cosi' niente esce dal grafico.
  */
-const FONDO_SCALA_M: Record<'volume' | 'oi', number> = { volume: 150000, oi: 10000 };
+const FONDO_SCALA_M: Record<GexBasis, number> = { volume: 150000, oi: 10000, oiVol: 160000 };
+
+/**
+ * Su quale quantita' di contratti si pesa il gamma. `oiVol` = open interest +
+ * volume di oggi: il GEX per strike e' gamma x contratti, quindi e' la somma
+ * delle altre due misure (gexOi + gex), senza nulla di nuovo dal server.
+ */
+type GexBasis = 'volume' | 'oi' | 'oiVol';
+const gexDiBase = (basis: GexBasis, gex: number, gexOi: number) =>
+  basis === 'oi' ? gexOi : basis === 'oiVol' ? gex + gexOi : gex;
 
 /**
  * Ogni quanto il client allunga la storia del profilo. E' lo stesso passo con
@@ -147,7 +156,7 @@ export default function GexPage() {
   // Su cosa pesare il gamma: i contratti scambiati oggi (flusso) o le
   // posizioni aperte (posizionamento, il GEX canonico). Ogni punto porta
   // gia' entrambi i valori, quindi il cambio e' istantaneo.
-  const [gexBasis, setGexBasis] = useState<'volume' | 'oi'>('volume');
+  const [gexBasis, setGexBasis] = useState<GexBasis>('volume');
   // Cosa colora la mappa: |GEX| sulla scala termica di Bookmap, il livello
   // col segno (verde/rosa), o quanto e' cambiato negli ultimi `lookbackMin`
   // minuti (ciano = si rafforza, arancio = si scioglie).
@@ -155,6 +164,11 @@ export default function GexPage() {
   // Lo slider di contrasto di Bookmap: >1 fa saturare prima, i muri piccoli escono.
   const [contrasto, setContrasto] = useState(1);
   const [lookbackMin, setLookbackMin] = useState<number>(10);
+  // Pallini sulle variazioni piu' importanti della serie (in prova, 05/11/2026).
+  const [mostraPicchi, setMostraPicchi] = useState(true);
+  const mostraPicchiRef = useRef(mostraPicchi);
+  mostraPicchiRef.current = mostraPicchi;
+  const [nPicchi, setNPicchi] = useState(0);
   const [fondoMappa, setFondoMappa] = useState(0);
   const lookbackRef = useRef(lookbackMin);
   lookbackRef.current = lookbackMin;
@@ -436,8 +450,8 @@ export default function GexPage() {
 
   const gexProfile = useMemo(() => {
     // Il totale di giornata arriva gia' cumulato dal server: qui si sceglie
-    // solo quale delle due misure mostrare.
-    return profile.map((p) => ({ strike: p.strike, gex: gexBasis === 'oi' ? p.gexOi : p.gex }));
+    // solo quale misura mostrare (OI + volume = somma delle due).
+    return profile.map((p) => ({ strike: p.strike, gex: gexDiBase(gexBasis, p.gex, p.gexOi) }));
   }, [profile, gexBasis]);
 
   const currentBasis = useMemo(() => {
@@ -674,7 +688,8 @@ export default function GexPage() {
       const strikeSerie = latestStrikes.current;
       const fotogrammi = latestSerie.current.map((f) => {
         const t = f.time.includes(':') ? f.time : `${f.time}:00`;
-        return { t: new Date(`${todayStr}T${t}`).getTime(), valori: gexBasis === 'oi' ? f.gexOi : f.gex };
+        return { t: new Date(`${todayStr}T${t}`).getTime(), valori: gexBasis === 'oiVol' ? f.gex.map((v, i) => v + (f.gexOi[i] ?? 0))
+          : gexBasis === 'oi' ? f.gexOi : f.gex };
       }).filter((f) => !isNaN(f.t));
       // L'ultima colonna e' il profilo di adesso, non la fotografia di due
       // minuti fa: cosi' il bordo destro della mappa e' il muro attuale.
@@ -768,6 +783,59 @@ export default function GexPage() {
       delete opt.max;
     };
 
+    /**
+     * Mirino: due linee tratteggiate dal puntatore fin dentro le scale, con
+     * l'ora sull'asse del tempo e lo strike sull'asse degli strike.
+     */
+    const disegnaMirino = (c: ChartJS) => {
+      const p = puntatoreRef.current;
+      const area = c.chartArea;
+      const sx = (c.scales as any).xTime;
+      const sy = (c.scales as any).y;
+      if (!p || !area || !sx || !sy) return;
+      if (p.x < area.left || p.x > area.right || p.y < area.top || p.y > area.bottom) return;
+      const ctx = c.ctx;
+      const yDestra = sy.position === 'right';
+      ctx.save();
+      ctx.strokeStyle = 'rgba(226, 232, 240, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(Math.round(p.x) + 0.5, area.top);
+      ctx.lineTo(Math.round(p.x) + 0.5, sx.bottom);
+      ctx.moveTo(yDestra ? area.left : sy.left, Math.round(p.y) + 0.5);
+      ctx.lineTo(yDestra ? sy.right : area.right, Math.round(p.y) + 0.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.font = 'bold 10px ui-monospace, Consolas, monospace';
+      ctx.textBaseline = 'middle';
+      const etichetta = (testo: string, cx: number, cy: number, allinea: 'center' | 'left' | 'right') => {
+        const w = ctx.measureText(testo).width + 8;
+        const h = 16;
+        const x0 = allinea === 'center' ? cx - w / 2 : allinea === 'left' ? cx : cx - w;
+        ctx.fillStyle = '#e2e8f0';
+        ctx.fillRect(x0, cy - h / 2, w, h);
+        ctx.fillStyle = '#0f172a';
+        ctx.textAlign = 'left';
+        ctx.fillText(testo, x0 + 4, cy);
+      };
+
+      const t = sx.getValueForPixel(p.x);
+      if (t != null && isFinite(t)) {
+        const d = new Date(t);
+        const ora = [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+        const xc = Math.min(Math.max(p.x, sx.left + 30), sx.right - 30);
+        etichetta(ora, xc, sx.top + 9, 'center');
+      }
+      const k = sy.getValueForPixel(p.y);
+      if (k != null && isFinite(k)) {
+        etichetta(k.toFixed(1), yDestra ? sy.left + 2 : sy.right - 2, p.y, yDestra ? 'left' : 'right');
+      }
+      ctx.restore();
+    };
+
+    canvas.style.cursor = 'crosshair';
     const chart = new ChartJS(canvas, {
       type: 'bar',
       data: { datasets: datasets as any },
@@ -816,39 +884,9 @@ export default function GexPage() {
             },
           },
           annotation: { annotations: lineAnnotations },
-          tooltip: {
-            mode: 'index' as const, intersect: false,
-            backgroundColor: '#0f172a', titleColor: '#38bdf8', bodyColor: '#f1f5f9',
-            borderColor: '#334155', borderWidth: 1,
-            callbacks: {
-              label: (ctx: any) => {
-                const l = ctx.dataset.label || '';
-                if (l.includes('SPX Price')) return `SPX Price: ${ctx.parsed.y.toFixed(2)}`;
-                if (ctx.raw?.v !== undefined) {
-                  return `Strike ${ctx.parsed.y}: ${(ctx.raw.v / 1000).toFixed(1)} Bn`;
-                }
-                return `${l}: ${ctx.parsed.x.toFixed(2)} M$`;
-              },
-              // Il muro sotto il puntatore, letto dalla mappa: valore e
-              // variazione sul lookback scelto.
-              afterBody: (items: any[]) => {
-                const mappa = mappaRef.current;
-                const p = puntatoreRef.current;
-                const c = items[0]?.chart as ChartJS | undefined;
-                if (!mappa || !p || !c) return '';
-                const t = (c.scales as any).xTime?.getValueForPixel(p.x);
-                const k = (c.scales as any).y?.getValueForPixel(p.y);
-                if (t == null || k == null) return '';
-                const r = mappa.leggi(t, k);
-                if (!r) return '';
-                const bn = (v: number) => `${v >= 0 ? '+' : ''}${(v / 1000).toFixed(2)} Bn`;
-                return [
-                  `Strike ${r.strike}: ${bn(r.valore)}`,
-                  `|GEX| in ${lookbackRef.current}m: ${bn(r.delta)}${r.delta > 0 ? ' (si rafforza)' : r.delta < 0 ? ' (si indebolisce)' : ''}`,
-                ];
-              },
-            },
-          },
+          // Niente pannello: il mirino (plugin qui sotto) con le etichette
+          // sulle scale dice ora e strike, la mappa il resto.
+          tooltip: { enabled: false },
           zoom: {
             // `xGex` non compare: il profilo resta inchiodato dov'e'. Zoom e
             // trascinamento del plugin lavorano su tutte le scale insieme, e
@@ -876,12 +914,18 @@ export default function GexPage() {
         beforeDatasetsDraw: (c: ChartJS) => {
           if (mappaRef.current) disegnaMappa(c as any, mappaRef.current);
         },
+        afterDatasetsDraw: (c: ChartJS) => {
+          if (mappaRef.current && mostraPicchiRef.current) disegnaPicchi(c as any, mappaRef.current);
+        },
         afterDraw: (c: ChartJS) => {
           if (mappaRef.current) disegnaColonna(c as any, mappaRef.current);
+          disegnaMirino(c);
         },
-        afterEvent: (_c: ChartJS, args: { event: { type: string; x: number | null; y: number | null } }) => {
+        afterEvent: (_c: ChartJS, args: { event: { type: string; x: number | null; y: number | null }; changed?: boolean }) => {
           const ev = args.event;
+          const prima = puntatoreRef.current;
           puntatoreRef.current = ev.type === 'mouseout' || ev.x == null || ev.y == null ? null : { x: ev.x, y: ev.y };
+          if (prima?.x !== puntatoreRef.current?.x || prima?.y !== puntatoreRef.current?.y) args.changed = true;
         },
       }],
     });
@@ -994,7 +1038,7 @@ export default function GexPage() {
     const suSu = () => {
       if (!trascinamento) return;
       trascinamento = null;
-      canvas.style.cursor = '';
+      canvas.style.cursor = 'crosshair';
     };
 
     canvas.addEventListener('mousedown', suGiu);
@@ -1014,6 +1058,9 @@ export default function GexPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pluginsReady, viewMode]);
 
+  // Accendere/spegnere i pallini non cambia i dati: basta ridisegnare.
+  useEffect(() => { chartRef.current?.draw(); }, [mostraPicchi]);
+
   // ─── Imperative data update — preserves zoom/pan ───
   useEffect(() => {
     const chart = chartRef.current;
@@ -1021,6 +1068,7 @@ export default function GexPage() {
 
     const newDatasets = buildDatasets(spxHistory, gexProfile);
     setFondoMappa(mappaRef.current?.fondo ?? 0);
+    setNPicchi(mappaRef.current?.picchi.length ?? 0);
 
     // Si aggiorna sul posto solo se nella stessa posizione c'e' lo stesso
     // dataset: i muri visibili cambiano di numero durante la sessione, e
@@ -1138,6 +1186,13 @@ export default function GexPage() {
             >
               Open Interest
             </button>
+            <button
+              onClick={() => setGexBasis('oiVol')}
+              title="Gamma pesato su open interest + contratti scambiati oggi: le posizioni di ieri piu' il flusso di oggi"
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${gexBasis === 'oiVol' ? 'bg-slate-800 text-teal-400 shadow-md border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              OI + Volume
+            </button>
             {isZoomed && (
               <button
                 onClick={handleResetZoom}
@@ -1184,7 +1239,14 @@ export default function GexPage() {
                 </button>
               ))}
             </div>
-            {modoMappa === 'variazione' && (
+            <button
+              onClick={() => setMostraPicchi((v) => !v)}
+              title="Un pallino sullo strike e nell'istante della variazione di |GEX| piu' importante (sopra il 98° percentile della sessione, sul lookback scelto): ciano si rafforza, arancio si indebolisce. In prova"
+              className={`px-2.5 py-1 text-[11px] font-semibold rounded border transition-all ${mostraPicchi ? 'bg-slate-800 text-cyan-300 border-cyan-700/60' : 'text-slate-400 border-slate-800 hover:text-slate-200'}`}
+            >
+              ● Pallini{mostraPicchi && nPicchi > 0 ? ` (${nPicchi})` : ''}
+            </button>
+            {(modoMappa === 'variazione' || mostraPicchi) && (
               <div className="flex items-center gap-1 bg-slate-950/60 p-0.5 rounded-md border border-slate-800" title="Su quanti minuti si misura la variazione">
                 {[2, 10, 30].map((m) => (
                   <button

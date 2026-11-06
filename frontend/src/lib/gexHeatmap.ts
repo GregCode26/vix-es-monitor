@@ -48,8 +48,26 @@ export interface MappaGex {
   fondo: number;
   /** Il profilo dell'ultima colonna, per la colonna stile COB. */
   ultimo: { strike: number; valore: number }[];
+  /**
+   * Le variazioni piu' importanti della sessione, una per evento: in ogni
+   * istante lo strike che e' cambiato di piu', se supera il 98esimo
+   * percentile; istanti consecutivi sullo stesso strike e verso sono un
+   * evento solo, segnato al suo picco.
+   */
+  picchi: PiccoVariazione[];
+  /** La soglia dei picchi (M$ sul lookback). */
+  sogliaPicchi: number;
   /** Per il tooltip: valore e variazione interpolati in un punto. */
   leggi: (t: number, strike: number) => { strike: number; valore: number; delta: number } | null;
+}
+
+export interface PiccoVariazione {
+  t: number;
+  strike: number;
+  /** Variazione di |GEX| sul lookback, M$: > 0 il muro si rafforza. */
+  delta: number;
+  /** |delta| / soglia: 1 = appena significativo. */
+  forza: number;
 }
 
 /** Passo della griglia nel tempo. */
@@ -133,37 +151,9 @@ function percentile(valori: number[], p: number): number {
   return ord[Math.min(ord.length - 1, Math.floor(p * (ord.length - 1)))];
 }
 
-/**
- * Costruisce l'immagine. `lookbackMin` serve solo alla variazione.
- * Restituisce null se non c'e' niente da disegnare.
- */
-export function costruisciMappa(
-  strikes: number[],
-  fotogrammi: FotogrammaMappa[],
-  modo: ModoMappa,
-  lookbackMin: number,
-  /**
-   * Contrasto, come lo slider di Bookmap: 2 vuol dire che il colore pieno
-   * arriva gia' a meta' del fondo scala (i muri piccoli si vedono meglio, i
-   * grandi saturano), 0,5 il contrario.
-   */
-  contrasto = 1,
-): MappaGex | null {
-  if (typeof document === 'undefined' || strikes.length === 0 || fotogrammi.length === 0) return null;
+/** La serie ricampionata ogni PASSO_T_MS e la sua variazione di |GEX| sul lookback. */
+function grigliaEDelta(strikes: number[], fotogrammi: FotogrammaMappa[], lookbackMin: number) {
   const fot = [...fotogrammi].sort((a, b) => a.t - b.t);
-
-  // Strike ordinati dall'alto e passo della griglia: il piu' piccolo scarto.
-  const ordine = strikes.map((k, i) => ({ k, i })).sort((a, b) => b.k - a.k);
-  let passoK = Infinity;
-  for (let j = 1; j < ordine.length; j++) {
-    const d = ordine[j - 1].k - ordine[j].k;
-    if (d > 0 && d < passoK) passoK = d;
-  }
-  if (!isFinite(passoK)) passoK = 5;
-  const kAlto = ordine[0].k;
-  const kBasso = ordine[ordine.length - 1].k;
-  const nIndici = Math.round((kAlto - kBasso) / passoK) + 1;
-
   const t0 = fot[0].t;
   const t1 = fot[fot.length - 1].t;
   const nCol = Math.max(1, Math.round((t1 - t0) / PASSO_T_MS) + 1);
@@ -217,6 +207,86 @@ export function costruisciMappa(
     }
     return liscia;
   });
+  return { griglia, delta, t0, t1, nCol };
+}
+
+/**
+ * Le variazioni piu' importanti: in ogni colonna lo strike con |delta|
+ * maggiore, se sopra il 98esimo percentile della sessione; colonne
+ * consecutive sullo stesso strike e verso sono un evento solo, al picco.
+ */
+function picchiDaDelta(delta: Float64Array[], strikes: number[], t0: number): { picchi: PiccoVariazione[]; soglia: number } {
+  const nCol = delta[0]?.length ?? 0;
+  const campioniPicchi: number[] = [];
+  for (const riga of delta) for (let c = 0; c < riga.length; c += 2) if (!isNaN(riga[c]) && riga[c] !== 0) campioniPicchi.push(Math.abs(riga[c]));
+  const soglia = percentile(campioniPicchi, 0.98);
+  const picchi: PiccoVariazione[] = [];
+  if (soglia > 0) {
+    let corrente: PiccoVariazione | null = null;
+    for (let c = 0; c < nCol; c++) {
+      let migliore = -1;
+      let massimo = 0;
+      for (let i = 0; i < strikes.length; i++) {
+        const d = delta[i][c];
+        if (!isNaN(d) && Math.abs(d) > massimo) { massimo = Math.abs(d); migliore = i; }
+      }
+      if (migliore < 0 || massimo < soglia) { if (corrente) picchi.push(corrente); corrente = null; continue; }
+      const d = delta[migliore][c];
+      const nuovo: PiccoVariazione = { t: t0 + c * PASSO_T_MS, strike: strikes[migliore], delta: d, forza: massimo / soglia };
+      if (corrente && corrente.strike === nuovo.strike && Math.sign(corrente.delta) === Math.sign(d)) {
+        if (massimo > Math.abs(corrente.delta)) corrente = nuovo;
+      } else {
+        if (corrente) picchi.push(corrente);
+        corrente = nuovo;
+      }
+    }
+    if (corrente) picchi.push(corrente);
+  }
+  return { picchi, soglia };
+}
+
+/**
+ * Solo i picchi, senza disegnare niente: per /market, che la mappa non la
+ * mostra. Stessa griglia e stessa variazione di `costruisciMappa`.
+ */
+export function trovaPicchi(strikes: number[], fotogrammi: FotogrammaMappa[], lookbackMin: number): PiccoVariazione[] {
+  if (strikes.length === 0 || fotogrammi.length === 0) return [];
+  const { delta, t0 } = grigliaEDelta(strikes, fotogrammi, lookbackMin);
+  return picchiDaDelta(delta, strikes, t0).picchi;
+}
+
+/**
+ * Costruisce l'immagine. `lookbackMin` serve solo alla variazione.
+ * Restituisce null se non c'e' niente da disegnare.
+ */
+export function costruisciMappa(
+  strikes: number[],
+  fotogrammi: FotogrammaMappa[],
+  modo: ModoMappa,
+  lookbackMin: number,
+  /**
+   * Contrasto, come lo slider di Bookmap: 2 vuol dire che il colore pieno
+   * arriva gia' a meta' del fondo scala (i muri piccoli si vedono meglio, i
+   * grandi saturano), 0,5 il contrario.
+   */
+  contrasto = 1,
+): MappaGex | null {
+  if (typeof document === 'undefined' || strikes.length === 0 || fotogrammi.length === 0) return null;
+  const fot = [...fotogrammi].sort((a, b) => a.t - b.t);
+
+  // Strike ordinati dall'alto e passo della griglia: il piu' piccolo scarto.
+  const ordine = strikes.map((k, i) => ({ k, i })).sort((a, b) => b.k - a.k);
+  let passoK = Infinity;
+  for (let j = 1; j < ordine.length; j++) {
+    const d = ordine[j - 1].k - ordine[j].k;
+    if (d > 0 && d < passoK) passoK = d;
+  }
+  if (!isFinite(passoK)) passoK = 5;
+  const kAlto = ordine[0].k;
+  const kBasso = ordine[ordine.length - 1].k;
+  const nIndici = Math.round((kAlto - kBasso) / passoK) + 1;
+
+  const { griglia, delta, t0, t1, nCol } = grigliaEDelta(strikes, fot, lookbackMin);
 
   // Fondo scala. Per il livello il massimo della sessione: tutta la storia sta
   // sullo stesso metro, quindi un muro che raddoppia si vede raddoppiare. Per
@@ -232,6 +302,8 @@ export function costruisciMappa(
   }
   if (!(fondo > 0)) fondo = 1;
   fondo /= Math.max(0.05, contrasto);
+
+  const { picchi, soglia: sogliaPicchi } = picchiDaDelta(delta, strikes, t0);
 
   const larghezza = nCol;
   const altezza = nIndici * RIGHE_PER_STRIKE;
@@ -296,7 +368,7 @@ export function costruisciMappa(
     return { strike, valore };
   });
 
-  return { immagine, t0, t1, passoT: PASSO_T_MS, kAlto, kBasso, passoK, fondo, ultimo, leggi };
+  return { immagine, t0, t1, passoT: PASSO_T_MS, kAlto, kBasso, passoK, fondo, ultimo, picchi, sogliaPicchi, leggi };
 }
 
 /**
@@ -328,6 +400,43 @@ export function disegnaMappa(
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(mappa.immagine, xa, ya, xb - xa, yb - ya);
+  ctx.restore();
+}
+
+/**
+ * I pallini delle variazioni piu' importanti, sopra la mappa: ciano il muro
+ * che si rafforza, arancio quello che si scioglie, piu' grandi i piu' forti.
+ */
+export function disegnaPicchi(
+  chart: { ctx: CanvasRenderingContext2D; chartArea: { left: number; right: number; top: number; bottom: number }; scales: Record<string, { getPixelForValue: (v: number) => number }> },
+  mappa: MappaGex,
+): void {
+  const x = chart.scales.xTime;
+  const y = chart.scales.y;
+  const area = chart.chartArea;
+  if (!x || !y || !area || mappa.picchi.length === 0) return;
+  const ctx = chart.ctx;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+  ctx.clip();
+  ctx.font = 'bold 9px ui-monospace, Consolas, monospace';
+  ctx.textBaseline = 'middle';
+  for (const p of mappa.picchi) {
+    const px = x.getPixelForValue(p.t);
+    const py = y.getPixelForValue(p.strike);
+    if (!isFinite(px) || !isFinite(py)) continue;
+    const r = Math.min(10, 3 + 2 * Math.sqrt(p.forza));
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.fillStyle = p.delta > 0 ? 'rgba(34, 211, 238, 0.95)' : 'rgba(251, 146, 60, 0.95)';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#ffffff';
+    ctx.stroke();
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillText(`${p.delta > 0 ? '+' : '−'}${(Math.abs(p.delta) / 1000).toFixed(1)}`, px + r + 3, py);
+  }
   ctx.restore();
 }
 

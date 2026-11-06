@@ -1,5 +1,6 @@
 'use client';
 
+import { trovaPicchi } from '@/lib/gexHeatmap';
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import {
@@ -354,6 +355,37 @@ interface RangeCalcInput {
  */
 // Funzioni e non costanti: in ora di Roma cambiano nelle settimane in cui
 // l'ora legale italiana e quella americana non coincidono (vedi orarioNy).
+/** Roma e New York, aggiornati ogni secondo; vuoti fino al montaggio (niente differenze server/client). */
+function Orologi() {
+    const [adesso, setAdesso] = useState<Date | null>(null);
+    useEffect(() => {
+        const tick = () => setAdesso(new Date());
+        const primo = setTimeout(tick, 0);
+        const id = setInterval(tick, 1000);
+        return () => { clearTimeout(primo); clearInterval(id); };
+    }, []);
+    const ora = (tz: string) => adesso
+        ? adesso.toLocaleTimeString('it-IT', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        : '--:--:--';
+    const giorno = (tz: string) => adesso
+        ? adesso.toLocaleDateString('it-IT', { timeZone: tz, weekday: 'short', day: '2-digit', month: '2-digit' })
+        : '';
+    return (
+        <div className="shrink-0 flex flex-col gap-1">
+            {([['ROMA', 'Europe/Rome', 'text-blue-400'], ['NEW YORK', 'America/New_York', 'text-orange-400']] as const)
+                .map(([nome, tz, colore]) => (
+                    <div key={tz} className="flex items-baseline justify-end gap-3">
+                        <span className="flex flex-col items-end text-[11px] leading-tight">
+                            <span className="font-bold tracking-widest text-slate-500">{nome}</span>
+                            <span className="text-slate-600">{giorno(tz)}</span>
+                        </span>
+                        <span className={`text-4xl font-bold leading-tight tabular-nums ${colore}`}>{ora(tz)}</span>
+                    </div>
+                ))}
+        </div>
+    );
+}
+
 const aperturaUsa = () => oraRomaDaNy('09:30');
 const obSnapshot = () => oraRomaDaNy('09:35');
 
@@ -657,6 +689,17 @@ export default function MarketPage() {
     const zgCboe = zeroGamma.attuale?.fonte === 'cboe' ? zeroGamma.attuale.valore : null;
     const zgTraccia = zeroGamma.traccia;
     const [tracciaGamma, setTracciaGamma] = useState<{ time: string; maxPos: number | null; maxNeg: number | null }[]>([]);
+    /**
+     * Pallini GEX (in prova, 05/11/2026): sullo strike SPX (spostato del
+     * basis) e nell'istante in cui il GEX per strike ha avuto la variazione
+     * piu' importante, dalla stessa `serie` di /api/gex che serve ai Major
+     * Gamma -- nessuna richiesta in piu'. Stessa regola dei pallini di /gex
+     * (lib/gexHeatmap.ts `trovaPicchi`): lookback 10 minuti, sopra il 98esimo
+     * percentile della sessione. Ciano il muro si rafforza, arancio si scioglie.
+     */
+    const [mostraPicchiGex, setMostraPicchiGex] = useState(true);
+    const [picchiGex, setPicchiGex] = useState<{ time: string; strike: number; delta: number; forza: number }[]>([]);
+    const serieGexRef = useRef<{ strikes: number[]; frames: { time: string; gex: number[] }[] }>({ strikes: [], frames: [] });
   const [activeTab, setActiveTab] = useState<'market'|'gex'>('market');
 
     const [pluginsReady, setPluginsReady] = useState(false);
@@ -765,6 +808,8 @@ export default function MarketPage() {
             if (savedSpxOb !== null) setMostraRangeSpxOb(savedSpxOb === 'true');
             const savedGamma = localStorage.getItem('marketShowMajorGamma');
             if (savedGamma !== null) setMostraGamma(savedGamma === 'true');
+            const savedPicchi = localStorage.getItem('marketShowPicchiGex');
+            if (savedPicchi !== null) setMostraPicchiGex(savedPicchi === 'true');
         }
     }, [router]);
 
@@ -855,6 +900,9 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowMajorGamma', String(mostraGamma));
     }, [mostraGamma]);
+    useEffect(() => {
+        localStorage.setItem('marketShowPicchiGex', String(mostraPicchiGex));
+    }, [mostraPicchiGex]);
 
     // Traccia dei Major Gamma. Il primo giro senza `since` porta la `serie`
     // (~110 KB a fine sessione, una volta sola); dopo, `since` + `flow=0`
@@ -875,6 +923,8 @@ export default function MarketPage() {
                 giorno = getTodayKey();
                 ultimo = null;
                 setTracciaGamma([]);
+                serieGexRef.current = { strikes: [], frames: [] };
+                setPicchiGex([]);
             }
             try {
                 const url = ultimo ? `/api/gex?flow=0&since=${ultimo}` : '/api/gex?flow=0';
@@ -891,9 +941,35 @@ export default function MarketPage() {
                         voci.push({ time: j.lastTime, ...majorGamma(j.profile, 'gex') });
                     }
                     setTracciaGamma(voci);
+                    serieGexRef.current = {
+                        strikes,
+                        frames: (j.serie ?? []).map((f: { time: string; gex: number[] }) => ({ time: f.time, gex: f.gex })),
+                    };
                 } else if (j.lastTime && (j.profile ?? []).length > 0) {
                     const voce = { time: j.lastTime as string, ...majorGamma(j.profile, 'gex') };
                     setTracciaGamma((prev) => [...prev, voce]);
+                }
+                // La serie si allunga come su /gex: una fotografia del profilo
+                // ogni 2 minuti, e in coda sempre il profilo di adesso.
+                const sg = serieGexRef.current;
+                if (j.lastTime && sg.strikes.length > 0 && (j.profile ?? []).length > 0) {
+                    const mappa = new Map((j.profile as { strike: number; gex: number }[]).map((r) => [r.strike, r.gex]));
+                    const frame = { time: j.lastTime as string, gex: sg.strikes.map((k) => Math.round(mappa.get(k) ?? 0)) };
+                    const fr = sg.frames;
+                    const ultima = fr[fr.length - 1];
+                    const penultima = fr.length >= 2 ? fr[fr.length - 2] : null;
+                    if (!ultima || frame.time > ultima.time) {
+                        if (penultima && secondiDa(frame.time) - secondiDa(penultima.time) < 120) fr[fr.length - 1] = frame;
+                        else fr.push(frame);
+                    }
+                }
+                if (sg.frames.length > 0) {
+                    const hhmmss = (ms: number) => {
+                        const x = Math.round(ms / 1000);
+                        return [Math.floor(x / 3600), Math.floor((x % 3600) / 60), x % 60].map((n) => String(n).padStart(2, '0')).join(':');
+                    };
+                    const picchi = trovaPicchi(sg.strikes, sg.frames.map((f) => ({ t: secondiDa(f.time) * 1000, valori: f.gex })), 10);
+                    setPicchiGex(picchi.map((p) => ({ time: hhmmss(p.t), strike: p.strike, delta: p.delta, forza: p.forza })));
                 }
                 if (j.lastTime) ultimo = j.lastTime;
             } catch { /* rete giu': si riprova al giro dopo */ }
@@ -1254,6 +1330,29 @@ export default function MarketPage() {
             (chart.data.datasets[8] as { pointBackgroundColor?: string[] }).pointBackgroundColor = colori;
         }
 
+        // Pallini GEX: sullo strike SPX spostato del basis, sul primo punto di
+        // /api/market da quell'ora in poi (come le divergenze).
+        if (chart.data.datasets[10]) {
+            const ds = chart.data.datasets[10] as { data: (number | null)[]; hidden?: boolean; pointBackgroundColor?: string[]; pointRadius?: number[] };
+            const valori = new Array<number | null>(dataPoints.length).fill(null);
+            const colori: string[] = [];
+            const raggi: number[] = [];
+            let i = 0;
+            if (basisSpx !== null) {
+                for (const p of picchiGex) {
+                    while (i < dataPoints.length && dataPoints[i].time < p.time) i++;
+                    if (i >= dataPoints.length) break;
+                    valori[i] = suScalaSpx(p.strike);
+                    colori[i] = p.delta > 0 ? '#22d3ee' : '#fb923c';
+                    raggi[i] = Math.min(9, 3 + 2 * Math.sqrt(p.forza));
+                }
+            }
+            ds.data = valori;
+            ds.pointBackgroundColor = colori;
+            ds.pointRadius = raggi;
+            ds.hidden = !mostraPicchiGex;
+        }
+
         const newAnnotations: any = {};
         const baseConfigs = [
             // Mattina: tratteggiata. Sono i livelli delle 10:35, calcolati
@@ -1520,7 +1619,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, picchiGex, mostraPicchiGex]);
 
     // ---- Analisi AI sui livelli ----
     useEffect(() => {
@@ -2318,45 +2417,37 @@ export default function MarketPage() {
         };
     }, []);
 
-    // ---- Zoom controls ----
-    const handleZoomIn = (axis: 'x' | 'y') => {
-        if (chartRef.current) {
-            const chart = chartRef.current;
-            chart.zoom(axis === 'x' ? { x: 1.2 } : { y: 1.2 });
-            if (axis === 'y') {
-                manualYLeftZoomingRef.current = true;
-                manualYRightZoomingRef.current = true;
-                manualZoomRef.current = true;
-                // Si registra l'ampiezza appena ottenuta: senza questo il
-                // prossimo aggiornamento riapplicherebbe un intervallo vecchio.
-                manualLimitsRef.current = {
-                    ...(manualLimitsRef.current ?? { x: null, yLeft: null, yRight: null }),
-                    yLeft: [chart.scales['y-left'].min, chart.scales['y-left'].max],
-                    yRight: [chart.scales['y-right'].min, chart.scales['y-right'].max],
-                };
-            }
-            updateZoomState();
+    /**
+     * Il grafico occupa la finestra fino in fondo: l'altezza e' quella che resta sotto
+     * all'intestazione, cosi' l'asse x degli orari si vede sempre senza scorrere la pagina.
+     * Si rimisura quando cambia la finestra o quello che c'e' sopra (pannelli, avvisi).
+     */
+    const areaChartRef = useRef<HTMLDivElement>(null);
+    const haDati = dataPoints.length > 0;
+    const [altezzaChart, setAltezzaChart] = useState<number | null>(null);
+    useEffect(() => {
+        const misura = () => {
+            const el = areaChartRef.current;
+            if (!el) return;
+            const top = el.getBoundingClientRect().top + window.scrollY;
+            // Sotto: il bordo/padding della cornice del grafico e il padding della pagina (pb-3);
+            // la pagina non scorre (overflow-hidden), quindi il grafico deve starci per intero.
+            const sotto = 12 + 12;
+            const altezza = Math.max(400, Math.floor(window.innerHeight - top - sotto));
+            setAltezzaChart((prima) => (prima === altezza ? prima : altezza));
+        };
+        misura();
+        window.addEventListener('resize', misura);
+        const sopra = areaChartRef.current?.parentElement?.parentElement; // il contenitore della pagina
+        const ro = sopra ? new ResizeObserver(misura) : null;
+        // Solo cio' che sta sopra il grafico: osservare il contenitore intero (che cresce col grafico) farebbe un giro.
+        if (sopra) for (const figlio of Array.from(sopra.children)) {
+            if (figlio.contains(areaChartRef.current)) break;
+            ro?.observe(figlio);
         }
-    };
-    const handleZoomOut = (axis: 'x' | 'y') => {
-        if (chartRef.current) {
-            const chart = chartRef.current;
-            chart.zoom(axis === 'x' ? { x: 0.8 } : { y: 0.8 });
-            if (axis === 'y') {
-                manualYLeftZoomingRef.current = true;
-                manualYRightZoomingRef.current = true;
-                manualZoomRef.current = true;
-                // Si registra l'ampiezza appena ottenuta: senza questo il
-                // prossimo aggiornamento riapplicherebbe un intervallo vecchio.
-                manualLimitsRef.current = {
-                    ...(manualLimitsRef.current ?? { x: null, yLeft: null, yRight: null }),
-                    yLeft: [chart.scales['y-left'].min, chart.scales['y-left'].max],
-                    yRight: [chart.scales['y-right'].min, chart.scales['y-right'].max],
-                };
-            }
-            updateZoomState();
-        }
-    };
+        return () => { window.removeEventListener('resize', misura); ro?.disconnect(); };
+    }, [activeTab, haDati, showSettings, showRangeCalc, status]);
+
     const handleResetZoom = () => {
         if (chartRef.current) {
             const chart = chartRef.current;
@@ -2515,6 +2606,20 @@ export default function MarketPage() {
                 yAxisID: 'y-right',
                 fill: false,
             },
+            {
+                // Pallini GEX (in prova): strike SPX + basis, nell'istante della
+                // variazione di GEX per strike piu' importante.
+                label: 'Variazione GEX',
+                data: [] as (number | null)[],
+                showLine: false,
+                pointRadius: [] as number[],
+                pointHoverRadius: 8,
+                pointBackgroundColor: [] as string[],
+                pointBorderColor: '#ffffff',
+                pointBorderWidth: 1.5,
+                yAxisID: 'y-right',
+                fill: false,
+            },
         ],
     }), []);
 
@@ -2661,8 +2766,6 @@ export default function MarketPage() {
         },
     }), [updateZoomState]);
 
-    const latestVix = dataPoints.length > 0 ? dataPoints[dataPoints.length - 1].vix : null;
-    const latestEsf = dataPoints.length > 0 ? dataPoints[dataPoints.length - 1].esf : null;
 
     if (isAuthorized === null) {
         return (
@@ -2681,62 +2784,51 @@ export default function MarketPage() {
     const sc = statusConfig[status];
 
     return (
-        <div className="min-h-screen bg-[#0c0d10] text-slate-300 p-4 md:p-8 font-sans">
+        <div className="h-screen overflow-hidden bg-[#0c0d10] text-slate-300 px-4 md:px-8 pt-3 pb-3 font-sans">
             <div className="w-full max-w-[1920px] mx-auto">
-                {/* Header */}
-                <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-6">
-                    <div className="flex flex-col gap-1">
-                        <div className="flex items-center gap-4">
-                            <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-orange-400 bg-clip-text text-transparent">
-                                Market Monitor <span className="text-sm font-light text-slate-500 italic ml-2">ODD LOGIC</span>
-                            </h1>
-                            <div className="flex items-center gap-2 ml-2">
-                                <div className="flex items-center gap-2 px-2 py-1 bg-blue-500/10 border border-blue-500/20 rounded-md">
-                                    <span className="text-[10px] font-bold text-blue-400/80 tracking-tight">VIX</span>
-                                    <span className="text-lg font-bold text-blue-400 leading-none">
-                                        {latestVix !== null ? latestVix.toFixed(2) : '—'}
-                                    </span>
-                                </div>
-                                <div className="flex items-center gap-2 px-2 py-1 bg-green-500/10 border border-green-500/20 rounded-md">
-                                    <div className="flex flex-col items-end">
-                                        <div className="flex items-center gap-2">
-                                            <span className="text-[10px] font-bold text-green-400/80 tracking-tight">ES</span>
-                                            <span className="text-lg font-bold text-green-400 leading-none">
-                                                {latestEsf !== null ? latestEsf.toLocaleString('en-US') : '—'}
-                                            </span>
-                                        </div>
-                                        {firstEsfValue !== null && (
-                                            <span className="text-[10px] text-slate-500 font-medium leading-none mt-0.5">
-                                                Ø {firstEsfValue.toFixed(0)}
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
+                {/* Header (riordinato il 06/11/2026 su richiesta, tolti i riquadri VIX/ES):
+                    il logo su due righe a sinistra, gli orologi Roma/New York a destra e,
+                    centrate fra i due, una riga con le pagine e una con gli strumenti. */}
+                <div className="flex items-center gap-6 mb-3">
+                    <div className="shrink-0 flex flex-col" title="VIX & S&P 500 Futures — Daily History & Real-Time">
+                        <h1 className="text-4xl font-bold leading-tight bg-gradient-to-r from-blue-400 to-orange-400 bg-clip-text text-transparent">
+                            Market<br />Monitor
+                        </h1>
+                        <span className="text-sm font-light text-slate-500 italic">ODD LOGIC</span>
+                        {/* Stato del polling e ultimo aggiornamento, sotto il logo */}
+                        <div className="flex items-center gap-2 mt-1.5">
+                            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border ${sc.color}`}>
+                                <span className={`w-2 h-2 rounded-full ${sc.dot}`} />
+                                {sc.label}
+                            </span>
+                            {lastUpdate && <span className="text-slate-500 text-[11px] tabular-nums">{lastUpdate}</span>}
                         </div>
-                        <p className="text-slate-400 text-sm mt-0.5">
-                            VIX & S&P 500 Futures — Daily History & Real-Time
-                        </p>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-2 mt-3 md:mt-0">
+                    <div className="flex-1 min-w-0 flex flex-col items-center gap-3">
+                    {/* Pagine */}
+                    <div className="flex flex-wrap items-center justify-center gap-2">
                         {/* Tab Switcher */}
-<div className="flex bg-slate-900 border border-slate-700 rounded-lg p-1">
+                        <div className="flex flex-wrap bg-slate-900 border border-slate-700 rounded-lg p-1">
                             <button onClick={() => setActiveTab('market')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'market' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>CHART</button>
                             <button onClick={() => setActiveTab('gex')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'gex' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>GEX</button>
                             <button onClick={() => router.push('/spx-volumes')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">VOLUMI SPX</button>
                             <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET MAKER</button>
+                            <button onClick={() => router.push('/spx-scanner')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Singoli trade da almeno 500 contratti sulle opzioni SPX 0-90 DTE, in 3D">SCANNER 3D</button>
                             <button onClick={() => router.push('/market-tide')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET TIDE</button>
                             <button onClick={() => router.push('/bookmap')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">BOOKMAP</button>
                             <button onClick={() => router.push('/iv-monitor')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">IV MONITOR</button>
                             <button onClick={() => router.push('/operativita')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">OPERATIVITA&apos;</button>
                         </div>
-                        
+                    </div>
+
+                    {/* Strumenti sul grafico (accendi/spegni) e comandi */}
+                    <div className="flex flex-wrap items-center justify-center gap-1.5">
                         {/* Bias su ES da Claude, a titolo di studio */}
                         <button
                             onClick={() => setMostraAi((v) => !v)}
                             title="Segnale AI su ES (studio)"
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraAi
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraAi
                                 ? 'bg-purple-600/30 text-purple-300 border-purple-500/50 hover:bg-purple-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2748,7 +2840,7 @@ export default function MarketPage() {
                                 return !v;
                             })}
                             title="Analisi AI automatica quando ES arriva a 1 punto da un range o da GEX+/GEX- tracciati; riarmo dopo 5 minuti"
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${aiAuto
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${aiAuto
                                 ? 'bg-purple-600/30 text-purple-300 border-purple-500/50 hover:bg-purple-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2759,7 +2851,7 @@ export default function MarketPage() {
                         <button
                             onClick={() => setMostraSmile((v) => !v)}
                             title={mostraSmile ? 'Nascondi la curva dello smile' : 'Mostra la curva dello smile SPX 0DTE'}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraSmile
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraSmile
                                 ? 'bg-cyan-600/30 text-cyan-300 border-cyan-500/50 hover:bg-cyan-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2770,7 +2862,7 @@ export default function MarketPage() {
                         <button
                             onClick={() => setMostraStraddle((v) => !v)}
                             title={mostraStraddle ? 'Nascondi le linee dello straddle' : 'Mostra le linee dello straddle'}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraStraddle
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraStraddle
                                 ? 'bg-orange-600/30 text-orange-300 border-orange-500/50 hover:bg-orange-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2781,7 +2873,7 @@ export default function MarketPage() {
                         <button
                             onClick={() => setMostraSpx((v) => !v)}
                             title={mostraSpx ? `Nascondi la linea SPX (dalle ${aperturaUsa().slice(0, 5)})` : `Mostra la linea SPX dalle ${aperturaUsa().slice(0, 5)}, sulla scala destra`}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraSpx
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraSpx
                                 ? 'bg-green-600/30 text-green-300 border-green-500/50 hover:bg-green-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2792,30 +2884,40 @@ export default function MarketPage() {
                         <button
                             onClick={() => setMostraGamma((v) => !v)}
                             title={mostraGamma ? 'Nascondi Major Pos/Neg Gamma' : 'Mostra Major Pos/Neg Gamma (come /gex, base Volume) nel pomeriggio'}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraGamma
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraGamma
                                 ? 'bg-lime-600/30 text-lime-300 border-lime-500/50 hover:bg-lime-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraGamma ? '◉' : '◌'} Major Gamma
                         </button>
 
+                        {/* Pallini sulla variazione di GEX per strike piu' importante (in prova) */}
+                        <button
+                            onClick={() => setMostraPicchiGex((v) => !v)}
+                            title="Pallino sullo strike SPX (spostato del basis) nell'istante della variazione di GEX piu' importante (10 min, sopra il 98° percentile della sessione): ciano il muro si rafforza, arancio si indebolisce. In prova"
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraPicchiGex
+                                ? 'bg-cyan-600/30 text-cyan-300 border-cyan-500/50 hover:bg-cyan-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraPicchiGex ? '◉' : '◌'} Var GEX{mostraPicchiGex && picchiGex.length > 0 ? ` (${picchiGex.length})` : ''}
+                        </button>
+
                         {/* I sei livelli dell'Opening Bell in termini SPX */}
                         <button
                             onClick={() => setMostraRangeSpxOb((v) => !v)}
                             title={mostraRangeSpxOb ? "Nascondi i range SPX dell'Opening Bell" : `Mostra i range SPX dell'Opening Bell, dalle ${obSnapshot().slice(0, 5)}`}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${mostraRangeSpxOb
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraRangeSpxOb
                                 ? 'bg-emerald-600/30 text-emerald-300 border-emerald-500/50 hover:bg-emerald-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraRangeSpxOb ? '◉' : '◌'} Range SPX OB
-                            <button onClick={() => router.push('/spx-scanner')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Singoli trade da almeno 500 contratti sulle opzioni SPX 0-90 DTE, in 3D">SCANNER 3D</button>
                         </button>
 
                         {/* I dodici livelli R1/R2/R3, che sono un'altra cosa */}
                         <button
                             onClick={toggleStraddle}
                             title={straddleVisibile ? 'Nascondi i livelli R1/R2/R3 (anche sulla pagina GEX)' : 'Mostra i livelli R1/R2/R3'}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${straddleVisibile
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${straddleVisibile
                                 ? 'bg-sky-600/30 text-sky-300 border-sky-500/50 hover:bg-sky-600/40'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2829,7 +2931,7 @@ export default function MarketPage() {
                         <button
                             onClick={() => setShowDivergences(!showDivergences)}
                             title={showDivergences ? 'Nascondi le divergenze' : 'Mostra le divergenze'}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors mr-4 ${showDivergences
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${showDivergences
                                 ? 'bg-yellow-500/20 text-yellow-500 border-yellow-500/30 hover:bg-yellow-500/30'
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
@@ -2839,7 +2941,7 @@ export default function MarketPage() {
                         {/* Settings button */}
                         <button
                             onClick={() => setShowSettings(!showSettings)}
-                            className="px-3 py-1.5 bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded-lg text-xs font-medium transition-colors"
+                            className="px-2 py-1 bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded-md text-[11px] font-medium transition-colors"
                         >
                             ⚙️ Ref Lines
                         </button>
@@ -2849,28 +2951,17 @@ export default function MarketPage() {
                         {/* Range Calculator button */}
                         <button
                             onClick={() => setShowRangeCalc(!showRangeCalc)}
-                            className={`px-3 py-1.5 border rounded-lg text-xs font-bold transition-colors ${showRangeCalc
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${showRangeCalc
                                 ? 'bg-purple-600/30 text-purple-300 border-purple-500/50 hover:bg-purple-600/40'
                                 : 'bg-slate-700/50 hover:bg-slate-700 border-slate-600 text-slate-300'
                             }`}
                         >
                             📐 Range Calc
                         </button>
-
-
-
-
-
-                        {/* Status badge */}
-                        <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border ${sc.color}`}>
-                            <span className={`w-2 h-2 rounded-full ${sc.dot}`} />
-                            {sc.label}
-                        </span>
-
-                        {lastUpdate && (
-                            <span className="text-slate-500 text-xs">Last: {lastUpdate}</span>
-                        )}
                     </div>
+                    </div>
+
+                    <Orologi />
                 </div>
 
                 {/* Outside hours banner */}
@@ -3080,40 +3171,24 @@ export default function MarketPage() {
 
                 {/* Chart Area */}
                 {activeTab === 'market' ? (
-                  <div className="bg-[#0c0d10] border border-slate-800/50 rounded-lg p-2 md:p-4 shadow-2xl">
-                    {/* Zoom Controls */}
-                    <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center gap-2">
-                            <span className="text-xs text-slate-400 font-medium">Zoom X:</span>
-                            <button onClick={() => handleZoomOut('x')} className="w-8 h-8 flex items-center justify-center bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded text-slate-300 hover:text-white transition-colors" title="Zoom Out X">−</button>
-                            <button onClick={() => handleZoomIn('x')} className="w-8 h-8 flex items-center justify-center bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded text-slate-300 hover:text-white transition-colors" title="Zoom In X">+</button>
-                        </div>
-                        <div className="flex items-center gap-2">
-                            <span className="text-xs text-slate-400 font-medium">Zoom Y:</span>
-                            <button onClick={() => handleZoomOut('y')} className="w-8 h-8 flex items-center justify-center bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded text-slate-300 hover:text-white transition-colors" title="Zoom Out Y">−</button>
-                            <button onClick={() => handleZoomIn('y')} className="w-8 h-8 flex items-center justify-center bg-slate-700/50 hover:bg-slate-700 border border-slate-600 rounded text-slate-300 hover:text-white transition-colors" title="Zoom In Y">+</button>
-                        </div>
-
-
-
+                  <div className="relative bg-[#0c0d10] border border-slate-800/50 rounded-lg p-1 md:p-2 shadow-2xl">
+                    {/* Niente piu' barra Zoom X/Y e LIVE TRACKING (06/11/2026, su richiesta: si zooma col
+                        mouse e il live si vede gia'). Se si e' spostato il grafico, il ritorno al live e'
+                        il doppio clic o questo pulsante, che compare solo in quel caso. */}
+                    {isLocked && (
                         <button
                             onClick={handleResetZoom}
-                            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all duration-300 flex items-center gap-2 ${isLocked
-                                ? 'bg-blue-600 text-white shadow-[0_0_15px_rgba(59,130,246,0.5)] border-blue-400'
-                                : 'bg-slate-800/80 text-slate-400 border border-slate-700 hover:bg-slate-700 cursor-default'
-                                }`}
-                            title={isLocked ? 'Restore Live View' : 'Live Tracking Active'}
+                            className="absolute top-2 left-3 z-10 px-3 py-1 rounded-md text-[11px] font-bold bg-blue-600 text-white shadow-[0_0_15px_rgba(59,130,246,0.5)] flex items-center gap-2"
+                            title="Torna alla vista live (anche doppio clic sul grafico)"
                         >
-                            {isLocked ? (
-                                <><span className="w-2 h-2 bg-white rounded-full animate-pulse"></span> RESTORE LIVE VIEW</>
-                            ) : (
-                                <><span className="w-2 h-2 bg-green-500 rounded-full"></span> LIVE TRACKING</>
-                            )}
+                            <span className="w-2 h-2 bg-white rounded-full animate-pulse"></span> RESTORE LIVE VIEW
                         </button>
-                    </div>
-
+                    )}
                     <div
-                        className="h-[calc(100vh-240px)] min-h-[400px] cursor-crosshair"
+                        ref={areaChartRef}
+                        style={{ height: altezzaChart ?? undefined }}
+                        className={`${altezzaChart == null ? 'h-[calc(100vh-240px)]' : ''} min-h-[400px] cursor-crosshair`}
+                        onDoubleClick={handleResetZoom}
                         onMouseMove={handleMouseMove}
                         onMouseOut={handleMouseOut}
                         onMouseDown={handleMouseDown}
@@ -3147,12 +3222,6 @@ export default function MarketPage() {
                       </div>
                     )}
                 {mostraAi && <AiSignalPanel onClose={() => setMostraAi(false)} esterno={ultimaAi} />}
-                {/* Footer */}
-                <div className="mt-4 text-center text-slate-600 text-xs">
-                    Data refreshed every 5 seconds • Active window: 00:00–23:00 CET • Source: IBKR TWS
-                    <br />
-                    <span className="text-slate-500">💡 Tip: Rotella sull&apos;asse X = zoom orizzontale • Trascina grafico = pan completo • Trascina assi Y = scala verticale</span>
-                </div>
             </div>
         </div>
     );

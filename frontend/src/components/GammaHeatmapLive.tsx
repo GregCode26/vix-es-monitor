@@ -287,7 +287,7 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
         <span className="text-slate-500">
           {base === 'gexLr'
             ? 'Segno: posizione dei dealer dal flusso Lee-Ready (opposta a quella dei clienti)'
-            : 'Segno: dealer lunghi le call e corti le put (convenzione, non un dato osservato)'} · rotella sulla mappa = zoom sul tempo · rotella sull&apos;asse dei prezzi = zoom sui prezzi · trascina = guarda indietro · doppio clic = torna live
+            : 'Segno: dealer lunghi le call e corti le put (convenzione, non un dato osservato)'} · rotella sulla mappa o sull&apos;asse del tempo = zoom sul tempo · rotella sull&apos;asse dei prezzi = zoom sui prezzi · trascina = guarda indietro · doppio clic = torna live
         </span>
         {errore && <span className="text-amber-400">{errore}</span>}
       </div>

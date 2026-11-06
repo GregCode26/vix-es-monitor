@@ -62,8 +62,8 @@ const GRANDI_TRADE_MS = 60_000;
 /** Pentagono regolare, punta in alto. */
 const PENTAGONO = 'path://M50 0 L97.6 34.5 L79.4 90.5 L20.6 90.5 L2.4 34.5 Z';
 
-const oraNyTrade = (ts: number) => new Date(ts * 1000).toLocaleTimeString('it-IT',
-    { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const oraTrade = (ts: number) => new Date(ts * 1000).toLocaleTimeString('it-IT',
+    { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
 interface PressureHistoryPoint {
     time: string;
@@ -486,7 +486,7 @@ export default function HedgingPressurePage() {
                         const g: Gruppo = p.data.gruppo;
                         const colore = g.right === 'C' ? '#22c55e' : '#ef4444';
                         const righe = [...g.trade].sort((a, b) => a.ts - b.ts).map((t) =>
-                            `${oraNyTrade(t.ts)} NY · <b>${t.size.toLocaleString('it-IT')}</b> @ ${t.price ?? 'n.d.'}`).join('<br/>');
+                            `${oraTrade(t.ts)} · <b>${t.size.toLocaleString('it-IT')}</b> @ ${t.price ?? 'n.d.'}`).join('<br/>');
                         return `<div style="margin-top:4px;color:${colore}"><b>⬟ ${g.right === 'C' ? 'CALL' : 'PUT'} ${g.k} ${g.scad}</b>` +
                             ` · ${g.trade.length} trade ≥ ${MIN_GRANDE_TRADE}, ${g.somma.toLocaleString('it-IT')} contratti</div>` +
                             `<div style="color:#cbd5e1">${righe}</div>`;

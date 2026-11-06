@@ -35,8 +35,8 @@ interface Risposta {
     verifica: { da_leggere: number; letti: number; aggiornato: number | null } | null;
 }
 
-const oraNy = (ts: number | null, secondi = false) => ts == null ? 'n.d.' :
-    new Date(ts * 1000).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit',
+const oraIt = (ts: number | null, secondi = false) => ts == null ? 'n.d.' :
+    new Date(ts * 1000).toLocaleTimeString('it-IT', { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit',
         ...(secondi ? { second: '2-digit' } : {}) });
 const fmt = (v: number | null | undefined) => v == null ? 'n.d.' : v.toLocaleString('it-IT');
 
@@ -134,7 +134,7 @@ export default function SpxScannerPage() {
                     if (!p || !c) return x.seriesName?.startsWith('ATM') ? `ATM ${atm}` : '';
                     return `<b>${c.trading_class} ${c.real_expiry} ${c.strike} ${c.opt_right === 'C' ? 'CALL' : 'PUT'}</b><br/>` +
                         `DTE ${c.dte}<br/>Trade da ≥ ${fmt(dati.min)}: <b>${p.n}</b>, contratti <b>${fmt(p.somma)}</b><br/>` +
-                        `più grande ${fmt(p.massimo)} · ultimo ${oraNy(p.ultimo, true)} NY<br/>` +
+                        `più grande ${fmt(p.massimo)} · ultimo ${oraIt(p.ultimo, true)}<br/>` +
                         `<span style="color:#888">volume sessione ${fmt(c.volume)}</span>`;
                 },
             },
@@ -183,14 +183,14 @@ export default function SpxScannerPage() {
             {dati && vista && (
                 <div className="text-xs text-gray-400 mb-2 space-y-0.5">
                     <div>
-                        {ciclo && <>Ciclo volumi {ciclo.numero} {oraNy(ciclo.started_at)} NY · SPX {ciclo.spx?.toFixed(2)} ({ciclo.spx_source}) · ATM {vista.atm} · </>}
+                        {ciclo && <>Ciclo volumi {ciclo.numero} {oraIt(ciclo.started_at)} · SPX {ciclo.spx?.toFixed(2)} ({ciclo.spx_source}) · ATM {vista.atm} · </>}
                         altezza = somma dei soli trade da ≥ {fmt(dati.min)} contratti, ogni stampa da sola (non il volume cumulativo) ·
                         in vista {fmt(vista.barre.length)} contratti con trade, {fmt(vista.trade.length)} trade
                     </div>
                     <div>
                         {dati.sogliaBase != null && minimo < dati.sogliaBase &&
                             <span className="text-amber-400">salvati solo i trade ≥ {dati.sogliaBase}: filtro portato a {dati.sogliaBase} · </span>}
-                        {ver ? <>trade letti per {fmt(ver.letti)} contratti, ultimo aggiornamento {oraNy(ver.aggiornato)} NY ·{' '}
+                        {ver ? <>trade letti per {fmt(ver.letti)} contratti, ultimo aggiornamento {oraIt(ver.aggiornato)} ·{' '}
                             <span className={ver.da_leggere ? 'text-amber-400' : ''}>
                                 {fmt(ver.da_leggere)} contratti con volume salito di ≥ {fmt(dati.min)} non ancora verificati
                             </span></> : <span className="text-amber-400">nessun trade letto: avvia python -m spx_flow_scanner.main trade</span>}
@@ -208,12 +208,12 @@ export default function SpxScannerPage() {
                             <div className={`font-bold mb-1 ${r === 'C' ? 'text-green-400' : 'text-red-400'}`}>
                                 LARGE {r === 'C' ? 'CALL' : 'PUT'} TRADES (≥ {fmt(dati.min)})</div>
                             <table className="w-full">
-                                <thead className="text-gray-500"><tr><th className="text-left">Ora NY</th><th className="text-left">DTE</th>
+                                <thead className="text-gray-500"><tr><th className="text-left">Ora</th><th className="text-left">DTE</th>
                                     <th className="text-left">Scadenza</th><th>Strike</th><th className="text-right">Contratti</th>
                                     <th className="text-right">Prezzo</th><th className="text-right">Borsa</th></tr></thead>
                                 <tbody>{vista.trade.filter(t => t.opt_right === r).slice(0, 25).map(t => (
                                     <tr key={`${t.con_id}-${t.ts}-${t.seq}`} className="border-t border-gray-800">
-                                        <td>{oraNy(t.ts, true)}</td><td>{vista.dteDi(t.real_expiry)}</td>
+                                        <td>{oraIt(t.ts, true)}</td><td>{vista.dteDi(t.real_expiry)}</td>
                                         <td>{t.trading_class} {t.real_expiry}</td><td className="text-center">{t.strike}</td>
                                         <td className="text-right font-bold">{fmt(t.size)}</td>
                                         <td className="text-right">{t.price ?? 'n.d.'}</td><td className="text-right">{t.exchange ?? ''}</td>

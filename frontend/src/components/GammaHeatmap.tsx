@@ -679,9 +679,9 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
     setVistaY(null);
   }, [fissaX]);
 
-  // Rotella come in /bookmap: sulla mappa = tempo, sull'asse dei prezzi (o
-  // sul profilo a sinistra) = prezzi. Con un gestore non passivo, altrimenti
-  // la pagina scorrerebbe insieme.
+  // Rotella come in /bookmap: sulla mappa o sull'asse del tempo sotto = tempo,
+  // sull'asse dei prezzi (o sul profilo a sinistra) = prezzi. Con un gestore
+  // non passivo, altrimenti la pagina scorrerebbe insieme.
   useEffect(() => {
     const c = tela.current;
     if (!c) return;
@@ -691,7 +691,10 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
       const rect = c.getBoundingClientRect();
       const y = e.clientY - rect.top;
       const x = e.clientX - rect.left;
-      if (x > g.area.x + g.area.w || y < g.area.y || y > g.area.y + g.area.h) return;
+      const sottoArea = y > g.area.y + g.area.h;
+      if (x > g.area.x + g.area.w || y < g.area.y) return;
+      // Sotto la mappa conta solo l'asse del tempo, non l'angolo sotto il profilo.
+      if (sottoArea && x < g.area.x) return;
       e.preventDefault();
       const fattore = e.deltaY > 0 ? 1.15 : 1 / 1.15;
       if (x < g.area.x) {

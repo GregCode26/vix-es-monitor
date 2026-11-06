@@ -29,6 +29,19 @@ import type { Vol } from './volContesto';
 
 export const SMILE_COL = 180;
 
+/**
+ * Il resoconto (contesto, bande, regime, IV ATM, vertice, z) sta in una fascia
+ * SOPRA il grafico, allineata a destra e su piu' colonne, non piu' in testa
+ * alla colonna dello smile: il 06/11/2026 l'utente ha chiesto di spostarlo
+ * perche' copriva la curva. La fascia e' il `layout.padding.top` del grafico,
+ * messo da `beforeLayout` solo quando lo smile e' acceso.
+ */
+const RES_COLONNE = 3;
+const RES_COLONNA_PX = 205;
+const RES_RIGA_PX = 13;
+type Riga = [string, string, string];
+const altezzaResoconto = (n: number) => (n === 0 ? 0 : 6 + Math.ceil(n / RES_COLONNE) * RES_RIGA_PX + 4);
+
 export interface DatiSmile {
     time: string;
     spot: number;
@@ -193,9 +206,9 @@ function storiaVertice(chart: any, ctx: CanvasRenderingContext2D, storia: [strin
     ctx.restore();
 }
 
-/** Regime, IV ATM, vertice e z-score in alto nella colonna: testo su fondo scuro, sopra la curva. */
-function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], vol: Vol | undefined, x0: number, x1: number, top: number) {
-    const righe: [string, string, string][] = [];
+/** Le righe del resoconto: contesto, bande, divergenza, regime, IV ATM, vertice, z-score, avvisi. */
+function righeResoconto(s: DatiSmile['smile'], vol: Vol | undefined): Riga[] {
+    const righe: Riga[] = [];
     // In testa il contesto della giornata (studio_vol.py: prevede l'ampiezza,
     // non la direzione), poi bande e ultima divergenza.
     const c = vol?.contesto;
@@ -243,19 +256,42 @@ function intestazione(ctx: CanvasRenderingContext2D, s: DatiSmile['smile'], vol:
     if (s.est25) avvisi.push('25Δ estrapolata');
     if ((s.ivFermaSec ?? 0) >= 60) avvisi.push(`IV ferma da ${Math.round((s.ivFermaSec as number) / 60)}'`);
     if (avvisi.length) righe.push(['10px Arial', ARANCIO, avvisi.join(' · ')]);
+    return righe;
+}
+
+/** Il resoconto nella fascia sopra il grafico, a colonne (in ordine per colonna), che finisce al bordo destro. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- l'istanza Chart.js
+function intestazione(ctx: CanvasRenderingContext2D, chart: any, righe: Riga[]) {
+    if (righe.length === 0) return;
+    const perColonna = Math.ceil(righe.length / RES_COLONNE);
+    const colonne = Math.ceil(righe.length / perColonna);
+    const x1 = chart.width - 4;
+    const x0 = Math.max(0, x1 - colonne * RES_COLONNA_PX);
+    ctx.save();
     ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-    ctx.fillRect(x0, top, x1 - x0, 8 + righe.length * 13);
+    ctx.fillRect(x0, 2, x1 - x0, altezzaResoconto(righe.length) - 4);
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
     righe.forEach(([font, colore, testo], i) => {
         ctx.font = font;
         ctx.fillStyle = colore;
-        ctx.fillText(testo, x0 + 6, top + 5 + i * 13);
+        ctx.fillText(testo, x0 + 6 + Math.floor(i / perColonna) * RES_COLONNA_PX, 6 + (i % perColonna) * RES_RIGA_PX);
     });
+    ctx.restore();
 }
 
 export const smilePlugin = {
     id: 'smile',
+    // La fascia del resoconto: lo spazio sopra il grafico, quanto servono le righe.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- l'istanza Chart.js
+    beforeLayout: (chart: any) => {
+        const dati: DatiSmile | null | undefined = chart.$smile;
+        const righe = chart.$smileVisibile && dati ? righeResoconto(dati.smile, dati.vol) : [];
+        chart.$smileRighe = righe;
+        const layout = (chart.options.layout ??= {});
+        const pad = typeof layout.padding === 'object' && layout.padding ? layout.padding : {};
+        layout.padding = { ...pad, top: altezzaResoconto(righe.length) };
+    },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- l'istanza Chart.js con le proprieta' $ messe dalla pagina
     afterDraw: (chart: any) => {
         const dati: DatiSmile | null | undefined = chart.$smile;
@@ -297,7 +333,7 @@ export const smilePlugin = {
                 storiaVertice(chart, ctx, s.storiaVertice, yDi, x1);
                 ctx.restore();
             }
-            intestazione(ctx, s, dati.vol, x0, x1, chartArea.top);
+            intestazione(ctx, chart, chart.$smileRighe ?? []);
             ctx.restore();
             return;
         }
@@ -402,7 +438,8 @@ export const smilePlugin = {
             const daCall = sottoSpot ? p.putIv == null : p.callIv != null;
             pallino(ctx, xDi(p.ivOtm as number), y, daCall ? VERDE : ROSSO, vuoto);
         }
-        intestazione(ctx, s, dati.vol, x0, x1, chartArea.top);
         ctx.restore();
+        // Fuori dal clip della colonna: la fascia sta sopra il grafico.
+        intestazione(ctx, chart, chart.$smileRighe ?? []);
     },
 };
