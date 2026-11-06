@@ -8,7 +8,7 @@ from spx_flow_scanner.database.repository import Archivio
 from spx_flow_scanner.scanner.atm_calculator import riferimento_atm
 from spx_flow_scanner.scanner.filters import Filtro, contratti_filtrati, copertura
 from spx_flow_scanner.scanner.volume_analyzer import aggiorna_ultimi, metriche
-from spx_flow_scanner.tests.test_contracts import _catena
+from spx_flow_scanner.tests.test_contracts import OGGI, _catena
 
 NY = ZoneInfo('America/New_York')
 M = 60
@@ -45,7 +45,7 @@ class TestFiltriSuDb(unittest.TestCase):
     def setUp(self):
         self.cartella = tempfile.TemporaryDirectory()
         self.a = Archivio(Path(self.cartella.name) / 't.db', blocco=10_000, ogni_s=999)
-        self.contratti = _catena().contratti(dte_max=10_000)
+        self.contratti = _catena().contratti(dte_max=10_000, oggi=OGGI)
         self.a.registra_contratti(self.contratti, '2026-11-05')
         self.inizio = int(datetime(2026, 11, 5, 9, 0, tzinfo=NY).timestamp())
         # Due letture a 10 minuti: volume = strike - 7000 (C) o metà (P).

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from spx_flow_scanner.database.repository import Archivio
 from spx_flow_scanner.scanner.volume_scanner import incremento
-from spx_flow_scanner.tests.test_contracts import _catena
+from spx_flow_scanner.tests.test_contracts import OGGI, _catena
 
 
 def _lettura(con_id, ts, volume, stato='OK', **altro):
@@ -31,7 +31,7 @@ class TestArchivio(unittest.TestCase):
         self.cartella = tempfile.TemporaryDirectory()
         self.percorso = Path(self.cartella.name) / 't.db'
         self.a = Archivio(self.percorso, blocco=1000, ogni_s=999)
-        self.contratti = _catena().contratti(dte_max=10_000)
+        self.contratti = _catena().contratti(dte_max=10_000, oggi=OGGI)
         self.a.registra_contratti(self.contratti, '2026-11-05')
 
     def tearDown(self):
@@ -93,6 +93,47 @@ class TestArchivio(unittest.TestCase):
         self.a.imposta_stato('scanner', {'stato': 'x'})
         self.a.imposta_stato('scanner', {'stato': 'y'})
         self.assertEqual(self.a.db.execute('SELECT value FROM system_status').fetchall()[0][0], '{"stato":"y"}')
+
+    def test_riepilogo_con_scrittore_concorrente(self):
+        """
+        06/11/2026, 9:51 NY: con `trade` acceso lo scanner e' caduto su `database is locked`.
+        aggiorna_ultimi riempiva la tabella temporanea senza commit, quindi le SELECT dopo
+        leggevano dentro quella transazione; se l'altro processo salvava nel mezzo, la
+        scrittura di volume_latest veniva rifiutata subito (snapshot vecchio, il timeout non conta).
+        """
+        from spx_flow_scanner.scanner.volume_analyzer import aggiorna_ultimi
+        c = self.contratti[0].conId
+        self.a.aggiungi_lettura(_lettura(c, 100, 700))
+        self.a.scarica()
+        altro = sqlite3.connect(self.percorso, timeout=1)
+        db = self.a.db
+
+        class ConScrittore:
+            """La connessione dello scanner, ma l'altro processo salva alla lettura dei contratti."""
+            def execute(self, sql, *p):
+                if 'FROM options_contracts' in sql:
+                    altro.execute("INSERT INTO system_status (key, value, updated_at) VALUES ('trade', '{}', 1) "
+                                  "ON CONFLICT (key) DO UPDATE SET updated_at = updated_at + 1")
+                    altro.commit()
+                return db.execute(sql, *p)
+
+            def executemany(self, *a):
+                return db.executemany(*a)
+
+            def commit(self):
+                return db.commit()
+
+            def __enter__(self):
+                return db.__enter__()
+
+            def __exit__(self, *e):
+                return db.__exit__(*e)
+
+        try:
+            self.assertEqual(aggiorna_ultimi(ConScrittore(), '2026-11-05', 'cash', {c}), 1)
+        finally:
+            altro.close()
+        self.assertEqual(db.execute('SELECT volume FROM volume_latest').fetchone()[0], 700)
 
     def test_lettore_concorrente_in_wal(self):
         self.assertEqual(self.a.db.execute('PRAGMA journal_mode').fetchone()[0], 'wal')

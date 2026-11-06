@@ -72,6 +72,11 @@ def aggiorna_ultimi(db, giorno: str, sessione: str, con_ids=None) -> int:
         db.execute('CREATE TEMP TABLE IF NOT EXISTS _toccati (con_id INTEGER PRIMARY KEY)')
         db.execute('DELETE FROM _toccati')
         db.executemany('INSERT OR IGNORE INTO _toccati VALUES (?)', [(c,) for c in con_ids])
+        # Subito il commit: DELETE/INSERT aprono una transazione implicita, e le SELECT qui sotto
+        # leggerebbero dentro di essa. Se `trade` salva nel mezzo, la scrittura di volume_latest
+        # trova uno snapshot vecchio e SQLite la rifiuta subito ("database is locked", il timeout
+        # non serve): e' quello che ha fermato lo scanner il 06/11/2026 alle 9:51 NY.
+        db.commit()
         filtro = 'AND v.con_id IN (SELECT con_id FROM _toccati)'
 
     ok = defaultdict(list)
