@@ -51,6 +51,7 @@ export async function GET(req: NextRequest) {
         // >= min, ogni stampa presa da sola. Il DB tiene solo le stampe >= la soglia di base.
         const haTrade = !!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'trades'").get();
         let trade: unknown[] = [], perContratto: unknown[] = [], verifica = null, sogliaBase: number | null = null;
+        let precedente: { giorno: string; perContratto: unknown[] } | null = null;
         const richiesto = Math.max(1, Number(q.get('min') ?? 500) || 500);
         if (haTrade) {
             sogliaBase = (db.prepare('SELECT MAX(soglia) s FROM trade_cursor WHERE giorno = ? AND sessione = ?')
@@ -76,10 +77,32 @@ export async function GET(req: NextRequest) {
                  WHERE l.giorno = ? AND l.sessione = ? AND l.volume IS NOT NULL
                    AND l.volume - COALESCE(c.vol_rif, 0) >= ?`)
                 .get(giorno, sessione, giorno, sessione, giorno, sessione, min) ?? null;
+
+            // `?precedente=1`: la stessa sessione del giorno prima, solo per i contratti che oggi
+            // lo scanner non ha ancora letto (nessuna riga in volume_latest). Dopo l'apertura le
+            // scadenze lontane arrivano solo dopo 1-1,5 ore: la pagina le mostra in grigio
+            // intanto, e ognuna sparisce appena viene letta.
+            if (q.get('precedente') === '1') {
+                const prima = (db.prepare('SELECT MAX(giorno) g FROM trades WHERE giorno < ? AND sessione = ?')
+                    .get(giorno, sessione) as { g: string | null })?.g;
+                if (prima) {
+                    precedente = {
+                        giorno: prima,
+                        perContratto: db.prepare(
+                            `SELECT t.con_id, SUM(t.size) somma, COUNT(*) n, MAX(t.size) massimo, MAX(t.ts) ultimo,
+                                    o.trading_class, o.real_expiry, o.strike, o.opt_right
+                             FROM trades t JOIN options_contracts o ON o.con_id = t.con_id
+                             WHERE t.giorno = ? AND t.sessione = ? AND t.size >= ? AND o.real_expiry >= ?
+                               AND t.con_id NOT IN (SELECT con_id FROM volume_latest WHERE giorno = ? AND sessione = ?)
+                             GROUP BY t.con_id`)
+                            .all(prima, sessione, min, giorno.replaceAll('-', ''), giorno, sessione),
+                    };
+                }
+            }
         }
 
         return NextResponse.json({ giorno, sessione, sessioni, giorni, ciclo: ciclo ?? null, contratti,
-            min: Math.max(richiesto, sogliaBase ?? 0), sogliaBase, perContratto, trade, verifica });
+            min: Math.max(richiesto, sogliaBase ?? 0), sogliaBase, perContratto, trade, verifica, precedente });
     } finally {
         db.close();
     }

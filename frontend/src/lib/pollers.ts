@@ -7,13 +7,31 @@ const ROOT_DIR = path.join(process.cwd(), '..');
 const LOCK_FILE = path.join(ROOT_DIR, '.tmp', 'pollers.lock');
 const LOG_DIR = path.join(ROOT_DIR, '.tmp', 'poller-logs');
 
-const POLLER_SCRIPTS = [
-    'execution/tws_poller.py',
-    'execution/tws_volumes_poller.py',
-    'execution/tws_iv_poller.py',
+/**
+ * `script` e' la chiave nel lock (per i tre poller il percorso, come prima),
+ * `args` cio' che segue `python -u`, `firma` il pezzo di riga di comando che
+ * prova che il processo e' davvero quello, `log` il nome del file di log.
+ */
+type Poller = { script: string; args: string[]; firma: string; log: string };
+const POLLERS: Poller[] = [
+    ...['execution/tws_poller.py', 'execution/tws_volumes_poller.py', 'execution/tws_iv_poller.py'].map((s) => ({
+        script: s, args: [s], firma: path.basename(s), log: path.basename(s, '.py'),
+    })),
+    // Scanner SPX 0-90 DTE per /spx-scanner (dal 09/11/2026 parte da solo come
+    // i poller): `scansiona` legge i volumi a cicli di 10 minuti con poche
+    // linee, `trade` i singoli trade dallo storico tick. Fuori orario aspettano.
+    ...['scansiona', 'trade'].map((cmd) => ({
+        script: `spx_flow_scanner ${cmd}`, args: ['-m', 'spx_flow_scanner.main', cmd],
+        firma: `spx_flow_scanner.main ${cmd}`, log: `spx_flow_scanner_${cmd}`,
+    })),
 ];
+const POLLER_SCRIPTS = POLLERS.map((p) => p.script);
 
-/** Un poller vivo scrive sul suo log ogni 10-16 secondi. */
+/**
+ * Un poller vivo scrive sul suo log ogni 10-16 secondi. Lo scanner no (un
+ * ciclo ogni 10 minuti, 5 a mercato chiuso): per lui il battito non e' una
+ * prova, e conta solo la riga di comando.
+ */
 const HEARTBEAT_MS = 3 * 60 * 1000;
 
 type LockEntry = { pid: number; script: string };
@@ -21,8 +39,12 @@ type Lock = { processes: LockEntry[]; startedAt: string };
 /** Formato vecchio: solo i PID, senza sapere quale script fosse quale. */
 type LegacyLock = { pids: number[]; startedAt: string };
 
+function pollerDi(script: string): Poller | undefined {
+    return POLLERS.find((p) => p.script === script);
+}
+
 function logFileFor(script: string): string {
-    return path.join(LOG_DIR, `${path.basename(script, '.py')}.log`);
+    return path.join(LOG_DIR, `${pollerDi(script)?.log ?? path.basename(script, '.py')}.log`);
 }
 
 /** Il segnale 0 non viene inviato: serve solo a verificare che il PID esista. */
@@ -122,15 +144,17 @@ export function runningPollers(): Map<string, number> {
         if (cmds === null) {
             // Sistema non interrogabile: ripieghiamo sul battito del log, che
             // e' comunque piu' solido del semplice "il PID esiste".
-            if (entry.script && heartbeatFresh(entry.script)) found.set(entry.script, entry.pid);
+            if (entry.script && !entry.script.startsWith('spx_flow_scanner') && heartbeatFresh(entry.script)) {
+                found.set(entry.script, entry.pid);
+            }
             continue;
         }
         const cmd = cmds.get(entry.pid);
         if (!cmd) continue;
         // Lo script vero lo dice la riga di comando: vale anche per i lock
         // vecchi, che il PID lo registravano senza dire a chi appartenesse.
-        const script = POLLER_SCRIPTS.find((s) => cmd.includes(path.basename(s)));
-        if (script) found.set(script, entry.pid);
+        const poller = POLLERS.find((p) => cmd.includes(p.firma));
+        if (poller) found.set(poller.script, entry.pid);
     }
 
     return found;
@@ -155,7 +179,7 @@ function spawnPoller(script: string): number | null {
 
     // `-u` disattiva il buffering di Python, altrimenti il log resta
     // vuoto finche' il buffer non si riempie.
-    const child = spawn('python', ['-u', script], {
+    const child = spawn('python', ['-u', ...(pollerDi(script)?.args ?? [script])], {
         cwd: ROOT_DIR,
         detached: true,
         stdio: ['ignore', fd, fd],

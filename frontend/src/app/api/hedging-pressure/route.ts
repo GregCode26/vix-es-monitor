@@ -19,6 +19,7 @@ import path from 'path';
 import { createClient } from '@supabase/supabase-js';
 import { estimateVanna, vannaToHedgingPressure } from '@/lib/vanna';
 import { calculateHedgingPressure, normalizeHedgingPressure, identifyRiskZones } from '@/lib/hedgingPressure';
+import { giornoRichiesto } from '@/lib/giornoRichiesto';
 
 export const dynamic = 'force-dynamic';
 
@@ -95,14 +96,6 @@ interface PressureHistoryPoint {
     gammaPressure: number;
     vannaPressure: number;
     totalPressure: number;
-}
-
-function getTodayKey() {
-    const now = new Date();
-    const y = now.getFullYear();
-    const m = String(now.getMonth() + 1).padStart(2, '0');
-    const d = String(now.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
 }
 
 function readLocalSnapshots(dateStr: string): Snapshot[] | null {
@@ -367,10 +360,12 @@ export async function GET(request: Request) {
     try {
         const { searchParams } = new URL(request.url);
         const conStoria = searchParams.get('storia') === '1';
-        const targetDate = getTodayKey();
+        // `?date=YYYY-MM-DD` (09/11/2026, per execution/studio_rombi_serie.py): un giorno
+        // passato, SOLO dai file locali (lib/giornoRichiesto.ts), mai da Supabase.
+        const { data: targetDate, passato } = giornoRichiesto(searchParams);
 
         // Read volume snapshots (with gamma, delta, vega)
-        let local = (await readSupabaseSnapshots(targetDate)) ?? [];
+        let local = passato ? [] : (await readSupabaseSnapshots(targetDate)) ?? [];
         if (local.length === 0) local = readLocalSnapshots(targetDate) ?? [];
         if (local.length === 0) {
             return NextResponse.json(
@@ -397,7 +392,7 @@ export async function GET(request: Request) {
         }
 
         // Read IV data to get current IV and changes
-        let latestIV = await readSupabaseLatestIV(targetDate);
+        let latestIV = passato ? null : await readSupabaseLatestIV(targetDate);
         if (!latestIV) {
             const ivSnapshots = readLocalIVSnapshots(targetDate) ?? [];
             latestIV = ivSnapshots.length > 0 ? ivSnapshots[ivSnapshots.length - 1] : null;
@@ -558,7 +553,7 @@ export async function GET(request: Request) {
         // Si ferma dove comincia `local`, che e' gia' in pressureHistory.
         let storia: PressureHistoryPoint[] = [];
         if (conStoria) {
-            let campioni = await readSupabaseStoria(targetDate);
+            let campioni = passato ? null : await readSupabaseStoria(targetDate);
             if (!campioni || campioni.length === 0) campioni = campionaAlMinuto(readLocalSnapshots(targetDate) ?? []);
             const inizioRecenti = pressureHistory.length > 0 ? pressureHistory[0].time : null;
             storia = pressioneDi(campioni.filter((snap) => inizioRecenti == null || snap.time < inizioRecenti));

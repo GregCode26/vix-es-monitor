@@ -33,12 +33,20 @@ interface Risposta {
     contratti: Contratto[]; min: number; sogliaBase: number | null;
     perContratto: PerContratto[]; trade: Trade[];
     verifica: { da_leggere: number; letti: number; aggiornato: number | null } | null;
+    /** Sessione precedente, solo contratti non ancora letti oggi (barre grigie). */
+    precedente: { giorno: string; perContratto: (PerContratto & Pick<Contratto, 'trading_class' | 'real_expiry' | 'strike' | 'opt_right'>)[] } | null;
 }
 
 const oraIt = (ts: number | null, secondi = false) => ts == null ? 'n.d.' :
     new Date(ts * 1000).toLocaleTimeString('it-IT', { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit',
         ...(secondi ? { second: '2-digit' } : {}) });
 const fmt = (v: number | null | undefined) => v == null ? 'n.d.' : v.toLocaleString('it-IT');
+/** Data di oggi a New York, YYYY-MM-DD: i giorni dello scanner sono giorni di borsa NY. */
+const oggiNy = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+/** Cosa cambia fra due letture: se nulla, il grafico 3D non si ridisegna. */
+const firma = (d: Risposta) => [d.giorno, d.sessione, d.min, d.ciclo?.numero, d.ciclo?.started_at,
+    d.verifica?.aggiornato, d.perContratto.length, d.trade.length, d.contratti.length,
+    d.precedente?.perContratto.length].join('|');
 
 export default function SpxScannerPage() {
     const [dati, setDati] = useState<Risposta | null>(null);
@@ -51,6 +59,10 @@ export default function SpxScannerPage() {
     const [range, setRange] = useState(300);
     const [minimo, setMinimo] = useState(500);
     const grafico = useRef<any>(null);
+    const ultimaFirma = useRef('');
+    // SPX live da /api/market (punto piu' recente), arrotondato al punto per non
+    // ridisegnare il 3D a ogni decimale. Usato per la linea gialla solo sul giorno di oggi.
+    const [spotLive, setSpotLive] = useState<number | null>(null);
 
     useEffect(() => {
         // Filtri iniziali anche dall'indirizzo: /spx-scanner?min=500&range=500&dte=30&tipo=P
@@ -68,18 +80,37 @@ export default function SpxScannerPage() {
             const p = new URLSearchParams({ min: String(minimo) });
             if (giorno) p.set('giorno', giorno);
             if (sessione) p.set('sessione', sessione);
+            // Sul giorno corrente: la sessione prima, in grigio, dove oggi non c'e' ancora niente.
+            if (!giorno) p.set('precedente', '1');
             try {
                 const r = await fetch(`/api/spx-scanner?${p}`);
                 const j = await r.json();
                 if (!attivo) return;
                 if (!r.ok) { setErrore(j.error || `HTTP ${r.status}`); return; }
-                setErrore(null); setDati(j);
+                setErrore(null);
+                const f = firma(j);
+                if (f !== ultimaFirma.current) { ultimaFirma.current = f; setDati(j); }
             } catch (e: any) { if (attivo) setErrore(String(e)); }
         };
         const t0 = setTimeout(carica, 300);   // il campo N si scrive cifra per cifra
-        const t = setInterval(carica, 60_000);
+        // 15 s: i trade arrivano ogni minuto e i volumi ogni 10, ma cosi' si vedono subito.
+        // Solo locale (SQLite, niente Supabase): i ~5 MB non costano egress.
+        const t = setInterval(carica, 15_000);
         return () => { attivo = false; clearTimeout(t0); clearInterval(t); };
     }, [giorno, sessione, minimo]);
+
+    useEffect(() => {
+        let attivo = true;
+        const leggi = async () => {
+            try {
+                const j = await (await fetch('/api/market')).json();
+                if (attivo && typeof j?.spx === 'number' && j.spx > 0) setSpotLive(Math.round(j.spx));
+            } catch { /* resta l'ultimo valore */ }
+        };
+        leggi();
+        const t = setInterval(leggi, 5_000);
+        return () => { attivo = false; clearInterval(t); };
+    }, []);
 
     // Il grafico si ridisegna da zero a ogni cambio (notMerge): in modalita' merge echarts-gl
     // lasciava a schermo le barre gia' filtrate. Si conserva solo l'inquadratura.
@@ -93,7 +124,10 @@ export default function SpxScannerPage() {
 
     const vista = useMemo(() => {
         if (!dati) return null;
-        const atm = dati.ciclo?.atm ?? null;
+        // Giorno di oggi (o la notturna di domani, gia' iniziata): linea sullo spot live.
+        // Giorni passati: l'ATM dell'ultimo ciclo di quel giorno.
+        const live = dati.giorno >= oggiNy() && spotLive != null;
+        const atm = live ? spotLive : dati.ciclo?.atm ?? null;
         const meta = new Map(dati.contratti.map(c => [c.con_id, c]));
         const dteDi = (scad: string) => {
             const s = `${scad.slice(0, 4)}-${scad.slice(4, 6)}-${scad.slice(6, 8)}`;
@@ -105,7 +139,11 @@ export default function SpxScannerPage() {
             .map(p => ({ p, c: meta.get(p.con_id) }))
             .filter((x): x is { p: PerContratto; c: Contratto } => !!x.c && passa(x.c.opt_right, x.c.dte, x.c.strike));
         const trade = dati.trade.filter(t => passa(t.opt_right, dteDi(t.real_expiry), t.strike));
-        const maxZ = Math.max(1, ...barre.map(b => b.p.somma));
+        // Barre grigie: la sessione precedente sui contratti che oggi lo scanner non ha ancora letto.
+        const grigie = (dati.precedente?.perContratto ?? [])
+            .map(g => ({ g, dte: dteDi(g.real_expiry) }))
+            .filter(({ g, dte }) => dte >= 0 && passa(g.opt_right, dte, g.strike));
+        const maxZ = Math.max(1, ...barre.map(b => b.p.somma), ...grigie.map(x => x.g.somma));
         const strikeVicini = [...new Set(dati.contratti.filter(c => c.dte <= 1).map(c => c.strike))].sort((a, b) => a - b);
         const passo = strikeVicini.length > 1 ? Math.max(1, Math.min(...strikeVicini.slice(1).map((v, i) => v - strikeVicini[i]))) : 5;
         // Asse DTE fisso da 0 al filtro "DTE <=" (90 di base), anche se le scadenze lontane non hanno trade.
@@ -121,17 +159,38 @@ export default function SpxScannerPage() {
             itemStyle: { color: r === 'C' ? '#22c55e' : '#ef4444', opacity: 0.95 },
             emphasis: { itemStyle: { color: '#facc15' } },
         }));
+        const nomeGrigie = dati.precedente ? `${dati.precedente.giorno.slice(8, 10)}/${dati.precedente.giorno.slice(5, 7)} (non ancora letti oggi)` : '';
+        if (grigie.length) {
+            series.push({
+                type: 'bar3D', name: nomeGrigie,
+                data: grigie.map(({ g, dte }) => ({
+                    value: [dte + (g.opt_right === 'C' ? 0.55 : -0.55) * larghezza + (g.trading_class === 'SPX' ? 1.3 * larghezza : 0), g.strike, g.somma],
+                    g, dte,
+                })),
+                barSize: [larghezza, passo * 0.8],
+                shading: 'lambert',
+                itemStyle: { color: '#6b7280', opacity: 0.55 },
+                emphasis: { itemStyle: { color: '#9ca3af' } },
+            });
+        }
         if (atm != null) {
             series.push({ type: 'line3D', name: 'ATM', data: [[xMin, atm, 0], [xMax, atm, 0]], lineStyle: { color: '#facc15', width: 4 } });
             series.push({ type: 'line3D', name: 'ATM ', data: [[0, atm, 0], [0, atm, maxZ]], lineStyle: { color: '#facc15', width: 2, opacity: 0.6 } });
         }
         const option = {
             backgroundColor: '#0b0f17',
-            legend: { data: ['CALL', 'PUT', 'ATM'], textStyle: { color: '#ccc' }, top: 8 },
+            legend: { data: ['CALL', 'PUT', 'ATM', ...(grigie.length ? [nomeGrigie] : [])], textStyle: { color: '#ccc' }, top: 8 },
             tooltip: {
                 formatter: (x: any) => {
+                    const g = x.data?.g;
+                    if (g) {
+                        return `<b>${g.trading_class} ${g.real_expiry} ${g.strike} ${g.opt_right === 'C' ? 'CALL' : 'PUT'}</b><br/>` +
+                            `<span style="color:#9ca3af">sessione del ${dati.precedente!.giorno}, oggi non ancora letto</span><br/>` +
+                            `DTE ${x.data.dte}<br/>Trade da ≥ ${fmt(dati.min)}: <b>${g.n}</b>, contratti <b>${fmt(g.somma)}</b><br/>` +
+                            `più grande ${fmt(g.massimo)}`;
+                    }
                     const p: PerContratto | undefined = x.data?.p, c: Contratto | undefined = x.data?.c;
-                    if (!p || !c) return x.seriesName?.startsWith('ATM') ? `ATM ${atm}` : '';
+                    if (!p || !c) return x.seriesName?.startsWith('ATM') ? (live ? `SPX live ${atm}` : `ATM ${atm}`) : '';
                     return `<b>${c.trading_class} ${c.real_expiry} ${c.strike} ${c.opt_right === 'C' ? 'CALL' : 'PUT'}</b><br/>` +
                         `DTE ${c.dte}<br/>Trade da ≥ ${fmt(dati.min)}: <b>${p.n}</b>, contratti <b>${fmt(p.somma)}</b><br/>` +
                         `più grande ${fmt(p.massimo)} · ultimo ${oraIt(p.ultimo, true)}<br/>` +
@@ -139,7 +198,9 @@ export default function SpxScannerPage() {
                 },
             },
             xAxis3D: { type: 'value', name: 'DTE', min: xMin, max: xMax, nameTextStyle: { color: '#ccc' }, axisLabel: { color: '#aaa' } },
-            yAxis3D: { type: 'value', name: 'Strike', min: atm != null ? atm - range : undefined, max: atm != null ? atm + range : undefined,
+            // Estremi tondi a 25 punti: con la linea sullo spot live (7547) uscivano tacche 7.247/7.847.
+            yAxis3D: { type: 'value', name: 'Strike', min: atm != null ? Math.floor((atm - range) / 25) * 25 : undefined,
+                max: atm != null ? Math.ceil((atm + range) / 25) * 25 : undefined,
                 nameTextStyle: { color: '#ccc' }, axisLabel: { color: '#aaa' } },
             zAxis3D: { type: 'value', name: `Σ trade ≥ ${dati.min}`, min: 0, nameTextStyle: { color: '#ccc' }, axisLabel: { color: '#aaa' } },
             grid3D: {
@@ -150,9 +211,8 @@ export default function SpxScannerPage() {
             },
             series,
         };
-        return { option, atm, barre, trade, dteDi };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [dati, tipo, dteMax, range]);
+        return { option, atm, live, barre, trade, dteDi, grigie: grigie.length };
+    }, [dati, tipo, dteMax, range, spotLive]);
 
     const ciclo = dati?.ciclo;
     const ver = dati?.verifica;
@@ -162,7 +222,9 @@ export default function SpxScannerPage() {
             <div className="flex flex-wrap items-center gap-3 mb-2">
                 <h1 className="text-lg font-bold mr-2">SPX Options · singoli trade · 3D</h1>
                 <select className={sel} value={giorno || dati?.giorno || ''} onChange={e => { setGiorno(e.target.value); setSessione(''); }}>
-                    {(dati?.giorni ?? []).map(g => <option key={g}>{g}</option>)}
+                    {/* Il giorno dell'ultimo ciclo c'e' anche prima che abbia volumi salvati */}
+                    {[...new Set([...(dati ? [dati.giorno] : []), ...(dati?.giorni ?? [])])].sort().reverse()
+                        .map(g => <option key={g}>{g}</option>)}
                 </select>
                 <select className={sel} value={sessione || dati?.sessione || ''} onChange={e => setSessione(e.target.value)}>
                     {(dati?.sessioni ?? []).map(s => <option key={s}>{s}</option>)}
@@ -180,12 +242,26 @@ export default function SpxScannerPage() {
                 </div>
             </div>
             {errore && <div className="text-red-400 mb-2">{errore}</div>}
+            {dati && !giorno && dati.giorno < oggiNy() && (
+                <div className="mb-2 px-3 py-1.5 rounded border border-amber-600 bg-amber-950/40 text-amber-300 text-sm">
+                    Dati del {dati.giorno}: oggi lo scanner non ha ancora letto niente (fuori orario, o TWS/scanner fermi).
+                    La pagina si aggiorna da sola appena arriva il primo ciclo.
+                </div>
+            )}
+            {dati && vista?.live && ciclo && Date.now() / 1000 - ciclo.started_at > 20 * 60 && (
+                <div className="mb-2 px-3 py-1.5 rounded border border-amber-600 bg-amber-950/40 text-amber-300 text-sm">
+                    Ultimo ciclo volumi alle {oraIt(ciclo.started_at)}: lo scanner ne fa uno ogni 10 minuti, potrebbe essere fermo.
+                </div>
+            )}
             {dati && vista && (
                 <div className="text-xs text-gray-400 mb-2 space-y-0.5">
                     <div>
-                        {ciclo && <>Ciclo volumi {ciclo.numero} {oraIt(ciclo.started_at)} · SPX {ciclo.spx?.toFixed(2)} ({ciclo.spx_source}) · ATM {vista.atm} · </>}
+                        {vista.live && <span className="text-yellow-400">linea gialla = SPX live {vista.atm} · </span>}
+                        {ciclo && <>Ciclo volumi {ciclo.numero} {oraIt(ciclo.started_at)} · SPX {ciclo.spx?.toFixed(2)} ({ciclo.spx_source}) · ATM del ciclo {ciclo.atm} · </>}
                         altezza = somma dei soli trade da ≥ {fmt(dati.min)} contratti, ogni stampa da sola (non il volume cumulativo) ·
                         in vista {fmt(vista.barre.length)} contratti con trade, {fmt(vista.trade.length)} trade
+                        {vista.grigie > 0 && dati.precedente && <span className="text-gray-300"> · in grigio {fmt(vista.grigie)} contratti
+                            della sessione del {dati.precedente.giorno} non ancora letti oggi (spariscono quando lo scanner li legge)</span>}
                     </div>
                     <div>
                         {dati.sogliaBase != null && minimo < dati.sogliaBase &&

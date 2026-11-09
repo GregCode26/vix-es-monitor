@@ -700,6 +700,15 @@ export default function MarketPage() {
     const [mostraPicchiGex, setMostraPicchiGex] = useState(true);
     const [picchiGex, setPicchiGex] = useState<{ time: string; strike: number; delta: number; forza: number }[]>([]);
     const serieGexRef = useRef<{ strikes: number[]; frames: { time: string; gex: number[] }[] }>({ strikes: [], frames: [] });
+    /**
+     * Rombi "Var Serie" (in prova, 09/11/2026): come i pallini GEX, ma sulla
+     * serie temporale di MARKET MAKER (/hedging-pressure, pressione per strike
+     * dei ~20 strike piu' carichi). Stessa regola `trovaPicchi`: variazione di
+     * |pressione| su 10 minuti, sopra il 98esimo percentile della sessione.
+     * Fucsia la pressione cresce, lime cala. Solo locale (niente Supabase).
+     */
+    const [mostraPicchiSerie, setMostraPicchiSerie] = useState(true);
+    const [picchiSerie, setPicchiSerie] = useState<{ time: string; strike: number; delta: number; forza: number }[]>([]);
   const [activeTab, setActiveTab] = useState<'market'|'gex'>('market');
 
     const [pluginsReady, setPluginsReady] = useState(false);
@@ -810,6 +819,8 @@ export default function MarketPage() {
             if (savedGamma !== null) setMostraGamma(savedGamma === 'true');
             const savedPicchi = localStorage.getItem('marketShowPicchiGex');
             if (savedPicchi !== null) setMostraPicchiGex(savedPicchi === 'true');
+            const savedPicchiSerie = localStorage.getItem('marketShowPicchiSerie');
+            if (savedPicchiSerie !== null) setMostraPicchiSerie(savedPicchiSerie === 'true');
         }
     }, [router]);
 
@@ -903,6 +914,62 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowPicchiGex', String(mostraPicchiGex));
     }, [mostraPicchiGex]);
+
+    useEffect(() => {
+        localStorage.setItem('marketShowPicchiSerie', String(mostraPicchiSerie));
+    }, [mostraPicchiSerie]);
+
+    // Serie temporale di MARKET MAKER per i rombi: la sessione intera al primo
+    // giro (`storia=1`, uno snapshot al minuto), poi ogni minuto gli ultimi
+    // punti. Si accumula per orario|strike come fa /hedging-pressure.
+    useEffect(() => {
+        if (!isAuthorized) return;
+        const punti = new Map<string, { time: string; strike: number; v: number }>();
+        let giorno = getTodayKey();
+        let conStoria = true;
+        let vivo = true;
+        const giro = async () => {
+            if (getTodayKey() !== giorno) {
+                giorno = getTodayKey();
+                punti.clear();
+                conStoria = true;
+                setPicchiSerie([]);
+            }
+            try {
+                const res = await fetch(conStoria ? '/api/hedging-pressure?storia=1' : '/api/hedging-pressure', { cache: 'no-store' });
+                if (!res.ok || !vivo) return;
+                const j = await res.json();
+                const d = j.data ?? j;
+                if (!d?.date) return;
+                conStoria = false;
+                for (const p of [...(d.storia ?? []), ...(d.pressureHistory ?? [])] as { time: string; strike: number; totalPressure: number }[]) {
+                    punti.set(`${p.time}|${p.strike}`, { time: p.time, strike: p.strike, v: p.totalPressure });
+                }
+                // Fotogrammi per orario; uno strike che quell'ora non c'era (entrato
+                // dopo fra i piu' carichi) e' NaN, non 0, o sembrerebbe un salto.
+                const strikes = [...new Set([...punti.values()].map((p) => p.strike))].sort((a, b) => a - b);
+                const indice = new Map(strikes.map((k, i) => [k, i]));
+                const perOra = new Map<string, number[]>();
+                for (const p of punti.values()) {
+                    let riga = perOra.get(p.time);
+                    if (!riga) { riga = new Array(strikes.length).fill(NaN); perOra.set(p.time, riga); }
+                    riga[indice.get(p.strike)!] = p.v;
+                }
+                const frames = [...perOra.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+                    .map(([time, valori]) => ({ t: secondiDa(time) * 1000, valori }));
+                if (frames.length === 0) return;
+                const hhmmss = (ms: number) => {
+                    const x = Math.round(ms / 1000);
+                    return [Math.floor(x / 3600), Math.floor((x % 3600) / 60), x % 60].map((n) => String(n).padStart(2, '0')).join(':');
+                };
+                const picchi = trovaPicchi(strikes, frames, 10);
+                setPicchiSerie(picchi.map((p) => ({ time: hhmmss(p.t), strike: p.strike, delta: p.delta, forza: p.forza })));
+            } catch { /* rete giu': si riprova al giro dopo */ }
+        };
+        giro();
+        const id = setInterval(giro, 60000);
+        return () => { vivo = false; clearInterval(id); };
+    }, [isAuthorized]);
 
     // Traccia dei Major Gamma. Il primo giro senza `since` porta la `serie`
     // (~110 KB a fine sessione, una volta sola); dopo, `since` + `flow=0`
@@ -1353,6 +1420,28 @@ export default function MarketPage() {
             ds.hidden = !mostraPicchiGex;
         }
 
+        // Rombi della serie temporale di MARKET MAKER: stessa collocazione dei pallini GEX.
+        if (chart.data.datasets[11]) {
+            const ds = chart.data.datasets[11] as { data: (number | null)[]; hidden?: boolean; pointBackgroundColor?: string[]; pointRadius?: number[] };
+            const valori = new Array<number | null>(dataPoints.length).fill(null);
+            const colori: string[] = [];
+            const raggi: number[] = [];
+            let i = 0;
+            if (basisSpx !== null) {
+                for (const p of picchiSerie) {
+                    while (i < dataPoints.length && dataPoints[i].time < p.time) i++;
+                    if (i >= dataPoints.length) break;
+                    valori[i] = suScalaSpx(p.strike);
+                    colori[i] = p.delta > 0 ? '#e879f9' : '#a3e635';
+                    raggi[i] = Math.min(10, 4 + 2 * Math.sqrt(p.forza));
+                }
+            }
+            ds.data = valori;
+            ds.pointBackgroundColor = colori;
+            ds.pointRadius = raggi;
+            ds.hidden = !mostraPicchiSerie;
+        }
+
         const newAnnotations: any = {};
         const baseConfigs = [
             // Mattina: tratteggiata. Sono i livelli delle 10:35, calcolati
@@ -1619,7 +1708,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, picchiGex, mostraPicchiGex]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, picchiGex, mostraPicchiGex, picchiSerie, mostraPicchiSerie]);
 
     // ---- Analisi AI sui livelli ----
     useEffect(() => {
@@ -2620,6 +2709,21 @@ export default function MarketPage() {
                 yAxisID: 'y-right',
                 fill: false,
             },
+            {
+                // Rombi "Var Serie" (in prova): strike SPX + basis, nell'istante della
+                // variazione piu' importante della serie temporale di MARKET MAKER.
+                label: 'Variazione serie MARKET MAKER',
+                data: [] as (number | null)[],
+                showLine: false,
+                pointStyle: 'rectRot',
+                pointRadius: [] as number[],
+                pointHoverRadius: 9,
+                pointBackgroundColor: [] as string[],
+                pointBorderColor: '#ffffff',
+                pointBorderWidth: 1.5,
+                yAxisID: 'y-right',
+                fill: false,
+            },
         ],
     }), []);
 
@@ -2819,6 +2923,7 @@ export default function MarketPage() {
                             <button onClick={() => router.push('/bookmap')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">BOOKMAP</button>
                             <button onClick={() => router.push('/iv-monitor')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">IV MONITOR</button>
                             <button onClick={() => router.push('/operativita')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">OPERATIVITA&apos;</button>
+                            <button onClick={() => router.push('/livelli-azionari')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Straddle e livelli L1/L2/L3 di un'azione sulle 3 scadenze più vicine, da IBKR (solo locale)">LIVELLI AZIONARI</button>
                         </div>
                     </div>
 
@@ -2900,6 +3005,17 @@ export default function MarketPage() {
                                 : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
                         >
                             {mostraPicchiGex ? '◉' : '◌'} Var GEX{mostraPicchiGex && picchiGex.length > 0 ? ` (${picchiGex.length})` : ''}
+                        </button>
+
+                        {/* Rombi sulla variazione piu' importante della serie temporale di MARKET MAKER (in prova) */}
+                        <button
+                            onClick={() => setMostraPicchiSerie((v) => !v)}
+                            title="Rombo sullo strike SPX (spostato del basis) nell'istante della variazione piu' importante della serie temporale di MARKET MAKER (pressione per strike, 10 min, sopra il 98° percentile della sessione): fucsia la pressione cresce, lime cala. In prova"
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraPicchiSerie
+                                ? 'bg-fuchsia-600/30 text-fuchsia-300 border-fuchsia-500/50 hover:bg-fuchsia-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraPicchiSerie ? '◆' : '◇'} Var Serie{mostraPicchiSerie && picchiSerie.length > 0 ? ` (${picchiSerie.length})` : ''}
                         </button>
 
                         {/* I sei livelli dell'Opening Bell in termini SPX */}
