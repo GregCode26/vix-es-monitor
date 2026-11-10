@@ -27,6 +27,7 @@ RADICE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'fronten
 ROMA, NY = ZoneInfo('Europe/Rome'), ZoneInfo('America/New_York')
 RIARMO, TOCCO, CONF, STOP, TARGET, FINESTRA, DURATA = 5.0, 0.5, 1.5, 3.0, 4.0, 120, 1800
 COSTO = 0.25
+INVERTI = False  # --inverti
 FINE_RICERCA = '2026-11-04'
 SERVER = 'http://localhost:3000'
 OGGI = datetime.now(ROMA).strftime('%Y-%m-%d')
@@ -186,13 +187,14 @@ def conferme(giorno):
                     if y >= CONF: k = t; break
                 if k is not None:
                     ent, esito = mid[k - s0], None
+                    verso = -lato if INVERTI else lato  # --inverti: stesso ingresso, verso opposto
                     for t in range(k + 1, s1 + 1):
-                        z = lato * (mid[t - s0] - ent)
+                        z = verso * (mid[t - s0] - ent)
                         if z >= TARGET: esito = TARGET; break
                         if z <= -STOP: esito = -STOP; break
                         if t - k >= DURATA: esito = z; break
                     out.append(dict(giorno=giorno, tipo=tipo, livello=nome, prezzo=round(L, 2), ora=f'{k // 3600:02}:{k % 3600 // 60:02}:{k % 60:02}',
-                                    verso='LONG' if lato > 0 else 'SHORT', entrata=ent, esito=esito))
+                                    verso='LONG' if verso > 0 else 'SHORT', entrata=ent, esito=esito))
             s += 1
     return out, nota
 
@@ -216,7 +218,9 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--dal', help='solo le giornate da questa data (YYYY-MM-DD)')
     ap.add_argument('--dettaglio', action='store_true', help='stampa ogni operazione')
+    ap.add_argument('--inverti', action='store_true', help='entra nel verso opposto al segnale (LONG -> SHORT), stesso target/stop')
     a = ap.parse_args()
+    INVERTI = a.inverti
     tutte = []
     for f in sorted(glob.glob(os.path.join(RADICE, 'bookmap', '*.ndjson'))):
         g = os.path.basename(f)[:10]

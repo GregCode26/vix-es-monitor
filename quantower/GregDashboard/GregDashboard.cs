@@ -136,6 +136,11 @@ namespace GregDashboard
         [InputParameter("Conferma anche sullo Zero Gamma (in prova)", 47)]
         public bool ConfermeZeroGamma = true;
 
+        /// <summary>LONG diventa SHORT e viceversa (10/11/2026): stesso ingresso, stesso target/stop, verso opposto.
+        /// Stessa cosa di execution/studio_conferma_range.py --inverti.</summary>
+        [InputParameter("Conferma: inverti segnale", 48)]
+        public bool InvertiConferme = false;
+
         [InputParameter("Smile IV (SPX 0DTE)", 50)]
         public bool MostraSmile = true;
 
@@ -1097,10 +1102,11 @@ namespace GregDashboard
                         if (y >= CONF_PUNTI) { k = t; break; }
                     }
                     if (k == null) continue;
-                    var c = new Conferma { Tipo = tipo, Livello = nome, Prezzo = L, Tocco = s, Sec = k.Value, Verso = lato, Entrata = mid[k.Value - s0] };
+                    var verso = InvertiConferme ? -lato : lato;
+                    var c = new Conferma { Tipo = tipo, Livello = nome, Prezzo = L, Tocco = s, Sec = k.Value, Verso = verso, Entrata = mid[k.Value - s0] };
                     for (var t = k.Value + 1; t <= s1; t++)
                     {
-                        var z = lato * (mid[t - s0] - c.Entrata);
+                        var z = verso * (mid[t - s0] - c.Entrata);
                         if (z >= CONF_TARGET) { c.Esito = CONF_TARGET; c.FineSec = t; break; }
                         if (z <= -CONF_STOP) { c.Esito = -CONF_STOP; c.FineSec = t; break; }
                         if (t - k.Value >= CONF_DURATA) { c.Esito = z; c.FineSec = t; break; }
@@ -1669,7 +1675,7 @@ namespace GregDashboard
                 var netto = chiuse.Sum(c => c.Esito.Value - 0.25);
                 parti.Add($"{tipo} {chiuse.Count(c => c.Esito > 0)}/{chiuse.Count} vinti {netto:+0.00;-0.00} pt");
             }
-            var riassunto = "Conferma (in prova): " + (parti.Count == 0 ? "nessun segnale oggi" : string.Join(" | ", parti));
+            var riassunto = (InvertiConferme ? "Conferma INVERTITA (in prova): " : "Conferma (in prova): ") + (parti.Count == 0 ? "nessun segnale oggi" : string.Join(" | ", parti));
             g.DrawString(riassunto, font, Brushes.Gold, area.Left + 8, area.Bottom - 34);
             if (lista.Count == 0 || giorno == null) return;
             if (!DateTime.TryParseExact(giorno, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) return;
