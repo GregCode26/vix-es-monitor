@@ -463,8 +463,11 @@ export async function GET(request: Request) {
         const riskZones = identifyRiskZones(pressures);
 
         /**
-         * I cinque strike di cui si manda lo storico: i piu' carichi per
-         * |pressione normalizzata|.
+         * Gli strike di cui si manda lo storico: i piu' carichi per
+         * |pressione normalizzata|. Sono le linee della serie temporale, e
+         * vengono dagli snapshot che il poller scrive comunque per tutta la
+         * catena: piu' linee non costano richieste a IBKR ne' letture in piu'
+         * da Supabase, solo una risposta piu' grande.
          *
          * Solo fra quelli con una pressione vera: a parita' di valore il sort
          * lascia l'ordine dell'array, quindi quando le pressioni sono tutte
@@ -473,7 +476,7 @@ export async function GET(request: Request) {
          * lontanissimi dallo spot. Se non ne restano abbastanza si completa
          * con i piu' vicini allo spot, che e' la scelta neutra.
          */
-        const NUM_TOP_STRIKE = 5;
+        const NUM_TOP_STRIKE = 20;
         const perVicinanza = pressures
             .map((p) => p.strike)
             .sort((x, y) => Math.abs(x - latestSpot) - Math.abs(y - latestSpot));
@@ -571,6 +574,7 @@ export async function GET(request: Request) {
                 profile: hedgingProfile,
                 riskZones,
                 strikes,
+                topStrikes,
                 pressureHistory,
                 ...(conStoria ? { storia } : {}),
             },

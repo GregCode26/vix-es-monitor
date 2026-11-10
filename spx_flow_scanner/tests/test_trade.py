@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from spx_flow_scanner.database.repository import Archivio
-from spx_flow_scanner.scanner.trade_scanner import LettoreTrade, candidati, inizio_sessione, scorri_stampe
+from spx_flow_scanner.scanner.trade_scanner import (LettoreTrade, candidati, inizio_sessione, scorri_stampe,
+                                                    verso_da_quota)
 from spx_flow_scanner.utils.market_calendar import NEW_YORK
 
 T0 = int(datetime(2026, 11, 5, 10, 0, tzinfo=NEW_YORK).timestamp())
@@ -87,6 +88,24 @@ class TestLettore(unittest.TestCase):
         self.assertEqual(candidati(db, '2026-11-05', 'cash', 100), [])
         db.execute("UPDATE volume_latest SET volume = 2100 WHERE con_id = 1")
         self.assertEqual([c['con_id'] for c in candidati(db, '2026-11-05', 'cash', 100)], [1])
+
+
+    def test_classifica_verso(self):
+        db = self.a.db
+        db.executemany("INSERT INTO trades (con_id, ts, seq, giorno, sessione, size, price) VALUES (1, ?, 0, '2026-11-05', 'cash', 300, ?)",
+                       [(T0 + 10, 2.05), (T0 + 20, 1.90), (T0 + 30, 1.975), (T0 + 40, 1.95)])
+        quote = {T0 + 10: [(T0 + 9, 1.95, 2.0)], T0 + 20: [(T0 + 19, 1.95, 2.0)], T0 + 30: [(T0 + 29, 1.95, 2.0)],
+                 T0 + 40: [(T0 + 40, 1.95, 2.0)]}  # solo una quota nello stesso secondo: non vale
+
+        class Ib:
+            def reqHistoricalTicks(self, contratto, da, fine, quante, cosa, useRth):
+                return [SimpleNamespace(time=datetime.fromtimestamp(s, timezone.utc), priceBid=b, priceAsk=a)
+                        for s, b, a in quote[int(fine.timestamp())]]
+        lettore = LettoreTrade(SimpleNamespace(ib=Ib(), ultimi_errori=[]), db, SimpleNamespace())
+        self.assertEqual(lettore.classifica(60, [('2026-11-05', 'cash')]), 4)
+        versi = [r[0] for r in db.execute('SELECT verso FROM trades ORDER BY ts')]
+        self.assertEqual(versi, ['C', 'V', 'I', 'N'])
+        self.assertEqual(verso_da_quota(1.96, 1.95, 2.0), 'V')
 
 
 if __name__ == '__main__':

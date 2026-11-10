@@ -64,8 +64,9 @@ def periodi_settimanali(barre: list, ora_ny: datetime) -> list[dict]:
     finita = ora_ny.weekday() > 4 or (ora_ny.weekday() == 4 and ora_ny.hour >= 16)
     corrente = ora_ny.date().isocalendar()[:2]
     chiavi = [k for k in sorted(settimane) if finita or k != corrente]
-    return [riga(settimane[k][0].date, settimane[k][-1].date, settimane[k][0].open, settimane[k][-1].close)
-            for k in chiavi[-N_PERIODI:]]
+    tutti = [riga(settimane[k][0].date, settimane[k][-1].date, settimane[k][0].open, settimane[k][-1].close)
+             for k in chiavi]
+    return con_due_scadenze(tutti)[-N_PERIODI:]
 
 
 def periodi_fra_scadenze(barre: list, riferimento: date, mesi: int, ora_ny: datetime) -> list[dict]:
@@ -80,10 +81,21 @@ def periodi_fra_scadenze(barre: list, riferimento: date, mesi: int, ora_ny: date
         return None
 
     oggi_chiuso = ora_ny.hour >= 16
-    date_scadenza = [d for d in scadenze_passate(riferimento, mesi, N_PERIODI + 1)
+    date_scadenza = [d for d in scadenze_passate(riferimento, mesi, N_PERIODI + 2)
                      if d < ora_ny.date() or (d == ora_ny.date() and oggi_chiuso)]
     punti = [b for b in (chiusura_entro(d) for d in date_scadenza) if b is not None]
-    return [riga(a.date, b.date, a.close, b.close) for a, b in zip(punti, punti[1:])][-N_PERIODI:]
+    return con_due_scadenze([riga(a.date, b.date, a.close, b.close) for a, b in zip(punti, punti[1:])])[-N_PERIODI:]
+
+
+def con_due_scadenze(periodi: list[dict]) -> list[dict]:
+    """`pct2`: il movimento su due periodi di fila, dall'inizio di quello prima alla fine di questo.
+
+    Settimanale: apertura del lunedi' della settimana prima -> chiusura di questo venerdi'.
+    Altrimenti: chiusura di due scadenze fa -> chiusura di questa. None sul primo periodo.
+    """
+    for prima, p in zip([None] + periodi[:-1], periodi):
+        p['pct2'] = round((p['fine'] - prima['inizio']) / prima['inizio'] * 100, 2) if prima else None
+    return periodi
 
 
 def riga(da: date, a: date, inizio: float, fine: float) -> dict:
@@ -99,6 +111,7 @@ def riepilogo(periodi: list[dict]) -> dict:
     assolute = [abs(m) for m in mosse]
     su = [m for m in mosse if m > 0]
     giu = [m for m in mosse if m < 0]
+    due = [abs(p['pct2']) for p in periodi if p.get('pct2') is not None]
     return {
         'n': len(mosse),
         'mediaAssoluta': round(statistics.mean(assolute), 2),
@@ -108,6 +121,9 @@ def riepilogo(periodi: list[dict]) -> dict:
         'giu': len(giu), 'mediaGiu': round(statistics.mean(giu), 2) if giu else None,
         'massimo': max(mosse, key=abs),
         'oltre': [{'soglia': s, 'n': sum(a > s for a in assolute)} for s in SOGLIE],
+        'mediaAssoluta2': round(statistics.mean(due), 2) if due else None,
+        'medianaAssoluta2': round(statistics.median(due), 2) if due else None,
+        'oltre2': [{'soglia': s, 'n': sum(a > s for a in due)} for s in SOGLIE],
     }
 
 

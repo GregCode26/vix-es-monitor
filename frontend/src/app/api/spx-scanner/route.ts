@@ -12,7 +12,7 @@ export const runtime = 'nodejs';
  * scanner Python (`spx_flow_scanner/`), da `frontend/data/spx-scanner/scanner.db`.
  *
  * `?giorno=YYYY-MM-DD` (default: l'ultimo giorno nel DB), `?sessione=cash|notturna`
- * (default: la sessione dell'ultimo ciclo), `?min=N` (default 500): soglia del
+ * (default: la sessione dell'ultimo ciclo), `?min=N` (default 200): soglia del
  * singolo trade, `?leggero=1`: senza l'elenco dei contratti. Volume NULL = non disponibile: viene restituito come null,
  * mai come 0. Solo locale: niente Supabase.
  */
@@ -52,7 +52,7 @@ export async function GET(req: NextRequest) {
         const haTrade = !!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'trades'").get();
         let trade: unknown[] = [], perContratto: unknown[] = [], verifica = null, sogliaBase: number | null = null;
         let precedente: { giorno: string; perContratto: unknown[] } | null = null;
-        const richiesto = Math.max(1, Number(q.get('min') ?? 500) || 500);
+        const richiesto = Math.max(1, Number(q.get('min') ?? 200) || 200);
         if (haTrade) {
             sogliaBase = (db.prepare('SELECT MAX(soglia) s FROM trade_cursor WHERE giorno = ? AND sessione = ?')
                 .get(giorno, sessione) as { s: number | null })?.s ?? null;
@@ -60,8 +60,13 @@ export async function GET(req: NextRequest) {
             perContratto = db.prepare(
                 `SELECT t.con_id, SUM(t.size) somma, COUNT(*) n, MAX(t.size) massimo, MAX(t.ts) ultimo
                  FROM trades t WHERE t.giorno = ? AND t.sessione = ? AND t.size >= ? GROUP BY t.con_id`).all(giorno, sessione, min);
+            // verso/bid/ask dal 10/11/2026 (migrazione 005 dello scanner): finche' lo scanner
+            // non l'ha applicata la colonna non c'e' e si manda null.
+            const conVerso = (db.prepare("SELECT COUNT(*) n FROM pragma_table_info('trades') WHERE name = 'verso'")
+                .get() as { n: number }).n > 0;
             trade = db.prepare(
                 `SELECT t.con_id, t.ts, t.seq, t.size, t.price, t.exchange, t.conditions,
+                        ${conVerso ? 't.verso, t.bid, t.ask' : 'NULL verso, NULL bid, NULL ask'},
                         o.trading_class, o.real_expiry, o.strike, o.opt_right
                  FROM trades t JOIN options_contracts o ON o.con_id = t.con_id
                  WHERE t.giorno = ? AND t.sessione = ? AND t.size >= ? ORDER BY t.size DESC, t.ts DESC LIMIT 400`)

@@ -25,6 +25,9 @@ interface Contratto {
 interface PerContratto { con_id: number; somma: number; n: number; massimo: number; ultimo: number }
 interface Trade {
     con_id: number; ts: number; seq: number; size: number; price: number | null; exchange: string | null;
+    conditions: string | null;
+    /** C comprato, V venduto, I al mid, N senza quotazione, null non ancora chiesto. */
+    verso: 'C' | 'V' | 'I' | 'N' | null; bid: number | null; ask: number | null;
     trading_class: string; real_expiry: string; strike: number; opt_right: 'C' | 'P';
 }
 interface Risposta {
@@ -35,6 +38,36 @@ interface Risposta {
     verifica: { da_leggere: number; letti: number; aggiornato: number | null } | null;
     /** Sessione precedente, solo contratti non ancora letti oggi (barre grigie). */
     precedente: { giorno: string; perContratto: (PerContratto & Pick<Contratto, 'trading_class' | 'real_expiry' | 'strike' | 'opt_right'>)[] } | null;
+}
+
+/**
+ * Codici OPRA delle stampe multi-gamba (spread, combo, legate ad azioni): il
+ * prezzo di una gamba confrontato col suo bid/ask non dice con sicurezza il
+ * verso dell'ordine, e spesso sta fuori dalla quotazione.
+ */
+const MULTI_GAMBA = new Set('fghijklmnopq'.split(''));
+const VERSI = {
+    C: ['COMPRATO', 'text-green-400'], V: ['VENDUTO', 'text-red-400'],
+    I: ['al mid', 'text-gray-400'], N: ['n.d.', 'text-gray-600'],
+} as const;
+
+function CellaVerso({ t }: { t: Trade }) {
+    if (t.verso == null) return <td className="text-right text-gray-600">…</td>;
+    const [testo, colore] = VERSI[t.verso];
+    const spread = t.conditions != null && [...t.conditions].some(c => MULTI_GAMBA.has(c));
+    // Fuori dalla quotazione: gamba di una combo prezzata come pacchetto, o stampa
+    // in ritardo. Il 10/11/2026 erano cosi' 15 dei 20 trade senza codice multi-gamba.
+    const fuori = t.price != null && t.bid != null && t.ask != null && (t.price > t.ask || t.price < t.bid);
+    const quota = t.bid != null && t.ask != null ? `bid ${t.bid} / ask ${t.ask} prima del trade` : 'nessuna quotazione prima del trade';
+    const avvisi = [spread && `codice ${t.conditions}: gamba di uno spread`, fuori && 'prezzo fuori dalla quotazione'].filter(Boolean);
+    return (
+        <td className={`text-right font-bold ${colore} ${avvisi.length ? 'opacity-60' : ''}`}
+            title={`${quota}${avvisi.length ? ` · ${avvisi.join(', ')}: verso poco affidabile` : ''}`}>
+            {testo}
+            {spread && <span className="ml-1 font-normal text-[10px] text-amber-400">spr</span>}
+            {fuori && <span className="ml-1 font-normal text-[10px] text-amber-400">fuori</span>}
+        </td>
+    );
 }
 
 const oraIt = (ts: number | null, secondi = false) => ts == null ? 'n.d.' :
@@ -57,7 +90,7 @@ export default function SpxScannerPage() {
     const [tipo, setTipo] = useState<'CP' | 'C' | 'P'>('CP');
     const [dteMax, setDteMax] = useState(90);
     const [range, setRange] = useState(300);
-    const [minimo, setMinimo] = useState(500);
+    const [minimo, setMinimo] = useState(200);
     const grafico = useRef<any>(null);
     const ultimaFirma = useRef('');
     // SPX live da /api/market (punto piu' recente), arrotondato al punto per non
@@ -286,13 +319,13 @@ export default function SpxScannerPage() {
                             <table className="w-full">
                                 <thead className="text-gray-500"><tr><th className="text-left">Ora</th><th className="text-left">DTE</th>
                                     <th className="text-left">Scadenza</th><th>Strike</th><th className="text-right">Contratti</th>
-                                    <th className="text-right">Prezzo</th><th className="text-right">Borsa</th></tr></thead>
+                                    <th className="text-right">Prezzo</th><th className="text-right">Verso</th><th className="text-right">Borsa</th></tr></thead>
                                 <tbody>{vista.trade.filter(t => t.opt_right === r).slice(0, 25).map(t => (
                                     <tr key={`${t.con_id}-${t.ts}-${t.seq}`} className="border-t border-gray-800">
                                         <td>{oraIt(t.ts, true)}</td><td>{vista.dteDi(t.real_expiry)}</td>
                                         <td>{t.trading_class} {t.real_expiry}</td><td className="text-center">{t.strike}</td>
                                         <td className="text-right font-bold">{fmt(t.size)}</td>
-                                        <td className="text-right">{t.price ?? 'n.d.'}</td><td className="text-right">{t.exchange ?? ''}</td>
+                                        <td className="text-right">{t.price ?? 'n.d.'}</td><CellaVerso t={t} /><td className="text-right">{t.exchange ?? ''}</td>
                                     </tr>))}</tbody>
                             </table>
                         </div>

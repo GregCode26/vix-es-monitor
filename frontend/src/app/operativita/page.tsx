@@ -65,6 +65,7 @@ interface Risposta {
 }
 
 type Soglia = '100' | '250' | '500' | '1000';
+type Ampiezza = '5' | '10';
 
 /** Il nome del vertical dal lato e dal verso: comprare la call e' un bull call, venderla un bear call. */
 function nomeBlocco(b: Blocco): string {
@@ -136,8 +137,10 @@ export default function OperativitaPage() {
   );
   const [dati, setDati] = useState<Risposta | null>(null);
   const [errore, setErrore] = useState<string | null>(null);
-  const [banda, setBanda] = useState<'20' | '30' | '50'>('30');
+  const [banda, setBanda] = useState<'40' | '50' | '70'>('50');
   const [soglia, setSoglia] = useState<Soglia>('1000');
+  // Larghezza dei vertical in tabella: 5 punti, o 10 (K / K+10 su ogni strike).
+  const [ampiezza, setAmpiezza] = useState<Ampiezza>('5');
   // Catena finta dalla route (?sim=1), per vedere la pagina a mercato chiuso.
   const [sim, setSim] = useState(false);
   // Dall'ultima riga di /api/market: VWAP di ES e base ES - SPX del momento.
@@ -155,7 +158,7 @@ export default function OperativitaPage() {
     let attivo = true;
     const carica = async () => {
       try {
-        const r = await fetch(sim ? '/api/verticali?sim=1' : '/api/verticali', { cache: 'no-store' });
+        const r = await fetch(`/api/verticali?ampiezza=${ampiezza}${sim ? '&sim=1' : ''}`, { cache: 'no-store' });
         const j = await r.json();
         if (!attivo) return;
         if (!r.ok) {
@@ -175,7 +178,7 @@ export default function OperativitaPage() {
       attivo = false;
       clearInterval(id);
     };
-  }, [autorizzato, sim]);
+  }, [autorizzato, sim, ampiezza]);
 
   useEffect(() => {
     if (!autorizzato || sim) return;
@@ -278,18 +281,17 @@ export default function OperativitaPage() {
   ], [livelli]);
 
   const spot = dati?.spot ?? null;
-  // Il vertical ATM e' quello con lo spot fra i due strike; la tabella ne
-  // mostra lo stesso numero sopra e sotto, cosi' l'ATM resta al centro.
+  // Il vertical ATM e' quello col centro piu' vicino allo spot (a 5 punti e'
+  // quello con lo spot fra i due strike; a 10 lo spot sta in due vertical
+  // sovrapposti). La tabella ne mostra lo stesso numero sopra e sotto, cosi'
+  // l'ATM resta al centro; le righe sono a passo 5 in entrambi i casi.
   const { righe, atm } = useMemo(() => {
     if (!dati || spot == null || dati.verticali.length === 0) return { righe: [], atm: null };
     const vs = dati.verticali;
-    let i = vs.findIndex((v) => v.k1 <= spot && spot < v.k2);
-    if (i < 0) {
-      i = 0;
-      vs.forEach((v, j) => {
-        if (Math.abs((v.k1 + v.k2) / 2 - spot) < Math.abs((vs[i].k1 + vs[i].k2) / 2 - spot)) i = j;
-      });
-    }
+    let i = 0;
+    vs.forEach((v, j) => {
+      if (Math.abs((v.k1 + v.k2) / 2 - spot) < Math.abs((vs[i].k1 + vs[i].k2) / 2 - spot)) i = j;
+    });
     const n = Math.min(Number(banda) / 5, i, vs.length - 1 - i);
     return { righe: vs.slice(i - n, i + n + 1), atm: vs[i].k1 };
   }, [dati, spot, banda]);
@@ -312,7 +314,7 @@ export default function OperativitaPage() {
           <div>
             <h1 className="text-2xl font-bold text-white">Operatività</h1>
             <p className="text-xs text-slate-500">
-              SPX 0DTE · vertical da 5 punti: mid e contratti eseguiti · solo locale
+              SPX 0DTE · vertical da {ampiezza} punti: mid e contratti eseguiti · solo locale
               {dati?.time && <> · quotazioni delle {dati.time}{dati.expiry && <>, scadenza {dati.expiry}</>}</>}
               {spot != null && <> · SPX {spot.toFixed(2)}</>}
             </p>
@@ -404,9 +406,15 @@ export default function OperativitaPage() {
               </div>
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-xs">
                 <Selettore
+                  titolo="Vertical"
+                  valore={ampiezza}
+                  opzioni={[['5', '5 punti'], ['10', '10 punti']]}
+                  onChange={setAmpiezza}
+                />
+                <Selettore
                   titolo="Attorno all'ATM"
                   valore={banda}
-                  opzioni={[['20', '±20'], ['30', '±30'], ['50', '±50']]}
+                  opzioni={[['40', '±40'], ['50', '±50'], ['70', '±70']]}
                   onChange={setBanda}
                 />
                 {errore && <span className="text-amber-400">{errore}</span>}

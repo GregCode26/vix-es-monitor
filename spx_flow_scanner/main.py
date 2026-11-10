@@ -172,8 +172,8 @@ def comando_trade(cli: ClienteIbkr, giri: int = 0) -> int:
             t0 = time.monotonic()
             r = lettore.giro(budget_s=240)
             log.info('trade giro %d: candidati %d, letti %d (in pari %d), pagine %d, stampe %d, salvate >=%d: %d, '
-                     'rimasti %d, %ss', numero, r['candidati'], r['letti'], r['in_pari'], r['pagine'], r['stampe'],
-                     cfg.trade_minimo, r['salvati'], r['rimasti'], r['secondi'])
+                     'rimasti %d, verso %d, %ss', numero, r['candidati'], r['letti'], r['in_pari'], r['pagine'], r['stampe'],
+                     cfg.trade_minimo, r['salvati'], r['rimasti'], r['classificati'], r['secondi'])
             archivio.imposta_stato('trade', {'stato': 'attivo', 'giro': numero, **r, 'soglia': cfg.trade_minimo})
             if giri and numero >= giri:
                 return 0

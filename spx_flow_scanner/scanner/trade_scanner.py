@@ -19,6 +19,15 @@ pacing si fa una pausa di 10 minuti.
 
 Le stampe si contano una per una, senza unire quelle dello stesso secondo:
 un ordine da 1.000 eseguito come 400+200+200+200 sono quattro trade.
+
+Verso (dal 10/11/2026): per ogni trade salvato una richiesta BID_ASK allo
+storico tick con fine al secondo del trade; IBKR da' le quotazioni fino al
+secondo prima (provato su 3 trade del 10/11). Prezzo sopra il mid = comprato,
+sotto = venduto, al mid = incerto. Una richiesta per trade (~150 al giorno a
+soglia 200), dopo la lettura dei trade e nello stesso budget del giro.
+Attenzione: la maggior parte dei trade grandi ha codici OPRA multi-gamba
+(f, m...): sono gambe di spread, e il prezzo di una gamba confrontato col suo
+bid/ask puo' stare fuori dalla quotazione o non dire il verso dell'ordine.
 """
 
 import time
@@ -33,6 +42,7 @@ from spx_flow_scanner.utils.market_calendar import (APERTURA_CASH_NY, APERTURA_N
 log = prendi_logger('trade')
 PAGINA = 1000
 PAUSA_PACING_S = 600
+RISERVA_VERSO_S = 60
 
 
 def inizio_sessione(giorno: str, sessione: str) -> datetime:
@@ -81,6 +91,14 @@ def scorri_stampe(ticks, cur_s: int | None, cur_n: int):
         else:
             cur_s, cur_n = s, seq + 1
     return nuove, cur_s, cur_n
+
+
+def verso_da_quota(prezzo: float, bid: float, ask: float) -> str:
+    """Regola della quotazione: sopra il mid comprato, sotto venduto, al mid incerto."""
+    mid = (bid + ask) / 2
+    if abs(prezzo - mid) < 1e-9:
+        return 'I'
+    return 'C' if prezzo > mid else 'V'
 
 
 class LettoreTrade:
@@ -150,6 +168,39 @@ class LettoreTrade:
         self.db.commit()
         return {'pagine': pagine, 'stampe': stampe, 'salvati': len(righe), 'in_pari': in_pari}
 
+    def classifica(self, budget_s: float, sessioni: list[tuple[str, str]]) -> int:
+        """Verso dei trade salvati che non l'hanno ancora, dal piu' recente, entro `budget_s`."""
+        t0 = time.monotonic()
+        fatti = 0
+        for giorno, sessione in sessioni:
+            righe = self.db.execute(
+                'SELECT con_id, ts, seq, price FROM trades WHERE giorno = ? AND sessione = ? AND verso IS NULL '
+                'ORDER BY ts DESC', (giorno, sessione)).fetchall()
+            for con_id, ts, seq, price in righe:
+                if time.monotonic() - t0 > budget_s:
+                    return fatti
+                bid, ask, verso = self._quota_prima(con_id, ts, price)
+                self.db.execute('UPDATE trades SET bid = ?, ask = ?, verso = ? WHERE con_id = ? AND ts = ? AND seq = ?',
+                                (bid, ask, verso, con_id, ts, seq))
+                self.db.commit()
+                fatti += 1
+        return fatti
+
+    def _quota_prima(self, con_id: int, ts: int, price: float | None):
+        """(bid, ask, verso) dall'ultima quotazione prima del secondo `ts`."""
+        prima = len(self.cli.ultimi_errori)
+        self.richieste += 1
+        ticks = self.cli.ib.reqHistoricalTicks(Contract(conId=con_id, exchange='SMART'), '',
+                                               datetime.fromtimestamp(ts, timezone.utc), 1, 'BID_ASK', useRth=False)
+        nuovi = list(self.cli.ultimi_errori)[prima:] if len(self.cli.ultimi_errori) > prima else []
+        if any(e['codice'] == 162 and 'pacing' in e['messaggio'].lower() for e in nuovi):
+            raise PacingIbkr(nuovi[-1]['messaggio'])
+        validi = [q for q in ticks or [] if int(q.time.timestamp()) < ts and q.priceBid > 0 and q.priceAsk >= q.priceBid]
+        if not validi or price is None:
+            return None, None, 'N'
+        q = validi[-1]
+        return q.priceBid, q.priceAsk, verso_da_quota(price, q.priceBid, q.priceAsk)
+
     def giro(self, budget_s: float) -> dict:
         """Un giro sui candidati delle ultime sessioni, entro `budget_s` secondi."""
         t0 = time.monotonic()
@@ -158,7 +209,9 @@ class LettoreTrade:
             lista = candidati(self.db, giorno, sessione, self.cfg.trade_minimo)
             tot['candidati'] += len(lista)
             for c in lista:
-                if time.monotonic() - t0 > budget_s:
+                # Un minuto resta sempre al verso: con la soglia a 200 la lettura
+                # dei trade riempie il giro e il verso restava indietro.
+                if time.monotonic() - t0 > budget_s - RISERVA_VERSO_S:
                     tot['rimasti'] += 1
                     continue
                 r = self.leggi(giorno, sessione, c)
@@ -166,6 +219,8 @@ class LettoreTrade:
                 tot['in_pari'] += r['in_pari']
                 for k in ('pagine', 'stampe', 'salvati'):
                     tot[k] += r[k]
+        resto = budget_s - (time.monotonic() - t0)
+        tot['classificati'] = self.classifica(resto, sessioni_da_leggere(self.db)) if resto > 0 else 0
         tot['secondi'] = round(time.monotonic() - t0, 1)
         return tot
 

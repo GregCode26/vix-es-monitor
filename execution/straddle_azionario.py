@@ -68,6 +68,28 @@ def catena_principale(ib: IB, azione: Stock):
     return max(catene, key=lambda c: len(c.expirations))
 
 
+def ciclo_scadenze(scadenze, ora_ny: datetime) -> str:
+    """Che scadenze ha il titolo, dalla distanza fra le prime quotate.
+
+    La piu' breve delle prime due: le catene quotano fitto vicino e rado
+    lontano (BCE: 28, 28, 63, 90 giorni), e una settimanale spostata al
+    giovedi' da una festivita' fa 6 + 8 giorni, quindi resta settimanale.
+    """
+    oggi = ora_ny.strftime('%Y%m%d')
+    vive = sorted(s for s in scadenze if s >= oggi)
+    giorni = [date(int(s[:4]), int(s[4:6]), int(s[6:8])) for s in vive]
+    distanze = [(b - a).days for a, b in zip(giorni, giorni[1:])][:2]
+    if not distanze:
+        return 'una sola scadenza quotata'
+    tipica = min(distanze)
+    if tipica <= 3:
+        return 'piu\' volte a settimana'
+    if tipica <= 8:
+        return 'settimanale'
+    mesi = max(1, round(tipica / 30.4))
+    return {1: 'mensile', 3: 'trimestrale'}.get(mesi, f'ogni {mesi} mesi')
+
+
 def prossime_scadenze(scadenze, ora_ny: datetime) -> list[str]:
     """Le piu' vicine ancora vive: quella di oggi vale solo fino alle 16:00 NY."""
     oggi = ora_ny.strftime('%Y%m%d')
@@ -187,6 +209,7 @@ def calcola(ib: IB, simbolo: str) -> dict:
         'spot': tondo(spot),
         'fonteSpot': fonte_spot,
         'tipoDatiSpot': TIPI_DATI.get(t_azione.marketDataType, str(t_azione.marketDataType)),
+        'ciclo': ciclo_scadenze(catena.expirations, ora_ny),
         'scadenze': [calcola_scadenza(ib, simbolo, s, catena.tradingClass, spot, ora_ny) for s in scadenze],
     }
 

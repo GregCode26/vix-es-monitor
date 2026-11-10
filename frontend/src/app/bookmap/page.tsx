@@ -30,6 +30,8 @@ interface BookmapPoint {
   remB: number | null;
   addA: number | null;
   remA: number | null;
+  /** Lo stesso a fasce di 5 livelli dal migliore: [addB, remB, addA, remA], 10 numeri non cumulati; null prima del 09/11/2026. */
+  fasce: number[][] | null;
   /** Ordini limit per livello, [prezzo, contratti]; null nei campioni di prima che l'add-on li mandasse. */
   book: { b: [number, number][]; a: [number, number][] } | null;
   /** OFI del secondo per livello dal migliore (contratti, + = acquisto); null prima dell'add-on che lo calcola. */
@@ -110,6 +112,7 @@ type StileOrdini = 'heatmap' | 'linee';
 
 const VERDE = '#34d399';
 const ROSSO = '#f43f5e';
+const BLU = '#60a5fa';
 const GIALLO = '#facc15';
 const VIOLA = '#a855f7';
 
@@ -388,10 +391,28 @@ function mediaMobile(xs: number[], valori: number[], finestraSec: number): numbe
   return out;
 }
 
+/** Su quanti livelli dal migliore si contano aggiunte e rimozioni: l'add-on li manda a gruppi di 5. */
+type LivelliFlusso = '5' | '10' | '15' | '20' | '25' | '30' | '35' | '40' | '45' | '50';
+const OPZIONI_LIVELLI_FLUSSO: [LivelliFlusso, string][] = (['5', '10', '15', '20', '25', '30', '35', '40', '45', '50'] as const).map((v) => [v, v]);
+
+/** Aggiunti e tolti del secondo nei primi `livelli` livelli; null se il campione non li ha. */
+function flussoAiLivelli(p: BookmapPoint, livelli: number) {
+  if (livelli === 5) {
+    if (p.addB == null || p.remB == null || p.addA == null || p.remA == null) return null;
+    return { aB: p.addB, rB: p.remB, aA: p.addA, rA: p.remA };
+  }
+  if (!p.fasce) return null;
+  const prime = livelli / 5;
+  const somma = (r: number[]) => {
+    let t = 0;
+    for (let i = 0; i < prime; i++) t += r[i];
+    return t;
+  };
+  return { aB: somma(p.fasce[0]), rB: somma(p.fasce[1]), aA: somma(p.fasce[2]), rA: somma(p.fasce[3]) };
+}
+
 /** Su quanti secondi si sommano aggiunte e rimozioni: secondo per secondo e' solo rumore. */
 type FinestraFlusso = '10' | '30' | '60';
-/** Tolti = cancellati + eseguiti (quello che sparisce dal book), oppure solo i cancellati. */
-type Tolti = 'cancellati' | 'tutti';
 /**
  * Come si guarda il flusso. Le quattro linee grezze sono della stessa
  * grandezza e si sovrappongono: da sole non dicono chi prevale.
@@ -422,25 +443,28 @@ interface SerieFlusso {
   remB: number[];
   addA: number[];
   remA: number[];
+  /** Delta degli eseguiti nella finestra, comprati - venduti: la linea blu, sulla scala a destra. */
+  deltaEseguiti: number[];
 }
 
 /**
  * Somme mobili sugli ultimi `finestraSec` secondi dei contratti limit aggiunti
- * e tolti nei primi livelli. Con `soloCancellati` ai tolti si sottrae
- * l'eseguito: un venditore aggressivo consuma i bid (`sell`), un compratore
+ * e cancellati nei primi livelli. Il book dice solo cosa e' sparito, quindi ai
+ * tolti si sottrae l'eseguito: un venditore aggressivo consuma i bid (`sell`), un compratore
  * gli ask (`buy`). Si sottrae sulla finestra e non secondo per secondo, perche'
  * trade e aggiornamento del book possono cadere in due secondi diversi.
  */
-function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, soloCancellati: boolean): SerieFlusso {
-  const out: SerieFlusso = { addB: [], remB: [], addA: [], remA: [] };
-  const ok = (p: BookmapPoint) => p.addB != null && p.remB != null && p.addA != null && p.remA != null;
+function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, livelli: number): SerieFlusso {
+  const out: SerieFlusso = { addB: [], remB: [], addA: [], remA: [], deltaEseguiti: [] };
+  const ok = (p: BookmapPoint) => flussoAiLivelli(p, livelli) != null;
   let j = 0;
   let aB = 0, rB = 0, aA = 0, rA = 0, compra = 0, vende = 0, n = 0;
   const somma = (p: BookmapPoint, segno: 1 | -1) => {
-    aB += segno * p.addB!;
-    rB += segno * p.remB!;
-    aA += segno * p.addA!;
-    rA += segno * p.remA!;
+    const f = flussoAiLivelli(p, livelli)!;
+    aB += segno * f.aB;
+    rB += segno * f.rB;
+    aA += segno * f.aA;
+    rA += segno * f.rA;
     compra += segno * p.buy;
     vende += segno * p.sell;
     n += segno;
@@ -456,12 +480,14 @@ function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, so
       out.remB.push(NaN);
       out.addA.push(NaN);
       out.remA.push(NaN);
+      out.deltaEseguiti.push(NaN);
       continue;
     }
     out.addB.push(aB);
     out.addA.push(aA);
-    out.remB.push(soloCancellati ? Math.max(0, rB - vende) : rB);
-    out.remA.push(soloCancellati ? Math.max(0, rA - compra) : rA);
+    out.remB.push(Math.max(0, rB - vende));
+    out.remA.push(Math.max(0, rA - compra));
+    out.deltaEseguiti.push(compra - vende);
   }
   return out;
 }
@@ -660,6 +686,73 @@ function Selettore<T extends string>({
   );
 }
 
+const ALTEZZA_MIN_PANNELLO = 120;
+const ALTEZZA_MAX_PANNELLO = 1400;
+
+/**
+ * Un grafico con la sua altezza: si trascina la barretta sotto per ingrandirlo o
+ * rimpicciolirlo, doppio clic per tornare all'altezza di partenza. Chart.js segue
+ * da solo il contenitore. Finche' non la si tocca valgono le classi `base`.
+ */
+function PannelloAltezza({ chiave, base, children }: { chiave: string; base: string; children: React.ReactNode }) {
+  const riquadro = useRef<HTMLDivElement>(null);
+  const memoria = `bookmap_altezza_${chiave}`;
+  // L'altezza sta nello stile dell'elemento, come il resto dei grafici e' imperativo: niente
+  // ridisegno della pagina a ogni pixel, e al rilascio il valore e' gia' quello giusto.
+  const inizio = useRef({ y: 0, h: 0, mosso: false });
+
+  useEffect(() => {
+    try {
+      const salvata = Number(localStorage.getItem(memoria));
+      if (riquadro.current && salvata >= ALTEZZA_MIN_PANNELLO && salvata <= ALTEZZA_MAX_PANNELLO) riquadro.current.style.height = `${salvata}px`;
+    } catch {
+      // niente preferenza salvata
+    }
+  }, [memoria]);
+
+  return (
+    <>
+      <div ref={riquadro} className={`relative ${base}`}>
+        {children}
+      </div>
+      <div
+        title="Trascina per ingrandire o rimpicciolire il grafico · doppio clic = altezza di partenza"
+        className="group flex h-3 cursor-row-resize touch-none select-none items-center justify-center"
+        onPointerDown={(e) => {
+          e.preventDefault();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          inizio.current = { y: e.clientY, h: riquadro.current?.offsetHeight ?? 0, mosso: false };
+        }}
+        onPointerMove={(e) => {
+          if (!e.currentTarget.hasPointerCapture(e.pointerId) || !riquadro.current) return;
+          const h = inizio.current.h + e.clientY - inizio.current.y;
+          inizio.current.mosso = true;
+          riquadro.current.style.height = `${Math.round(Math.min(ALTEZZA_MAX_PANNELLO, Math.max(ALTEZZA_MIN_PANNELLO, h)))}px`;
+        }}
+        onPointerUp={(e) => {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+          if (!inizio.current.mosso || !riquadro.current) return;
+          try {
+            localStorage.setItem(memoria, String(riquadro.current.offsetHeight));
+          } catch {
+            // la preferenza vale solo per questa visita
+          }
+        }}
+        onDoubleClick={() => {
+          if (riquadro.current) riquadro.current.style.height = '';
+          try {
+            localStorage.removeItem(memoria);
+          } catch {
+            // niente da togliere
+          }
+        }}
+      >
+        <span className="h-1 w-16 rounded-full bg-slate-700 group-hover:bg-slate-400" />
+      </div>
+    </>
+  );
+}
+
 export default function BookmapPage() {
   const router = useRouter();
   const [autorizzato, setAutorizzato] = useState(false);
@@ -677,9 +770,10 @@ export default function BookmapPage() {
   const [quantiRange, setQuantiRange] = useState(0);
   const [spessore, setSpessore] = useState(1);
   const [finestraFlusso, setFinestraFlusso] = useState<FinestraFlusso>('30');
+  const [livelliFlusso, setLivelliFlusso] = useState<LivelliFlusso>('5');
   const [mediaLiq, setMediaLiq] = useState<MediaLiq>('30');
   const [mostraBidAsk, setMostraBidAsk] = useState(false);
-  const [tolti, setTolti] = useState<Tolti>('cancellati');
+  const [mostraEseguiti, setMostraEseguiti] = useState(true);
   const [vistaFlusso, setVistaFlusso] = useState<VistaFlusso>('pressione');
   const [vistaBook, setVistaBook] = useState<VistaBook>('mlofi');
   const [livelliOfi, setLivelliOfi] = useState<LivelliOfi>('10');
@@ -721,9 +815,18 @@ export default function BookmapPage() {
   const baseGiorno = useRef<string | null>(null);
   const spessoreRef = useRef(1);
   const finestraFlussoRef = useRef<FinestraFlusso>('30');
+  const livelliFlussoRef = useRef<LivelliFlusso>('5');
   const mediaLiqRef = useRef<MediaLiq>('30');
   const mostraBidAskRef = useRef(false);
-  const toltiRef = useRef<Tolti>('cancellati');
+  const mostraEseguitiRef = useRef(true);
+  /**
+   * Quanto ogni scala Y e' stata spostata a mano (Maiusc + tasto destro), in
+   * frazioni della sua altezza. Una frazione e non dei punti: la scala continua a
+   * seguire i dati e l'indicatore resta dove lo si e' messo anche quando cambia ampiezza.
+   */
+  const spostamentiRef = useRef<Record<string, number>>({});
+  /** Vero mentre si trascina una scala: il plugin di zoom non deve spostare anche tutto il resto. */
+  const suScalaRef = useRef(false);
   const vistaFlussoRef = useRef<VistaFlusso>('pressione');
   const vistaBookRef = useRef<VistaBook>('mlofi');
   const livelliOfiRef = useRef<LivelliOfi>('10');
@@ -889,9 +992,9 @@ export default function BookmapPage() {
     cl.data.datasets[5].hidden = vistaBook !== 'ofiPct';
     const asseLiq = cl.options.scales!.yLiq!;
     asseLiq.ticks!.display = bidAsk;
-    const fl = flussoMobile(pts, xs, Number(finestraFlussoRef.current), toltiRef.current === 'cancellati');
-    // La rotazione ha senso solo sui cancellati: un ordine eseguito non e' fugace.
-    const rot = rotazione(toltiRef.current === 'cancellati' ? fl : flussoMobile(pts, xs, Number(finestraFlussoRef.current), true));
+    const quantiLivelli = Number(livelliFlussoRef.current);
+    const fl = flussoMobile(pts, xs, Number(finestraFlussoRef.current), quantiLivelli);
+    const rot = rotazione(fl);
     cf.data.datasets[7].data = xs.map((x, i) => ({ x, y: rot.bid[i] }));
     cf.data.datasets[8].data = xs.map((x, i) => ({ x, y: rot.ask[i] }));
     cf.data.datasets[0].data = xs.map((x, i) => ({ x, y: fl.addB[i] }));
@@ -909,6 +1012,10 @@ export default function BookmapPage() {
     cf.data.datasets[6].hidden = vista !== 'lato';
     cf.data.datasets[7].hidden = vista !== 'rotazione';
     cf.data.datasets[8].hidden = vista !== 'rotazione';
+    const lineaEseguiti = mostraEseguitiRef.current && vista !== 'rotazione';
+    cf.data.datasets[9].data = xs.map((x, i) => ({ x, y: fl.deltaEseguiti[i] }));
+    cf.data.datasets[9].hidden = !lineaEseguiti;
+    cf.options.scales!.yDelta!.ticks!.display = lineaEseguiti;
 
     let da: number;
     let a: number;
@@ -1005,6 +1112,11 @@ export default function BookmapPage() {
         else if (vista === 'rotazione') valori.push(rot.bid[i], rot.ask[i]);
         else valori.push(netti.pressione[i]);
       });
+      // Il delta ha la sua scala a destra, simmetrica: lo zero sta sempre in mezzo.
+      const massimoDelta = fl.deltaEseguiti.reduce((m, v, i) => (xs[i] >= da && xs[i] <= a && Number.isFinite(v) ? Math.max(m, Math.abs(v)) : m), 0);
+      const semiDelta = Math.max(10, Math.ceil(massimoDelta * 1.15));
+      cf.options.scales!.yDelta!.min = -semiDelta;
+      cf.options.scales!.yDelta!.max = semiDelta;
       const asse = cf.options.scales!.yFlusso!;
       if (vista === 'rotazione') {
         // Da 0 ad almeno 100%: la riga del 100% ("tutto cancellato") deve restare in vista.
@@ -1021,6 +1133,21 @@ export default function BookmapPage() {
         asse.max = semi;
       }
     }
+    // Dopo i calcoli qui sopra, che ripartono da zero a ogni giro. Su un grafico bloccato
+    // non si tocca niente: min e max sono gia' quelli lasciati dallo zoom e dallo spostamento.
+    const assi: [string, ChartJS, boolean][] = [
+      ['yPrezzo', cp, b.sopra], ['yCvd', cp, b.sopra],
+      ['ySbil', cl, b.sotto], ['yLiq', cl, b.sotto],
+      ['yFlusso', cf, b.flusso], ['yDelta', cf, b.flusso],
+    ];
+    for (const [id, chart, bloccato] of assi) {
+      const quota = spostamentiRef.current[id];
+      const asse = chart.options.scales![id]!;
+      if (!quota || bloccato || asse.min == null || asse.max == null) continue;
+      const passo = quota * (Number(asse.max) - Number(asse.min));
+      asse.min = Number(asse.min) + passo;
+      asse.max = Number(asse.max) + passo;
+    }
     cp.update('none');
     cl.update('none');
     cf.update('none');
@@ -1035,6 +1162,7 @@ export default function BookmapPage() {
   const tornaLive = useCallback(() => {
     impostaBlocco(LIBERO);
     ampiezzaRef.current = null;
+    spostamentiRef.current = {};
     for (const c of [chartPrezzo.current, chartLiquidita.current, chartFlusso.current]) {
       (c as (ChartJS & { resetZoom?: (mode?: string) => void }) | null)?.resetZoom?.('none');
     }
@@ -1098,6 +1226,7 @@ export default function BookmapPage() {
           enabled: true,
           mode: 'xy',
           onPanStart: ({ chart }) => {
+            if (suScalaRef.current) return false;
             impostaBlocco({ ...bloccoRef.current, x: true, [quale(chart as ChartJS)]: true });
             return true;
           },
@@ -1428,7 +1557,7 @@ export default function BookmapPage() {
 
           if (m.sorgente === chart) {
             for (const scala of Object.values(chart.scales)) {
-              if (scala.axis !== 'y' || scala.id === 'yVuoto') continue;
+              if (scala.axis !== 'y' || (scala.id === 'yDelta' && (!mostraEseguitiRef.current || vistaFlussoRef.current === 'rotazione'))) continue;
               const v = scala.getValueForPixel(m.y);
               if (v == null || (scala.id === 'yCvd' && !mostraCvdRef.current) || (scala.id === 'yLiq' && !mostraBidAskRef.current)) continue;
               const testo =
@@ -1631,6 +1760,7 @@ export default function BookmapPage() {
             { label: 'Ask netto', data: [], yAxisID: 'yFlusso', borderColor: ROSSO, borderWidth: 1.8, pointRadius: 0, tension: 0.2 },
             { label: 'Bid cancellati %', data: [], yAxisID: 'yFlusso', borderColor: VERDE, borderWidth: 1.6, pointRadius: 0, tension: 0.2 },
             { label: 'Ask cancellati %', data: [], yAxisID: 'yFlusso', borderColor: ROSSO, borderWidth: 1.6, pointRadius: 0, tension: 0.2 },
+            { label: 'Delta eseguiti', data: [], yAxisID: 'yDelta', borderColor: BLU, borderWidth: 1.6, pointRadius: 0, tension: 0 },
           ],
         },
         options: {
@@ -1655,8 +1785,18 @@ export default function BookmapPage() {
                 callback: (v) => (vistaFlussoRef.current === 'rotazione' ? `${Math.round(Number(v))}%` : compatto(Number(v))),
               },
             },
-            // Vuoto: c'e' solo perche' l'area del grafico finisca dove finiscono le altre due.
-            yVuoto: { position: 'right', afterFit: fissaLarghezza, grid: { display: false }, ticks: { display: false } },
+            // Il delta degli eseguiti. C'e' anche a linea spenta (senza numeri), perche' l'area del
+            // grafico finisca dove finiscono le altre due. Lo zero marcato serve nella vista Dettaglio,
+            // dove lo zero di sinistra sta in fondo.
+            yDelta: {
+              position: 'right',
+              afterFit: fissaLarghezza,
+              grid: {
+                color: (ctx) =>
+                  ctx.tick.value === 0 && mostraEseguitiRef.current && vistaFlussoRef.current !== 'rotazione' ? 'rgba(96, 165, 250, 0.3)' : 'transparent',
+              },
+              ticks: { color: BLU, callback: (v) => compatto(Number(v)) },
+            },
           },
         },
       });
@@ -1665,6 +1805,64 @@ export default function BookmapPage() {
       prezzoRef.current.ondblclick = tornaLive;
       liquiditaRef.current.ondblclick = tornaLive;
       flussoRef.current.ondblclick = tornaLive;
+
+      // Trascinare una scala (tasto sinistro, o Maiusc + destro) sposta in su o in giu' solo
+      // l'indicatore di quella scala, per centrarlo. Prima il sinistro sulla scala spostava tutto.
+      // Durante il trascinamento si ridisegna solo quel grafico: applica() ricalcola la giornata.
+      for (const [canvas, grafico] of [
+        [prezzoRef.current, chartPrezzo],
+        [liquiditaRef.current, chartLiquidita],
+        [flussoRef.current, chartFlusso],
+      ] as const) {
+        let appenaSpostato = false;
+        const scalaSotto = (e: MouseEvent) => {
+          const chart = grafico.current;
+          if (!chart) return undefined;
+          return Object.values(chart.scales).find(
+            (s) => s.axis === 'y' && chart.options.scales![s.id]?.ticks?.display !== false && e.offsetX >= s.left && e.offsetX <= s.right && e.offsetY >= s.top && e.offsetY <= s.bottom,
+          );
+        };
+        // Il cursore dice che li' si trascina la sola scala.
+        canvas.onmousemove = (e) => {
+          if (!suScalaRef.current) canvas.style.cursor = scalaSotto(e) ? 'ns-resize' : '';
+        };
+        canvas.onmousedown = (e) => {
+          const chart = grafico.current;
+          if (!chart || !(e.button === 0 || (e.button === 2 && e.shiftKey))) return;
+          const scala = scalaSotto(e);
+          if (!scala) return;
+          e.preventDefault();
+          suScalaRef.current = true;
+          appenaSpostato = e.button === 2;
+          const id = scala.id;
+          let yPrima = e.clientY;
+          canvas.style.cursor = 'ns-resize';
+          const muovi = (m: MouseEvent) => {
+            const s = chart.scales[id];
+            if (!s) return;
+            const quota = (m.clientY - yPrima) / (s.bottom - s.top);
+            yPrima = m.clientY;
+            const passo = quota * (s.max - s.min);
+            const asse = chart.options.scales![id]!;
+            asse.min = s.min + passo;
+            asse.max = s.max + passo;
+            spostamentiRef.current[id] = (spostamentiRef.current[id] ?? 0) + quota;
+            chart.update('none');
+          };
+          const fine = () => {
+            window.removeEventListener('mousemove', muovi);
+            window.removeEventListener('mouseup', fine);
+            suScalaRef.current = false;
+          };
+          window.addEventListener('mousemove', muovi);
+          window.addEventListener('mouseup', fine);
+        };
+        // Su Windows il menu del browser arriva dopo il rilascio, anche con Maiusc gia' lasciato.
+        canvas.oncontextmenu = (e) => {
+          if (e.shiftKey || appenaSpostato) e.preventDefault();
+          appenaSpostato = false;
+        };
+      }
       setPronti(true);
     })();
 
@@ -1880,6 +2078,17 @@ export default function BookmapPage() {
     applica();
   };
 
+  const cambiaLivelliFlusso = (v: LivelliFlusso) => {
+    livelliFlussoRef.current = v;
+    setLivelliFlusso(v);
+    try {
+      localStorage.setItem('bookmap_livelli_flusso', v);
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
+    applica();
+  };
+
   const cambiaVistaFlusso = (v: VistaFlusso) => {
     vistaFlussoRef.current = v;
     setVistaFlusso(v);
@@ -1897,6 +2106,15 @@ export default function BookmapPage() {
       if (v === 'pressione' || v === 'lato' || v === 'dettaglio' || v === 'rotazione') {
         vistaFlussoRef.current = v;
         setVistaFlusso(v);
+      }
+      if (localStorage.getItem('bookmap_eseguiti') === 'off') {
+        mostraEseguitiRef.current = false;
+        setMostraEseguiti(false);
+      }
+      const l = OPZIONI_LIVELLI_FLUSSO.find(([o]) => o === localStorage.getItem('bookmap_livelli_flusso'));
+      if (l) {
+        livelliFlussoRef.current = l[0];
+        setLivelliFlusso(l[0]);
       }
     } catch {
       // niente preferenza salvata
@@ -2031,9 +2249,15 @@ export default function BookmapPage() {
     applica();
   };
 
-  const cambiaTolti = (v: Tolti) => {
-    toltiRef.current = v;
-    setTolti(v);
+  const cambiaEseguiti = () => {
+    const acceso = !mostraEseguitiRef.current;
+    mostraEseguitiRef.current = acceso;
+    setMostraEseguiti(acceso);
+    try {
+      localStorage.setItem('bookmap_eseguiti', acceso ? 'on' : 'off');
+    } catch {
+      // la preferenza vale solo per questa visita
+    }
     applica();
   };
 
@@ -2079,7 +2303,7 @@ export default function BookmapPage() {
   const bloccato = blocco.x || blocco.sopra || blocco.sotto || blocco.flusso;
   // I valori di adesso: basta la coda, la somma guarda al massimo un minuto indietro.
   const coda = points.slice(-70);
-  const flussoOra = flussoMobile(coda, coda.map((p) => secondi(p.time)), Number(finestraFlusso), tolti === 'cancellati');
+  const flussoOra = flussoMobile(coda, coda.map((p) => secondi(p.time)), Number(finestraFlusso), Number(livelliFlusso));
   const ultimoFlusso = (k: keyof SerieFlusso) => {
     const v = flussoOra[k][flussoOra[k].length - 1];
     return v == null || Number.isNaN(v) ? null : v;
@@ -2090,7 +2314,7 @@ export default function BookmapPage() {
     const v = nettiOra[k][nettiOra[k].length - 1];
     return v == null || Number.isNaN(v) ? null : v;
   };
-  const rotazioneOra = rotazione(tolti === 'cancellati' ? flussoOra : flussoMobile(coda, coda.map((p) => secondi(p.time)), Number(finestraFlusso), true));
+  const rotazioneOra = rotazione(flussoOra);
   const ultimaRotazione = (k: 'bid' | 'ask') => {
     const v = rotazioneOra[k][rotazioneOra[k].length - 1];
     return v == null || Number.isNaN(v) ? null : v;
@@ -2276,7 +2500,7 @@ export default function BookmapPage() {
               )}
             </button>
             <span className="text-slate-500">
-              Rotella sul grafico = zoom sul tempo · rotella su un asse Y = zoom su quell&apos;asse · trascina = sposta · doppio clic = torna live
+              Rotella sul grafico = zoom sul tempo · rotella su un asse Y = zoom su quell&apos;asse · trascina il grafico = sposta tutto · trascina una scala (o Maiusc + tasto destro) = sposta solo quell&apos;indicatore · doppio clic = torna live
             </span>
           </div>
 
@@ -2310,9 +2534,9 @@ export default function BookmapPage() {
               </div>
             )}
           </div>
-          <div className="relative h-[340px] md:h-[400px]">
+          <PannelloAltezza chiave="prezzo" base="h-[340px] md:h-[400px]">
             <canvas ref={prezzoRef} className="cursor-crosshair" />
-          </div>
+          </PannelloAltezza>
 
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-4 mb-1">
             <div className="text-[11px] uppercase tracking-wide text-slate-500">
@@ -2379,20 +2603,20 @@ export default function BookmapPage() {
               Nessun dato: l&apos;add-on in Bookmap non calcola ancora OFI e asimmetria. Copia execution/bookmap_addon.py in C:\Bookmap\Python\, ricostruiscilo dal code editor e riattivalo.
             </div>
           )}
-          <div className="relative h-[220px] md:h-[260px]">
+          <PannelloAltezza chiave="book" base="h-[220px] md:h-[260px]">
             <canvas ref={liquiditaRef} className="cursor-crosshair" />
-          </div>
+          </PannelloAltezza>
 
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-4 mb-1">
             <div className="text-[11px] uppercase tracking-wide text-slate-500">
               {vistaFlusso === 'pressione'
                 ? "Pressione degli ordini limit · sopra zero bid che si accumulano o ask ritirati, sotto il contrario"
                 : vistaFlusso === 'lato'
-                  ? "Netto per lato (aggiunti − tolti) · sopra zero il lato si riempie, sotto si svuota"
+                  ? "Netto per lato (aggiunti − cancellati) · sopra zero il lato si riempie, sotto si svuota"
                   : vistaFlusso === 'rotazione'
                     ? "Rotazione · quota degli ordini aggiunti poi cancellati, non eseguiti · vicino al 100% la liquidita' e' fugace"
-                    : 'Ordini limit aggiunti e tolti'}
-              {' '}· primi 5 livelli · ultimi {finestraFlusso} s
+                    : 'Ordini limit aggiunti e cancellati'}
+              {' '}· primi {livelliFlusso} livelli · ultimi {finestraFlusso} s
             </div>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
               <span className="flex items-center gap-3 tabular-nums font-semibold">
@@ -2417,6 +2641,7 @@ export default function BookmapPage() {
                     <Legenda colore={ROSSO} testo="Ask" valore={ultimaRotazione('ask')} unita="%" />
                   </>
                 )}
+                {vistaFlusso !== 'rotazione' && mostraEseguiti && <Legenda colore={BLU} testo="Delta eseguiti" valore={ultimoFlusso('deltaEseguiti')} segno />}
               </span>
               <Selettore
                 titolo="Vista"
@@ -2424,6 +2649,7 @@ export default function BookmapPage() {
                 opzioni={[['pressione', 'Pressione'], ['lato', 'Per lato'], ['dettaglio', 'Dettaglio'], ['rotazione', 'Rotazione']]}
                 onChange={cambiaVistaFlusso}
               />
+              <Selettore titolo="Livelli" valore={livelliFlusso} opzioni={OPZIONI_LIVELLI_FLUSSO} onChange={cambiaLivelliFlusso} />
               <Selettore
                 titolo="Somma"
                 valore={finestraFlusso}
@@ -2431,12 +2657,18 @@ export default function BookmapPage() {
                 onChange={cambiaFinestraFlusso}
               />
               {vistaFlusso !== 'rotazione' && (
-                <Selettore
-                  titolo="Tolti"
-                  valore={tolti}
-                  opzioni={[['cancellati', 'Solo cancellati'], ['tutti', 'Cancellati + eseguiti']]}
-                  onChange={cambiaTolti}
-                />
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-500">Delta eseguiti</span>
+                  <button
+                    onClick={cambiaEseguiti}
+                    className={`px-2 py-0.5 rounded-lg font-bold border ${
+                      mostraEseguiti ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                    }`}
+                    title="Linea blu, scala a destra: il delta degli eseguiti nella finestra, comprati meno venduti. Le altre linee contano solo i cancellati"
+                  >
+                    {mostraEseguiti ? 'ON' : 'OFF'}
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -2445,9 +2677,14 @@ export default function BookmapPage() {
               Nessun dato: l&apos;add-on in Bookmap e&apos; ancora la versione di prima. Ricostruiscilo dal code editor e riattivalo.
             </div>
           )}
-          <div className="relative h-[200px] md:h-[240px]">
+          {caricato && conFlusso && livelliFlusso !== '5' && corrente?.fasce == null && (
+            <div className="mb-1 text-xs text-amber-200/80">
+              Oltre 5 livelli servono i dati dell&apos;add-on nuovo: ricostruiscilo dal code editor di Bookmap e riattivalo. I secondi di prima restano vuoti.
+            </div>
+          )}
+          <PannelloAltezza chiave="flusso" base="h-[200px] md:h-[240px]">
             <canvas ref={flussoRef} className="cursor-crosshair" />
-          </div>
+          </PannelloAltezza>
         </div>
       </div>
     </div>

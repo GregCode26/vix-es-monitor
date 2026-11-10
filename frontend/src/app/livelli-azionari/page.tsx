@@ -39,6 +39,8 @@ function Gamba({ strike, lato, prezzo, fonte }: { strike: number; lato: 'P' | 'C
 interface Riga {
     id: string; ticker: string; ora: string; spot: number;
     fonteSpot: string; tipoDatiSpot: string; scadenze: Scadenza[];
+    /** Tipo di scadenze del titolo (righe dal 10/11/2026; prima si ricava dalle date). */
+    ciclo?: string;
 }
 
 const num = (v: number | null | undefined) => v == null ? 'n.d.' :
@@ -47,6 +49,21 @@ const dataBreve = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso
 const oraIt = (iso: string) => new Date(iso).toLocaleString('it-IT', {
     timeZone: 'Europe/Rome', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
 });
+
+/**
+ * Per le righe salvate prima del 10/11/2026, che non hanno `ciclo`: stessa regola
+ * dello script (la piu' breve delle prime due distanze), sulle 3 scadenze della riga.
+ */
+function cicloDaScadenze(scadenze: Scadenza[]): string {
+    const ms = scadenze.map((s) => Date.parse(s.scadenza)).sort((a, b) => a - b);
+    const distanze = ms.slice(1, 3).map((v, i) => Math.round((v - ms[i]) / 86_400_000));
+    if (distanze.length === 0) return 'una sola scadenza quotata';
+    const tipica = Math.min(...distanze);
+    if (tipica <= 3) return "piu' volte a settimana";
+    if (tipica <= 8) return 'settimanale';
+    const mesi = Math.max(1, Math.round(tipica / 30.4));
+    return mesi === 1 ? 'mensile' : mesi === 3 ? 'trimestrale' : `ogni ${mesi} mesi`;
+}
 
 /** Cosa c'e' di diverso da un mid live, da dire accanto al numero. */
 function avvisi(tipo: string | undefined, ...fonti: (string | undefined)[]) {
@@ -168,7 +185,15 @@ export default function LivelliAzionariPage() {
 
     return (
         <main className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-6">
-            <h1 className="text-xl font-bold tracking-wide">LIVELLI AZIONARI</h1>
+            <div className="flex items-center justify-between gap-4">
+                <h1 className="text-xl font-bold tracking-wide">LIVELLI AZIONARI</h1>
+                <Link
+                    href="/market"
+                    className="px-3 py-1.5 text-xs font-bold rounded border border-slate-600 text-slate-200 hover:bg-slate-800 hover:border-slate-400"
+                >
+                    ← MARKET
+                </Link>
+            </div>
             <p className="text-sm text-slate-400 mt-1">Straddle ATM sulle 3 scadenze più vicine, da IBKR (mid di call + put).</p>
 
             {!locale && <p className="mt-4 text-sm text-amber-400">Funziona solo in locale, con TWS aperto.</p>}
@@ -215,7 +240,16 @@ export default function LivelliAzionariPage() {
                                 return (
                                     <tr key={r.id} className="border-t border-slate-800">
                                         <td className="px-4 py-3 align-top whitespace-nowrap">
-                                            <div className="text-lg font-bold">{r.ticker}</div>
+                                            <Link
+                                                href={`/livelli-azionari/grafico?ticker=${encodeURIComponent(r.ticker)}&id=${encodeURIComponent(r.id)}`}
+                                                title="Grafico a candele giornaliere con i livelli di questa riga"
+                                                className="text-lg font-bold hover:text-cyan-300 underline-offset-4 hover:underline"
+                                            >
+                                                {r.ticker}
+                                            </Link>
+                                            <div className="text-xs font-semibold text-violet-300">
+                                                Scadenze {(r.ciclo ?? cicloDaScadenze(r.scadenze)).replace("piu'", 'più')}
+                                            </div>
                                             <div className="text-xs text-slate-300 tabular-nums">Spot {num(r.spot)}</div>
                                             {avviso && <div className="text-xs text-amber-400">{avviso}</div>}
                                             <div className="text-xs text-slate-500 tabular-nums">{oraIt(r.ora)}</div>

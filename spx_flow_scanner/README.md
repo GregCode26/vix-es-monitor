@@ -165,7 +165,7 @@ stesso secondo e prezzo, con N = 500, non conta): scelta dell'utente.
   sessione e' salito di >= N dall'ultima lettura dei trade, quindi i candidati
   vengono da `volume_latest`. Con soglia di base 500 (scelta dell'utente) ~95 per ciclo da
   10 minuti (con 100 sarebbero ~200, misurato il 05/11).
-- Si salvano solo le stampe >= `SCANNER_TRADE_MIN` (default 500) nella tabella
+- Si salvano solo le stampe >= `SCANNER_TRADE_MIN` (default 200; 500 fino al 10/11/2026) nella tabella
   `trades`; `trade_cursor` dice fin dove e' stato letto ogni contratto. La
   pagina non puo' filtrare sotto la soglia di base e lo dice.
 - Ritmo misurato: 60 richieste a 1/s senza errori di pacing, ma dopo ~20 IBKR

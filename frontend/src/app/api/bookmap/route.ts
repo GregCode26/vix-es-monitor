@@ -47,6 +47,7 @@ interface Campione {
     remB?: number;
     addA?: number;
     remA?: number;
+    fasce?: unknown;
     ofi?: number[] | null;
     cB?: number | null;
     cA?: number | null;
@@ -95,6 +96,12 @@ export interface BookmapPoint {
     remB: number | null;
     addA: number | null;
     remA: number | null;
+    /**
+     * Lo stesso conteggio piu' in profondita': [addB, remB, addA, remA], 10
+     * numeri ciascuno, uno per ogni gruppo di 5 livelli dal migliore (0-4, 5-9...
+     * 45-49), non cumulati. Null nei campioni di prima del 09/11/2026.
+     */
+    fasce: number[][] | null;
     /**
      * Order Flow Imbalance del secondo, livello per livello dal migliore
      * (contratti; positivo = pressione in acquisto). Il primo e' l'OFI
@@ -185,6 +192,7 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         remB: numeroONull(c.remB),
         addA: numeroONull(c.addA),
         remA: numeroONull(c.remA),
+        fasce: fasceValide(c.fasce),
         ofi: Array.isArray(c.ofi) && c.ofi.every((v) => typeof v === 'number' && Number.isFinite(v)) ? c.ofi : null,
         cB: numeroONull(c.cB),
         cA: numeroONull(c.cA),
@@ -212,6 +220,12 @@ function eventi(v: unknown): Evento[] | null {
             typeof e[3] === 'string' &&
             /^\d{2}:\d{2}:\d{2}$/.test(e[3]),
     );
+}
+
+function fasceValide(v: unknown): number[][] | null {
+    if (!Array.isArray(v) || v.length !== 4) return null;
+    const ok = v.every((r) => Array.isArray(r) && r.length === 10 && r.every((n) => typeof n === 'number' && Number.isFinite(n)));
+    return ok ? (v as number[][]) : null;
 }
 
 function numeroONull(v: unknown): number | null {

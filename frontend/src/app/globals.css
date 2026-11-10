@@ -24,3 +24,11 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Legenda della serie temporale di /hedging-pressure: gli strike con la variazione maggiore. */
+@keyframes legenda-lampeggio {
+  50% { opacity: 0.15; }
+}
+.legenda-lampeggio {
+  animation: legenda-lampeggio 1s steps(1) infinite;
+}

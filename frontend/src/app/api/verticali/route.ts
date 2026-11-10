@@ -6,6 +6,8 @@ export const dynamic = 'force-dynamic';
 
 /**
  * I vertical da 5 punti sullo SPX 0DTE: prezzo e volumi eseguiti.
+ * `?ampiezza=10` da' quelli da 10 punti (K / K+10 su ogni strike, quindi
+ * sovrapposti a passo 5), con i volumi dei blocchi da 10.
  *
  * Legge `frontend/data/catena/quote.json`, che `execution/tws_volumes_poller.py`
  * sovrascrive a ogni giro (10 s) con il bid/ask dei 37 strike che segue. Per
@@ -80,7 +82,8 @@ export interface Vertical {
     put: Lato | null;
 }
 
-const AMPIEZZA = 5;
+/** Larghezze ammesse con `?ampiezza=`: i 37 strike sono a passo 5. */
+const AMPIEZZE = [5, 10];
 
 function getTodayKey() {
     const now = new Date();
@@ -129,8 +132,8 @@ function sommaVolumi(verticali: Vertical[], blocchi: Blocco[]) {
         if (v.call) v.call.vol = { comprati: 0, venduti: 0, incerti: 0 };
         if (v.put) v.put.vol = { comprati: 0, venduti: 0, incerti: 0 };
     }
-    // Solo i blocchi da 5 punti finiscono nelle righe; quelli piu' larghi
-    // (dal 29/10/2026) stanno solo nella lista.
+    // Nelle righe finiscono solo i blocchi della larghezza mostrata; gli
+    // altri (fino a 50 punti dal 29/10/2026) stanno solo nella lista.
     const perStrike = new Map(verticali.map((v) => [`${v.k1}-${v.k2}`, v]));
     for (const b of blocchi) {
         const v = perStrike.get(`${b.k1}-${b.k2}`);
@@ -247,6 +250,8 @@ function blocchiSimulati(q: FileQuote, verticali: Vertical[]): Blocco[] {
 export async function GET(request: NextRequest) {
     const date = getTodayKey();
     const sim = request.nextUrl.searchParams.get('sim') === '1';
+    const chiesta = Number(request.nextUrl.searchParams.get('ampiezza') ?? 5);
+    const ampiezza = AMPIEZZE.includes(chiesta) ? chiesta : 5;
     let q: FileQuote;
     if (sim) {
         q = catenaSimulata();
@@ -267,7 +272,7 @@ export async function GET(request: NextRequest) {
     const perStrike = new Map(q.strikes.map((r) => [r.strike, r]));
     const verticali: Vertical[] = [];
     for (const r of q.strikes) {
-        const alto = perStrike.get(r.strike + AMPIEZZA);
+        const alto = perStrike.get(r.strike + ampiezza);
         if (!alto) continue;
         verticali.push({
             k1: r.strike,
@@ -291,7 +296,7 @@ export async function GET(request: NextRequest) {
         }
     }
     return NextResponse.json({
-        date, local: true, sim, time: q.time, spot: q.spot, expiry: q.expiry, verticali,
+        date, local: true, sim, ampiezza, time: q.time, spot: q.spot, expiry: q.expiry, verticali,
         rilevamento, blocchi,
     });
 }

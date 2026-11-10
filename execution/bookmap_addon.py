@@ -27,6 +27,12 @@ tolti in quel secondo entro LIVELLI_FLUSSO livelli dal migliore, contati a ogni
 aggiornamento del book: se la size di un livello sale e' aggiunta, se scende e'
 tolta. Tolta comprende anche l'eseguito (un ordine riempito sparisce dal book
 come uno cancellato): la pagina, se si vuole, gli sottrae `buy`/`sell`.
+`fasce` (dal 09/11/2026) e' lo stesso conteggio piu' in profondita', per il
+selettore Livelli di /bookmap: [addB, remB, addA, remA], ognuno con FASCE_FLUSSO
+numeri, uno per ogni gruppo di LIVELLI_FLUSSO livelli dal migliore (0-4, 5-9...
+45-49). Non cumulati: i primi N livelli sono la somma delle prime N/5 fasce. Per
+livello sarebbero 200 numeri al secondo, a fasce 40 (~150 byte). La prima fascia
+coincide con addB/remB/addA/remA, che restano per i campioni vecchi e gli studi.
 
 `ofi` e' l'Order Flow Imbalance livello per livello (Cont, Kukanov e Stoikov
 2014 per il primo livello, Xu, Gould e Howison per i livelli successivi, il
@@ -94,6 +100,7 @@ MIN_CONTRATTI_BOOK = 20
 LIVELLI_BOOK_LONTANI = 120
 MIN_CONTRATTI_LONTANI = 50
 LIVELLI_FLUSSO = 5
+FASCE_FLUSSO = 10
 LIVELLI_OFI = 15
 # Alla sottoscrizione Bookmap riversa l'intero book: sembrerebbero migliaia di
 # contratti aggiunti in un colpo. Per questi secondi non si conta.
@@ -109,7 +116,7 @@ ASS_TENUTA_SEC = 1.0
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
 livelli = {}        # alias -> quanti livelli per lato sommare nella liquidita'
-flusso = {}         # alias -> {"buy", "sell", "addB", "remB", "addA", "remA"} del secondo in corso
+flusso = {}         # alias -> {"buy", "sell", "fasce": [addB, remB, addA, remA]} del secondo in corso
 conta_da = {}       # alias -> da quando (epoch) contare aggiunte e rimozioni
 ultimo_secondo = {}  # alias -> secondo (epoch) dell'ultimo campione emesso
 foto_prima = {}     # alias -> ultima fotografia dei primi LIVELLI_OFI livelli, per l'OFI
@@ -159,7 +166,7 @@ def handle_unsubscribe_instrument(addon, alias):
 
 
 def azzerato():
-    return {"buy": 0.0, "sell": 0.0, "addB": 0.0, "remB": 0.0, "addA": 0.0, "remA": 0.0}
+    return {"buy": 0.0, "sell": 0.0, "fasce": [[0.0] * FASCE_FLUSSO for _ in range(4)]}
 
 
 def statistiche_azzerate():
@@ -248,14 +255,15 @@ def handle_depth_info(addon, alias, is_bid, price, size):
     if migliore is None or size == prima or time.time() < conta_da[alias]:
         return
     distanza = migliore[0] - price if is_bid else price - migliore[0]
-    if distanza >= LIVELLI_FLUSSO:
+    if distanza >= LIVELLI_FLUSSO * FASCE_FLUSSO:
         return
+    fascia = int(max(distanza, 0) // LIVELLI_FLUSSO)
     variazione = (size - prima) / strumenti[alias]["granularita"]
-    f = flusso[alias]
+    fasce = flusso[alias]["fasce"]
     if variazione > 0:
-        f["addB" if is_bid else "addA"] += variazione
+        fasce[0 if is_bid else 2][fascia] += variazione
     else:
-        f["remB" if is_bid else "remA"] -= variazione
+        fasce[1 if is_bid else 3][fascia] -= variazione
 
 
 def orario(epoch):
@@ -394,10 +402,11 @@ def on_interval(addon, alias):
             "b": livelli_book(libro["bids"], migliori_bid[0] if migliori_bid else None, -1, info),
             "a": livelli_book(libro["asks"], migliori_ask[0] if migliori_ask else None, 1, info),
         },
-        "addB": round(f["addB"]),
-        "remB": round(f["remB"]),
-        "addA": round(f["addA"]),
-        "remA": round(f["remA"]),
+        "addB": round(f["fasce"][0][0]),
+        "remB": round(f["fasce"][1][0]),
+        "addA": round(f["fasce"][2][0]),
+        "remA": round(f["fasce"][3][0]),
+        "fasce": [[round(v) for v in riga] for riga in f["fasce"]],
         **riassunto_statistiche(statistiche[alias]),
         "abs": eventi[alias]["abs"],
     }

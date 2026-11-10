@@ -37,17 +37,33 @@ interface HedgingPressureResponse {
     profile: HedgingPressureRow[];
     riskZones: RiskZone[];
     strikes: number[];
+    /** Le linee della serie temporale: gli strike per cui la route calcola lo storico. */
+    topStrikes: number[];
 }
 
 const REFRESH_MS = 15000;
 /**
- * Punti di storico tenuti in memoria. Basta per la sessione intera: la
- * storia arriva a uno snapshot al minuto (~510 x 5 strike), poi i giri
- * aggiungono uno snapshot ogni dieci secondi (~30 punti al minuto).
+ * Punti di storico tenuti in memoria. Basta per la sessione intera anche con
+ * la pagina aperta dall'inizio: uno snapshot ogni dieci secondi per 8 ore e
+ * mezza e 20 strike sono ~61.000 punti. Il vecchio tetto di 20.000 tagliava
+ * le prime ore.
  */
-const MAX_STORICO = 20000;
-/** Quanti strike mostra la serie temporale: gli stessi per cui la route calcola lo storico. */
-const TOP_STRIKE = 5;
+const MAX_STORICO = 80000;
+/**
+ * Una tinta per linea: la tavolozza di default di echarts ne ha 9, e dalla
+ * decima le linee si confondono. In ordine di strike, quindi tinte vicine non
+ * stanno mai su strike vicini.
+ */
+const COLORI_LINEE = [
+    '#60a5fa', '#f97316', '#34d399', '#f472b6', '#facc15',
+    '#a78bfa', '#22d3ee', '#ef4444', '#a3e635', '#e879f9',
+    '#2563eb', '#fdba74', '#059669', '#be185d', '#ca8a04',
+    '#7c3aed', '#0e7490', '#fca5a5', '#65a30d', '#cbd5e1',
+];
+/** Su quanti minuti si misura la variazione che fa lampeggiare gli strike in legenda. */
+const VARIAZIONE_MIN = 5;
+/** Quanti strike lampeggiano in tutto: sopra lo spot in verde, sotto in rosso. */
+const LAMPEGGIANTI = 2;
 
 type ViewMode = 'profile' | 'timeseries' | 'heatmap';
 
@@ -64,6 +80,11 @@ const PENTAGONO = 'path://M50 0 L97.6 34.5 L79.4 90.5 L20.6 90.5 L2.4 34.5 Z';
 
 const oraTrade = (ts: number) => new Date(ts * 1000).toLocaleTimeString('it-IT',
     { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+/** Quello che la legenda usa dell'istanza di echarts. */
+interface GraficoEcharts {
+    dispatchAction: (a: { type: string; [k: string]: unknown }) => void;
+}
 
 interface PressureHistoryPoint {
     time: string;
@@ -124,6 +145,13 @@ export default function HedgingPressurePage() {
      */
     const zoomSerie = useRef<{ da: number; a: number; live: boolean } | null>(null);
     const ultimoMsSerie = useRef(0);
+    /** Le linee spente dalla legenda: come lo zoom, senza questo tornerebbero tutte ogni 15 secondi. */
+    const legendaSerie = useRef<Record<string, boolean>>({});
+    const [lineeSpente, setLineeSpente] = useState<Record<string, boolean>>({});
+    /** Il grafico, per comandarlo dalla legenda: e' fuori dal canvas perche' un canvas ridisegnato per lampeggiare costerebbe tutte le linee. */
+    const graficoRef = useRef<GraficoEcharts | null>(null);
+    // La linea della serie temporale sotto il puntatore: il suo strike si evidenzia in legenda.
+    const [lineaSotto, setLineaSotto] = useState<string | null>(null);
 
     const fetchHedgingPressure = useCallback(async () => {
         try {
@@ -251,12 +279,63 @@ export default function HedgingPressurePage() {
      * Prima l'asse era a categorie e ogni linea si allineava per indice:
      * strike con orari diversi finivano sfasati. E `slice(0, 5)` su un
      * oggetto con chiavi numeriche prendeva i cinque strike piu' BASSI, non i
-     * piu' carichi. Ora l'asse e' il tempo vero, e gli strike sono gli stessi
-     * cinque per cui la route calcola lo storico.
+     * piu' carichi. Ora l'asse e' il tempo vero, e gli strike sono quelli per
+     * cui la route calcola lo storico (`topStrikes`). Uno strike che entra fra
+     * i piu' carichi a sessione iniziata ha la linea solo da quel momento,
+     * finche' non si ricarica la pagina.
      *
      * Lo zoom: rotella e trascinamento sul grafico, o la barra sotto. L'asse
      * Y si riadatta a quello che si vede (`filterMode: 'filter'`).
      */
+    /**
+     * Le voci della legenda, dal prezzo piu' alto al piu' basso. Lampeggiano i
+     * due strike con la variazione assoluta maggiore della pressione negli
+     * ultimi VARIAZIONE_MIN minuti, verdi sopra lo spot e rossi sotto: possono
+     * stare entrambi dalla stessa parte. Chi non ha un dato di allora
+     * (appena entrato fra i piu' carichi, o catena appena ricentrata) non
+     * concorre: la sua variazione non si puo' misurare.
+     */
+    const vociLegenda = useMemo(() => {
+        if (!data || storico.length === 0) return [];
+        const top = [...data.topStrikes].sort((x, y) => x - y);
+        const inTop = new Set(top);
+        const perStrike = new Map<number, { ms: number; v: number }[]>();
+        let ultimoMs = 0;
+        for (const p of storico) {
+            if (!inTop.has(p.strike)) continue;
+            const ms = inMs(data.date, p.time);
+            if (!Number.isFinite(ms)) continue;
+            const punti = perStrike.get(p.strike) ?? [];
+            punti.push({ ms, v: p.totalPressure });
+            perStrike.set(p.strike, punti);
+            if (ms > ultimoMs) ultimoMs = ms;
+        }
+        const obiettivo = ultimoMs - VARIAZIONE_MIN * 60000;
+        const voci = top.map((strike, i) => {
+            const punti = perStrike.get(strike) ?? [];
+            const ultimo = punti[punti.length - 1];
+            let rif: { ms: number; v: number } | null = null;
+            for (const q of punti) {
+                if (q.ms > obiettivo) break;
+                rif = q;
+            }
+            // Dati vecchi da una parte o dall'altra non fanno una variazione su questa finestra.
+            const valida = ultimo && rif && ultimo.ms >= ultimoMs - 60000 && rif.ms >= obiettivo - 120000;
+            return {
+                strike,
+                colore: COLORI_LINEE[i % COLORI_LINEE.length],
+                variazione: valida ? ultimo.v - rif!.v : null,
+                lampeggio: null as 'su' | 'giu' | null,
+            };
+        });
+        const piuMosse = voci
+            .filter((x) => x.variazione != null && x.variazione !== 0)
+            .sort((a, b) => Math.abs(b.variazione!) - Math.abs(a.variazione!))
+            .slice(0, LAMPEGGIANTI);
+        for (const x of piuMosse) x.lampeggio = x.strike > data.spot ? 'su' : 'giu';
+        return voci.reverse();
+    }, [storico, data]);
+
     const timeseriesOption = useMemo(() => {
         if (storico.length === 0 || !data) {
             return {
@@ -265,11 +344,7 @@ export default function HedgingPressurePage() {
             };
         }
 
-        const top = [...data.profile]
-            .sort((x, y) => Math.abs(y.normalizedPressure) - Math.abs(x.normalizedPressure))
-            .slice(0, TOP_STRIKE)
-            .map((r) => r.strike)
-            .sort((x, y) => x - y);
+        const top = [...data.topStrikes].sort((x, y) => x - y);
         const perStrike = new Map<number, [number, number][]>(top.map((k) => [k, []]));
         let ultimoMs = 0;
         for (const p of storico) {
@@ -282,13 +357,18 @@ export default function HedgingPressurePage() {
         }
         ultimoMsSerie.current = ultimoMs;
 
-        const series = top.map((strike) => ({
+        const series = top.map((strike, i) => ({
             name: `K${strike}`,
             type: 'line' as const,
             data: perStrike.get(strike) ?? [],
             showSymbol: false,
             sampling: 'lttb' as const,
-            lineStyle: { width: 2 },
+            color: COLORI_LINEE[i % COLORI_LINEE.length],
+            lineStyle: { width: 1.5 },
+            emphasis: { focus: 'series' as const },
+            // Senza, il passaggio sulla linea (senza simboli) non manda mouseover:
+            // serve per evidenziare lo strike in legenda.
+            triggerLineEvent: true,
         }));
 
         // La finestra di prima: se seguiva l'ultimo dato, scorre con lui
@@ -304,14 +384,16 @@ export default function HedgingPressurePage() {
             backgroundColor: '#0c0d10',
             tooltip: {
                 trigger: 'axis',
+                // Niente riquadro dei valori: resta solo il mirino.
+                showContent: false,
                 axisPointer: { type: 'cross' },
             },
+            // La legenda che si vede e' quella HTML sopra il grafico (vociLegenda):
+            // questa resta solo perche' echarts tenga lo stato delle linee spente.
             legend: {
+                show: false,
                 data: series.map((x) => x.name),
-                textStyle: { color: '#94a3b8', fontSize: 9 },
-                top: 10,
-                right: 10,
-                orient: 'vertical',
+                selected: legendaSerie.current,
             },
             grid: {
                 left: 60,
@@ -381,6 +463,11 @@ export default function HedgingPressurePage() {
         },
         [],
     );
+
+    const suLegendaSerie = useCallback((e: { selected: Record<string, boolean> }) => {
+        legendaSerie.current = e.selected;
+        setLineeSpente(e.selected);
+    }, []);
 
     // La vista Mappa Calore non e' piu' un grafico echarts: prima era la
     // pressione dei soli cinque strike di `storico`, troppo pochi per una
@@ -698,7 +785,48 @@ export default function HedgingPressurePage() {
                 )}
 
                 <div className="bg-[#0c0d10] border border-slate-800/80 rounded-xl p-2 shadow-2xl w-full mb-3">
-                    <div className="h-[calc(100vh-300px)] min-h-[600px]">
+                    <div className="relative h-[calc(100vh-300px)] min-h-[600px]">
+                        {viewMode === 'timeseries' && pronto && vociLegenda.length > 0 && (
+                            <div className="absolute top-2 right-1 z-10 flex max-h-[calc(100%-3rem)] flex-col gap-0.5 overflow-y-auto">
+                                {/* Il prezzo SPX fra gli strike: con `order` sta fra quello appena sopra e quello appena sotto. */}
+                                <div
+                                    title={`SPX ${data.spot.toFixed(2)}`}
+                                    className="mx-1.5 my-0.5 h-0.5 bg-white"
+                                    style={{ order: 2 * vociLegenda.filter((v) => v.strike > data.spot).length - 1 }}
+                                />
+                                {vociLegenda.map((v, i) => {
+                                    const nome = `K${v.strike}`;
+                                    const spenta = lineeSpente[nome] === false;
+                                    const sotto = lineaSotto === nome;
+                                    return (
+                                        <button
+                                            key={v.strike}
+                                            type="button"
+                                            style={{ order: 2 * i }}
+                                            title={v.variazione == null
+                                                ? `Variazione a ${VARIAZIONE_MIN} min non disponibile`
+                                                : `${v.variazione > 0 ? '+' : ''}${Math.round(v.variazione).toLocaleString('it-IT')} in ${VARIAZIONE_MIN} min`}
+                                            onClick={() => graficoRef.current?.dispatchAction({ type: 'legendToggleSelect', name: nome })}
+                                            onMouseEnter={() => graficoRef.current?.dispatchAction({ type: 'highlight', seriesName: nome })}
+                                            onMouseLeave={() => graficoRef.current?.dispatchAction({ type: 'downplay', seriesName: nome })}
+                                            ref={sotto ? (el) => el?.scrollIntoView({ block: 'nearest' }) : undefined}
+                                            className={`flex items-center gap-1.5 rounded px-1.5 py-px text-[10px] leading-4 ${spenta ? 'opacity-40' : ''} ${
+                                                sotto
+                                                    ? 'bg-white/90 font-bold text-black ring-2 ring-white'
+                                                    : v.lampeggio === 'su'
+                                                    ? 'legenda-lampeggio bg-emerald-500/40 font-bold text-emerald-200'
+                                                    : v.lampeggio === 'giu'
+                                                      ? 'legenda-lampeggio bg-red-500/40 font-bold text-red-200'
+                                                      : 'text-slate-400 hover:text-slate-200'
+                                            }`}
+                                        >
+                                            <span className="h-0.5 w-3" style={{ backgroundColor: v.colore }} />
+                                            {nome}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
                         {mappaAperta && (
                             <div className={viewMode === 'heatmap' ? 'h-full' : 'hidden'}>
                                 <GammaHeatmapLive attiva={viewMode === 'heatmap'} />
@@ -709,7 +837,14 @@ export default function HedgingPressurePage() {
                                 option={viewMode === 'profile' ? option : timeseriesOption}
                                 style={{ height: '100%', width: '100%' }}
                                 notMerge={true}
-                                onEvents={viewMode === 'timeseries' ? { datazoom: suZoomSerie } : undefined}
+                                onChartReady={(c: GraficoEcharts) => { graficoRef.current = c; }}
+                                onEvents={viewMode === 'timeseries' ? {
+                                    datazoom: suZoomSerie,
+                                    legendselectchanged: suLegendaSerie,
+                                    mouseover: (e: { seriesName?: string }) => setLineaSotto(e.seriesName ?? null),
+                                    mouseout: () => setLineaSotto(null),
+                                    globalout: () => setLineaSotto(null),
+                                } : undefined}
                             />
                         ) : (
                             <div className="flex flex-col items-center justify-center h-full gap-3 text-sm text-slate-500">
