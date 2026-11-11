@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { basiCash, basisAl, epochRoma } from '@/lib/basisCash';
 
 export const dynamic = 'force-dynamic';
 
@@ -247,8 +248,35 @@ function blocchiSimulati(q: FileQuote, verticali: Vertical[]): Blocco[] {
     return out;
 }
 
+/**
+ * `?blocchi=1`: solo i blocchi di oggi (gli stessi della lista di /operativita), larghi 5 o 10 punti
+ * e con almeno `?min=` contratti (default 200), con gli strike portati in ES con la basis ES - SPX
+ * del momento (`lib/basisCash.ts`). Per le saette dei vertical di Zone Footprint su Quantower
+ * (11/11/2026). Non serve la quotazione: risponde anche senza `quote.json`.
+ */
+function soloBlocchi(request: NextRequest, date: string) {
+    const min = Math.max(1, Number(request.nextUrl.searchParams.get('min') ?? 200) || 200);
+    const letti = (leggiBlocchi(date) ?? []).filter((b) => [5, 10].includes(Math.abs(b.k2 - b.k1)) && b.size >= min);
+    const basi = letti.length ? basiCash([date]) : [];
+    const arrot = (x: number) => Math.round(x * 100) / 100;
+    const blocchi = letti.map((b) => {
+        const ts = epochRoma(date, b.t);
+        const { basis, fonte } = basisAl(basi, ts);
+        const [kBasso, kAlto] = b.k1 < b.k2 ? [b.k1, b.k2] : [b.k2, b.k1];
+        // comprato = paga vicino al debito: sulle call e' un bull call, sulle put un bear put
+        const nome = b.verso === 'incerto' ? (b.lato === 'C' ? 'CALL' : 'PUT')
+            : b.lato === 'C' ? (b.verso === 'comprato' ? 'BULL CALL' : 'BEAR CALL') : (b.verso === 'comprato' ? 'BEAR PUT' : 'BULL PUT');
+        return {
+            ...b, ts, nome, tipo: b.lato, kBasso, kAlto, basis: basis == null ? null : arrot(basis), basisFonte: fonte,
+            esBasso: basis == null ? null : arrot(kBasso + basis), esAlto: basis == null ? null : arrot(kAlto + basis),
+        };
+    });
+    return NextResponse.json({ date, min, n: blocchi.length, blocchi });
+}
+
 export async function GET(request: NextRequest) {
     const date = getTodayKey();
+    if (request.nextUrl.searchParams.get('blocchi') === '1' && !process.env.VERCEL) return soloBlocchi(request, date);
     const sim = request.nextUrl.searchParams.get('sim') === '1';
     const chiesta = Number(request.nextUrl.searchParams.get('ampiezza') ?? 5);
     const ampiezza = AMPIEZZE.includes(chiesta) ? chiesta : 5;
