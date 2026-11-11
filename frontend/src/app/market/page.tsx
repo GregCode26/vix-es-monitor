@@ -2923,6 +2923,7 @@ export default function MarketPage() {
                             <button onClick={() => router.push('/bookmap')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">BOOKMAP</button>
                             <button onClick={() => router.push('/iv-monitor')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">IV MONITOR</button>
                             <button onClick={() => router.push('/operativita')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">OPERATIVITA&apos;</button>
+                            <button onClick={() => router.push('/sbilanciamento')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Call sopra contro put sotto alla stessa distanza dall'ATM, SPX 0DTE (in prova)">SBILANCIAMENTO</button>
                             <button onClick={() => router.push('/livelli-azionari')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Straddle e livelli L1/L2/L3 di un'azione sulle 3 scadenze più vicine, da IBKR (solo locale)">LIVELLI AZIONARI</button>
                         </div>
                     </div>
