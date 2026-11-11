@@ -11,8 +11,8 @@ export const runtime = 'nodejs';
  * Nessun dato nuovo: legge `data/catena/quote.json`, gli ultimi bid/ask dei 37 strike che il poller dei
  * volumi riscrive ogni 10 s. Il centro e' il forward da put-call parity (`smile.fwd`), non lo spot: su
  * 0DTE differiscono di poco, ma centrando sullo spot uno scarto di 1-2 punti basterebbe a far sembrare
- * piu' care le call o le put vicino all'ATM. Per ogni distanza d = 5, 10, ... il prezzo della call a F+d e
- * della put a F-d e' interpolato linearmente fra i due strike vicini (bid, ask e IV).
+ * piu' care le call o le put vicino all'ATM. Si usano gli strike veri (prezzi senza interpolazione), a
+ * coppie simmetriche attorno al punto della griglia da 2.5 piu' vicino al forward.
  *
  * Bilanciati = i due intervalli bid-ask si sovrappongono: con quei prezzi non si puo' dire quale costi
  * di piu'. Altrimenti il lato piu' caro e lo scarto in % del prezzo medio della coppia. Sotto 0.10 di
@@ -43,6 +43,8 @@ export type Riga = {
 
 export type Lettura = {
     time: string; spot: number | null; fwd: number;
+    /** centro delle coppie sulla griglia da 2.5 (uno strike o il punto fra due) */
+    centro: number;
     /** media degli scarti delle distanze confrontabili, in % */
     indice: number | null;
     bilanciati: number; confrontabili: number;
@@ -54,45 +56,39 @@ export type Lettura = {
 
 const valido = (x: number | null | undefined): x is number => typeof x === 'number' && Number.isFinite(x) && x >= 0;
 
-function interpola(s: Strike[], x: number, campo: keyof Strike): number | null {
-    for (let i = 0; i < s.length - 1; i++) {
-        const a = s[i], b = s[i + 1];
-        if (x < a.strike || x > b.strike) continue;
-        const va = a[campo] as number | null | undefined, vb = b[campo] as number | null | undefined;
-        if (!valido(va) || !valido(vb)) return null;
-        const w = (x - a.strike) / (b.strike - a.strike);
-        return va + (vb - va) * w;
-    }
-    return null;
-}
-
 const r2 = (x: number) => Math.round(x * 100) / 100;
 
 function calcola(q: Quote): { righe: Riga[]; lettura: Lettura } | null {
     const s = [...q.strikes].sort((a, b) => a.strike - b.strike);
     const fwd = q.smile?.fwd ?? q.spot;
     if (!fwd || s.length < 3) return null;
+    // Strike veri della catena: il centro e' il punto della griglia da 2.5 piu' vicino al forward. Se cade su
+    // uno strike le coppie sono centro -5/+5, -10/+10...; se cade a meta' fra due strike, -2.5/+2.5, -7.5/+7.5...
+    // Cosi' la coppia resta simmetrica attorno al forward entro 1.25 punti.
+    const centro = Math.round(fwd / 2.5) * 2.5;
+    const perStrike = new Map(s.map((x) => [x.strike, x]));
+    const partenza = perStrike.has(centro) ? 5 : 2.5;
     const righe: Riga[] = [];
-    for (let d = 5; d <= 100; d += 5) {
-        const kP = fwd - d, kC = fwd + d;
-        const pb = interpola(s, kP, 'pBid'), pa = interpola(s, kP, 'pAsk');
-        const cb = interpola(s, kC, 'cBid'), ca = interpola(s, kC, 'cAsk');
-        if (pb == null || pa == null || cb == null || ca == null || pa < pb || ca < cb) continue;
+    for (let d = partenza; d <= 100; d += 5) {
+        const P = perStrike.get(centro - d), C = perStrike.get(centro + d);
+        if (!P || !C) continue;
+        const pb = P.pBid, pa = P.pAsk, cb = C.cBid, ca = C.cAsk;
+        if (!valido(pb) || !valido(pa) || !valido(cb) || !valido(ca) || pa < pb || ca < cb) continue;
         const pm = (pb + pa) / 2, cm = (cb + ca) / 2;
         const scarto = ((cm - pm) / ((cm + pm) / 2)) * 100;
         const stato: Riga['stato'] = pm < 0.1 || cm < 0.1 ? 'economiche'
             : cb <= pa && pb <= ca ? 'bilanciati' : cm > pm ? 'call' : 'put';
         righe.push({
-            d, kPut: r2(kP), kCall: r2(kC),
-            put: { bid: r2(pb), ask: r2(pa), mid: r2(pm), iv: interpola(s, kP, 'pIvS') },
-            call: { bid: r2(cb), ask: r2(ca), mid: r2(cm), iv: interpola(s, kC, 'cIvS') },
+            d, kPut: P.strike, kCall: C.strike,
+            put: { bid: pb, ask: pa, mid: r2(pm), iv: P.pIvS ?? null },
+            call: { bid: cb, ask: ca, mid: r2(cm), iv: C.cIvS ?? null },
             stato, scarto: r2(scarto),
         });
     }
     const conf = righe.filter((r) => r.stato !== 'economiche');
     const primo = conf.find((r) => r.stato === 'call' || r.stato === 'put');
     const lettura: Lettura = {
-        time: q.time, spot: q.spot, fwd: r2(fwd),
+        time: q.time, spot: q.spot, fwd: r2(fwd), centro,
         indice: conf.length ? r2(conf.reduce((t, r) => t + r.scarto, 0) / conf.length) : null,
         bilanciati: conf.filter((r) => r.stato === 'bilanciati').length,
         confrontabili: conf.length,

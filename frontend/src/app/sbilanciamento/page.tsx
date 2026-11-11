@@ -96,8 +96,8 @@ export default function SbilanciamentoPage() {
           <div>
             <h1 className="text-xl font-bold">Sbilanciamento call / put <span className="text-xs font-normal text-amber-400 align-middle">IN PROVA</span></h1>
             <div className="text-xs text-slate-400">
-              SPX 0DTE {dati?.expiry ?? ''} · call a forward + d contro put a forward − d · ogni 10 s
-              {l && <> · dati delle {l.time} · SPX {fmt(l.spot)} · forward {fmt(l.fwd)}</>}
+              SPX 0DTE {dati?.expiry ?? ''} · call sopra contro put sotto, stessa distanza dal centro · ogni 10 s
+              {l && <> · dati delle {l.time} · SPX {fmt(l.spot)} · forward {fmt(l.fwd)} · centro {l.centro}</>}
             </div>
           </div>
           <button onClick={() => router.push('/market')} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET</button>
@@ -154,13 +154,13 @@ export default function SbilanciamentoPage() {
                   const c = coloreStato(r.stato);
                   return (
                     <tr key={r.d} className="border-b border-slate-800/60">
-                      <td className="p-2 text-right text-slate-300">{r.kPut.toFixed(1)}</td>
+                      <td className="p-2 text-right text-slate-300">{r.kPut}</td>
                       <td className="p-2 text-right" style={{ color: r.stato === 'put' ? ROSSO : undefined }}>{fmt(r.put.bid)} / {fmt(r.put.ask)}</td>
                       <td className="p-2 text-right text-slate-500">{fmt(r.put.iv, 1)}</td>
                       <td className="p-2 text-center font-semibold">±{r.d}</td>
                       <td className="p-2 text-left text-slate-500">{fmt(r.call.iv, 1)}</td>
                       <td className="p-2 text-left" style={{ color: r.stato === 'call' ? VERDE : undefined }}>{fmt(r.call.bid)} / {fmt(r.call.ask)}</td>
-                      <td className="p-2 text-left text-slate-300">{r.kCall.toFixed(1)}</td>
+                      <td className="p-2 text-left text-slate-300">{r.kCall}</td>
                       <td className="p-2">
                         <div className="relative h-3 bg-slate-800 rounded">
                           <div className="absolute top-0 bottom-0 w-px bg-slate-500" style={{ left: '50%' }} />
@@ -178,8 +178,8 @@ export default function SbilanciamentoPage() {
               </tbody>
             </table>
             <div className="p-2 text-[11px] text-slate-500">
-              Bilanciate = gli intervalli bid-ask si sovrappongono (con quei prezzi non si può dire quale costi di più). Prezzi a forward ± d interpolati fra i due strike vicini.
-              Sotto 0,10 di prezzo il confronto non vale. Strike in SPX.
+              Bilanciate = gli intervalli bid-ask si sovrappongono (con quei prezzi non si può dire quale costi di più). Strike SPX veri, a coppie simmetriche attorno al centro (lo strike o il punto fra due strike più vicino al forward).
+              Sotto 0,10 di prezzo il confronto non vale.
             </div>
           </div>
         )}
