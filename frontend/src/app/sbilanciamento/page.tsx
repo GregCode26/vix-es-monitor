@@ -27,24 +27,59 @@ function coloreStato(s: Riga['stato']) {
 }
 
 function Storia({ storia }: { storia: Lettura[] }) {
+  const [minuti, setMinuti] = useState(3);
   const p = storia.filter((x) => x.indice != null && x.spot != null);
   if (p.length < 2) return <div className="text-xs text-slate-500">La storia si riempie mentre la pagina resta aperta (una lettura ogni 10 s).</div>;
-  const W = 900, H = 160;
+  const W = 900, H = 220, SX = 44; // SX = spazio a sinistra per la scala dell'indice
   const sec = (t: string) => { const [h, m, s] = t.split(':').map(Number); return h * 3600 + m * 60 + s; };
   const t0 = sec(p[0].time), t1 = Math.max(sec(p[p.length - 1].time), t0 + 1);
-  const x = (t: string) => ((sec(t) - t0) / (t1 - t0)) * W;
-  const scala = (v: number[]) => { const lo = Math.min(...v), hi = Math.max(...v); return (y: number) => H - 8 - ((y - lo) / Math.max(hi - lo, 1e-9)) * (H - 16); };
-  const yi = scala(p.map((q) => q.indice!)), ys = scala(p.map((q) => q.spot!));
-  const linea = (f: (q: Lettura) => number) => p.map((q, i) => `${i ? 'L' : 'M'}${x(q.time).toFixed(1)},${f(q).toFixed(1)}`).join(' ');
+  const x = (t: string) => SX + ((sec(t) - t0) / (t1 - t0)) * (W - SX - 4);
+  // media mobile sugli ultimi `minuti` (a tempo, non a numero di letture: i buchi non la falsano)
+  const morbido: number[] = [];
+  let inizio = 0, somma = 0;
+  for (let i = 0; i < p.length; i++) {
+    somma += p[i].indice!;
+    while (sec(p[i].time) - sec(p[inizio].time) > minuti * 60) somma -= p[inizio++].indice!;
+    morbido.push(somma / (i - inizio + 1));
+  }
+  const media = p.reduce((t, q) => t + q.indice!, 0) / p.length;
+  // scala dell'indice sempre con lo 0 dentro: e' il riferimento "bilanciate"
+  const valori = [...morbido, 0];
+  const lo = Math.min(...valori), hi = Math.max(...valori);
+  const yi = (v: number) => H - 10 - ((v - lo) / Math.max(hi - lo, 1e-9)) * (H - 20);
+  const sLo = Math.min(...p.map((q) => q.spot!)), sHi = Math.max(...p.map((q) => q.spot!));
+  const ys = (v: number) => H - 10 - ((v - sLo) / Math.max(sHi - sLo, 1e-9)) * (H - 20);
+  const linea = (y: number[]) => y.map((v, i) => `${i ? 'L' : 'M'}${x(p[i].time).toFixed(1)},${v.toFixed(1)}`).join(' ');
+  const passo = (hi - lo) > 60 ? 20 : (hi - lo) > 25 ? 10 : 5;
+  const tacche: number[] = [];
+  for (let v = Math.ceil(lo / passo) * passo; v <= hi; v += passo) tacche.push(v);
+  const ultimo = morbido[morbido.length - 1];
   return (
     <div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-40 bg-slate-900/60 rounded">
-        <path d={linea((q) => ys(q.spot!))} fill="none" stroke="#facc15" strokeWidth={1.5} />
-        <path d={linea((q) => yi(q.indice!))} fill="none" stroke="#38bdf8" strokeWidth={1.5} />
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-56 bg-slate-900/60 rounded">
+        {tacche.map((v) => (
+          <g key={v}>
+            <line x1={SX} x2={W} y1={yi(v)} y2={yi(v)} stroke="#1e293b" strokeWidth={1} />
+            <text x={SX - 4} y={yi(v) + 3} fill="#64748b" fontSize={10} textAnchor="end">{v}%</text>
+          </g>
+        ))}
+        <line x1={SX} x2={W} y1={yi(0)} y2={yi(0)} stroke="#e2e8f0" strokeWidth={1.2} />
+        <text x={W - 6} y={yi(0) < 20 ? yi(0) + 13 : yi(0) - 4} fill="#e2e8f0" fontSize={10} textAnchor="end">0 = bilanciate · sopra call più care, sotto put più care</text>
+        <line x1={SX} x2={W} y1={yi(media)} y2={yi(media)} stroke="#38bdf8" strokeWidth={1} strokeDasharray="5 4" opacity={0.7} />
+        <text x={W - 6} y={yi(media) - 4} fill="#38bdf8" fontSize={10} textAnchor="end" opacity={0.8}>media di oggi {media.toFixed(1)}%</text>
+        <path d={linea(p.map((q) => ys(q.spot!)))} fill="none" stroke="#facc15" strokeWidth={1.2} opacity={0.8} />
+        <path d={linea(morbido.map(yi))} fill="none" stroke="#38bdf8" strokeWidth={2.2} />
       </svg>
-      <div className="flex justify-between text-[11px] text-slate-400 mt-1">
+      <div className="flex flex-wrap justify-between gap-2 text-[11px] text-slate-400 mt-1">
         <span>{p[0].time}</span>
-        <span><span className="text-sky-400">— indice scarto call/put</span> · <span className="text-yellow-400">— SPX</span> (scale proprie)</span>
+        <span>
+          <span className="text-sky-400">— scarto medio call/put, media mobile</span>{' '}
+          {[1, 3, 5, 10].map((m) => (
+            <button key={m} onClick={() => setMinuti(m)} className={`px-1.5 rounded ${m === minuti ? 'bg-sky-900 text-sky-200' : 'hover:text-slate-200'}`}>{m} min</button>
+          ))}
+          {' '}· adesso <b className="text-sky-300">{ultimo.toFixed(1)}%</b> ({ultimo >= media ? 'call più care' : 'put più care'} della media di oggi)
+          {' '}· <span className="text-yellow-400">— SPX</span> (scala sua)
+        </span>
         <span>{p[p.length - 1].time}</span>
       </div>
     </div>
