@@ -91,6 +91,8 @@ export default function SpxScannerPage() {
     const [dteMax, setDteMax] = useState(90);
     const [range, setRange] = useState(300);
     const [minimo, setMinimo] = useState(200);
+    // Schermata dei vertical della sessione notturna/mattina: dalle 15:30 la pagina passa alla cash e li nasconde.
+    const [mattina, setMattina] = useState(false);
     const grafico = useRef<any>(null);
     const ultimaFirma = useRef('');
     // SPX live da /api/market (punto piu' recente), arrotondato al punto per non
@@ -270,6 +272,8 @@ export default function SpxScannerPage() {
                 <label className="text-sm">DTE ≤ <input type="number" className={`${sel} w-16`} value={dteMax} onChange={e => setDteMax(+e.target.value)} /></label>
                 <label className="text-sm">ATM ± <input type="number" step={50} className={`${sel} w-20`} value={range} onChange={e => setRange(+e.target.value)} /></label>
                 <div className="ml-auto flex gap-2">
+                    <button onClick={() => setMattina(true)} className="px-3 py-1.5 bg-blue-900 hover:bg-blue-800 border border-blue-700 rounded-lg text-xs"
+                        title="Vertical 5/10 punti della sessione notturna e della mattina (prima dell'apertura cash)">VERTICAL MATTINA</button>
                     <a href="/hedging-pressure" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET MAKER</a>
                     <a href="/market" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">CHART</a>
                 </div>
@@ -332,6 +336,86 @@ export default function SpxScannerPage() {
                     ))}
                 </div>
             )}
+            {mattina && <VerticaliMattina giorno={giorno || dati?.giorno || ''} minimo={minimo} chiudi={() => setMattina(false)} />}
+        </div>
+    );
+}
+
+type Verticale = {
+    ts: number; sessione: string; classe: string; scadenza: string; tipo: 'C' | 'P'; kBasso: number; kAlto: number; larghezza: number;
+    size: number; prezzo: number | null; mid: number | null; verso: string; nome: string; condizioni: string | null;
+    basis: number | null; basisFonte: string; esBasso: number | null; esAlto: number | null;
+};
+
+/** Vertical 5/10 punti della sessione notturna (notte + mattina italiana) da /api/spx-scanner/verticali. */
+function VerticaliMattina({ giorno, minimo, chiudi }: { giorno: string; minimo: number; chiudi: () => void }) {
+    const [lista, setLista] = useState<Verticale[] | null>(null);
+    const [errore, setErrore] = useState<string | null>(null);
+    // la pagina passa una funzione nuova a ogni render: dal ref, cosi' non si ricarica a ogni aggiornamento
+    const chiudiRef = useRef(chiudi);
+    useEffect(() => { chiudiRef.current = chiudi; }, [chiudi]);
+    useEffect(() => {
+        let attivo = true;
+        const carica = async () => {
+            try {
+                const p = new URLSearchParams({ min: String(minimo) });
+                if (giorno) p.set('giorno', giorno);
+                const r = await fetch(`/api/spx-scanner/verticali?${p}`);
+                const j = await r.json();
+                if (!attivo) return;
+                if (!r.ok) { setErrore(j.error || `HTTP ${r.status}`); return; }
+                setErrore(null);
+                setLista((j.verticali as Verticale[]).filter(v => v.sessione === 'notturna'));
+            } catch (e: unknown) { if (attivo) setErrore(String(e)); }
+        };
+        carica();
+        const t = setInterval(carica, 30_000);
+        const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') chiudiRef.current(); };
+        window.addEventListener('keydown', esc);
+        return () => { attivo = false; clearInterval(t); window.removeEventListener('keydown', esc); };
+    }, [giorno, minimo]);
+    const colore = (v: Verticale) => v.verso === 'incerto' ? '#9ca3af' : v.nome.startsWith('BULL') ? '#34d399' : '#f43f5e';
+    const oggi = giorno.replaceAll('-', '');
+    return (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center p-4 overflow-y-auto" onClick={chiudi}>
+            <div className="bg-[#0f1520] border border-slate-700 rounded-lg w-full max-w-5xl p-4" onClick={e => e.stopPropagation()}>
+                <div className="flex items-center gap-3 mb-3">
+                    <h2 className="text-base font-bold">Vertical della mattina · {giorno} · sessione notturna · gambe ≥ {fmt(minimo)}</h2>
+                    <button onClick={chiudi} className="ml-auto px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded text-xs">CHIUDI (Esc)</button>
+                </div>
+                {errore && <div className="text-red-400 mb-2">{errore}</div>}
+                {!lista && !errore && <div className="text-gray-400 text-sm">Carico...</div>}
+                {lista && lista.length === 0 && <div className="text-gray-400 text-sm">Nessun vertical da 5 o 10 punti con gambe da almeno {fmt(minimo)} contratti nella sessione notturna.</div>}
+                {lista && lista.length > 0 && (
+                    <table className="w-full text-sm">
+                        <thead className="text-xs text-gray-400 border-b border-slate-700">
+                            <tr><th className="text-left p-1">Ora</th><th className="text-left p-1">Vertical</th><th className="text-left p-1">Tipo</th>
+                                <th className="text-center p-1">Strike SPX</th><th className="text-center p-1">Strike ES</th><th className="text-right p-1">Contratti</th>
+                                <th className="text-right p-1">Prezzo / mid</th><th className="text-left p-1">Scadenza</th></tr>
+                        </thead>
+                        <tbody>
+                            {lista.map((v, i) => (
+                                <tr key={i} className="border-b border-slate-800">
+                                    <td className="p-1">{oraIt(v.ts, true)}</td>
+                                    <td className="p-1 font-bold" style={{ color: colore(v) }}>{v.nome}</td>
+                                    <td className="p-1" style={{ color: v.tipo === 'C' ? '#3b82f6' : '#f97316' }}>{v.tipo === 'C' ? 'call' : 'put'} {v.larghezza} pt</td>
+                                    <td className="p-1 text-center">{v.kBasso} / {v.kAlto}</td>
+                                    <td className="p-1 text-center text-gray-300">{v.esBasso == null ? 'n.d.' : `${v.esBasso.toFixed(2)} / ${v.esAlto!.toFixed(2)}`}
+                                        {v.basisFonte !== 'momento' && <span className="text-gray-500" title={`basis ${v.basis} (${v.basisFonte})`}> *</span>}</td>
+                                    <td className="p-1 text-right font-bold">{fmt(v.size)}</td>
+                                    <td className="p-1 text-right">{v.prezzo ?? 'n.d.'} / {v.mid ?? 'n.d.'}</td>
+                                    <td className="p-1">{v.classe} {v.scadenza === oggi ? '0DTE' : `${v.scadenza.slice(6, 8)}/${v.scadenza.slice(4, 6)}`}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+                <div className="text-[11px] text-gray-500 mt-3">
+                    Due stampe stesso tipo e scadenza, stessa quantità, strike a 5 o 10 punti, entro 1 s. Verso dal prezzo del pacchetto contro il mid prima del trade
+                    (BULL verde, BEAR rosso, grigio = al mid o senza quote). Aperti o chiusi non si sa. * = strike ES con la basis dell&apos;ultima sessione cash
+                    (di notte SPX non quota). Si aggiorna ogni 30 s; la soglia è quella della pagina.
+                </div>
+            </div>
         </div>
     );
 }
