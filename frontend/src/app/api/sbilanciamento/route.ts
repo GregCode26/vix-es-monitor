@@ -6,21 +6,26 @@ export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 /**
- * Pagina di prova `/sbilanciamento` (11/11/2026): call e put SPX 0DTE alla stessa distanza dall'ATM.
+ * Pagina di prova `/sbilanciamento` (11/11/2026, vertical dal 12/11): vertical SPX 0DTE da 5 punti alla
+ * stessa distanza dall'ATM, call sopra contro put sotto, confrontati al mid.
  *
  * Nessun dato nuovo: legge `data/catena/quote.json`, gli ultimi bid/ask dei 37 strike che il poller dei
- * volumi riscrive ogni 10 s. Il centro e' il forward da put-call parity (`smile.fwd`), non lo spot: su
- * 0DTE differiscono di poco, ma centrando sullo spot uno scarto di 1-2 punti basterebbe a far sembrare
- * piu' care le call o le put vicino all'ATM. Si usano gli strike veri (prezzi senza interpolazione), a
- * coppie simmetriche attorno al punto della griglia da 2.5 piu' vicino al forward.
+ * volumi riscrive ogni 10 s. Il centro e' il punto della griglia da 2.5 piu' vicino al forward da put-call
+ * parity (`smile.fwd`), non lo spot: centrando sullo spot uno scarto di 1-2 punti basterebbe a sbilanciare
+ * le coppie vicino all'ATM. Per ogni distanza d (dal centro allo strike vicino del vertical):
+ *   call vertical  centro+d / centro+d+5  = mid C(centro+d) - mid C(centro+d+5)
+ *   put vertical   centro-d / centro-d-5  = mid P(centro-d) - mid P(centro-d-5)
+ * Un vertical da 5 vale circa 5 x la probabilita' (neutrale al rischio) che SPX chiuda oltre la sua
+ * meta': il confronto dice se il mercato prezza piu' probabile arrivare a +d o a -d.
  *
- * Bilanciati = i due intervalli bid-ask si sovrappongono: con quei prezzi non si puo' dire quale costi
- * di piu'. Altrimenti il lato piu' caro e lo scarto in % del prezzo medio della coppia. Sotto 0.10 di
- * mid le opzioni sono a pochi tick e il confronto non vale ('troppo economiche').
+ * Bilanciati = mid entro 0.05 (un tick) l'uno dall'altro. Altrimenti il lato piu' caro e lo scarto in %
+ * del mid medio della coppia. Sotto 0.10 di mid il confronto non vale ('troppo economiche'). Bid/ask
+ * del vertical = i prezzi naturali (bid vicino - ask lontano, ask vicino - bid lontano), solo per vederli.
  *
  * Ogni nuova lettura di quote.json (solo di oggi) aggiunge una riga riassuntiva a
- * `data/sbilanciamento/YYYY-MM-DD.ndjson`, per poter verificare dopo se lo sbilanciamento anticipa
- * SPX. La storia c'e' solo per i momenti in cui qualcuno ha chiamato la route (pagina aperta).
+ * `data/sbilanciamento/YYYY-MM-DD.ndjson` (`tipo: 'vertical'`; le righe dell'11/11 senza `tipo` erano sulle
+ * singole opzioni), per poter verificare dopo se lo sbilanciamento anticipa SPX. La storia c'e' solo per
+ * i momenti in cui qualcuno ha chiamato la route (pagina aperta).
  */
 
 function cartellaDati() {
@@ -33,15 +38,17 @@ type Quote = { date: string; time: string; spot: number | null; expiry: string; 
 
 export type Riga = {
     d: number;
-    kPut: number; kCall: number;
-    put: { bid: number; ask: number; mid: number; iv: number | null };
-    call: { bid: number; ask: number; mid: number; iv: number | null };
+    /** strike vicino e lontano di ciascun vertical */
+    kPut: number; kPut2: number; kCall: number; kCall2: number;
+    put: { bid: number; ask: number; mid: number };
+    call: { bid: number; ask: number; mid: number };
     stato: 'bilanciati' | 'call' | 'put' | 'economiche';
-    /** (call - put) / media dei due mid, in %: + = call piu' care. */
+    /** (call vertical - put vertical) / media dei due mid, in %: + = call piu' care. */
     scarto: number;
 };
 
 export type Lettura = {
+    tipo?: 'vertical';
     time: string; spot: number | null; fwd: number;
     /** centro delle coppie sulla griglia da 2.5 (uno strike o il punto fra due) */
     centro: number;
@@ -62,33 +69,34 @@ function calcola(q: Quote): { righe: Riga[]; lettura: Lettura } | null {
     const s = [...q.strikes].sort((a, b) => a.strike - b.strike);
     const fwd = q.smile?.fwd ?? q.spot;
     if (!fwd || s.length < 3) return null;
-    // Strike veri della catena: il centro e' il punto della griglia da 2.5 piu' vicino al forward. Se cade su
-    // uno strike le coppie sono centro -5/+5, -10/+10...; se cade a meta' fra due strike, -2.5/+2.5, -7.5/+7.5...
-    // Cosi' la coppia resta simmetrica attorno al forward entro 1.25 punti.
     const centro = Math.round(fwd / 2.5) * 2.5;
     const perStrike = new Map(s.map((x) => [x.strike, x]));
-    const partenza = perStrike.has(centro) ? 5 : 2.5;
+    const partenza = perStrike.has(centro) ? 0 : 2.5;
     const righe: Riga[] = [];
     for (let d = partenza; d <= 100; d += 5) {
-        const P = perStrike.get(centro - d), C = perStrike.get(centro + d);
-        if (!P || !C) continue;
-        const pb = P.pBid, pa = P.pAsk, cb = C.cBid, ca = C.cAsk;
-        if (!valido(pb) || !valido(pa) || !valido(cb) || !valido(ca) || pa < pb || ca < cb) continue;
-        const pm = (pb + pa) / 2, cm = (cb + ca) / 2;
-        const scarto = ((cm - pm) / ((cm + pm) / 2)) * 100;
+        const P = perStrike.get(centro - d), P2 = perStrike.get(centro - d - 5);
+        const C = perStrike.get(centro + d), C2 = perStrike.get(centro + d + 5);
+        if (!P || !P2 || !C || !C2) continue;
+        const q4 = [P.pBid, P.pAsk, P2.pBid, P2.pAsk, C.cBid, C.cAsk, C2.cBid, C2.cAsk];
+        if (!q4.every(valido)) continue;
+        const [pb, pa, p2b, p2a, cb, ca, c2b, c2a] = q4 as number[];
+        if (pa < pb || p2a < p2b || ca < cb || c2a < c2b) continue;
+        const pm = (pb + pa) / 2 - (p2b + p2a) / 2, cm = (cb + ca) / 2 - (c2b + c2a) / 2;
+        const media = (cm + pm) / 2;
+        const scarto = media > 0 ? ((cm - pm) / media) * 100 : 0;
         const stato: Riga['stato'] = pm < 0.1 || cm < 0.1 ? 'economiche'
-            : cb <= pa && pb <= ca ? 'bilanciati' : cm > pm ? 'call' : 'put';
+            : Math.abs(cm - pm) <= 0.05 + 1e-9 ? 'bilanciati' : cm > pm ? 'call' : 'put';
         righe.push({
-            d, kPut: P.strike, kCall: C.strike,
-            put: { bid: pb, ask: pa, mid: r2(pm), iv: P.pIvS ?? null },
-            call: { bid: cb, ask: ca, mid: r2(cm), iv: C.cIvS ?? null },
+            d, kPut: P.strike, kPut2: P2.strike, kCall: C.strike, kCall2: C2.strike,
+            put: { bid: r2(Math.max(0, pb - p2a)), ask: r2(pa - p2b), mid: r2(pm) },
+            call: { bid: r2(Math.max(0, cb - c2a)), ask: r2(ca - c2b), mid: r2(cm) },
             stato, scarto: r2(scarto),
         });
     }
     const conf = righe.filter((r) => r.stato !== 'economiche');
     const primo = conf.find((r) => r.stato === 'call' || r.stato === 'put');
     const lettura: Lettura = {
-        time: q.time, spot: q.spot, fwd: r2(fwd), centro,
+        tipo: 'vertical', time: q.time, spot: q.spot, fwd: r2(fwd), centro,
         indice: conf.length ? r2(conf.reduce((t, r) => t + r.scarto, 0) / conf.length) : null,
         bilanciati: conf.filter((r) => r.stato === 'bilanciati').length,
         confrontabili: conf.length,
@@ -116,7 +124,7 @@ export async function GET() {
     const file = path.join(cartella, `${q.date}.ndjson`);
     let storia: Lettura[] = [];
     try {
-        if (fs.existsSync(file)) storia = fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+        if (fs.existsSync(file)) storia = fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Lettura).filter((l) => l.tipo === 'vertical');
     } catch { storia = []; }
     if (q.date === oggiRoma() && storia[storia.length - 1]?.time !== q.time) {
         try {

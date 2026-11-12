@@ -129,9 +129,9 @@ export default function SbilanciamentoPage() {
       <div className="max-w-5xl mx-auto space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h1 className="text-xl font-bold">Sbilanciamento call / put <span className="text-xs font-normal text-amber-400 align-middle">IN PROVA</span></h1>
+            <h1 className="text-xl font-bold">Sbilanciamento vertical call / put <span className="text-xs font-normal text-amber-400 align-middle">IN PROVA</span></h1>
             <div className="text-xs text-slate-400">
-              SPX 0DTE {dati?.expiry ?? ''} · call sopra contro put sotto, stessa distanza dal centro · ogni 10 s
+              SPX 0DTE {dati?.expiry ?? ''} · vertical da 5 punti al mid, call sopra contro put sotto, stessa distanza dal centro · ogni 10 s
               {l && <> · dati delle {l.time} · SPX {fmt(l.spot)} · forward {fmt(l.fwd)} · centro {l.centro}</>}
             </div>
           </div>
@@ -146,14 +146,14 @@ export default function SbilanciamentoPage() {
               <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Ai prezzi di adesso</div>
               <div className="text-lg font-semibold">
                 {l.inizio
-                  ? <>Più care le <span style={{ color: l.inizio.lato === 'call' ? VERDE : ROSSO }}>{l.inizio.lato === 'call' ? 'CALL (sopra)' : 'PUT (sotto)'}</span>, da {l.inizio.d} punti</>
+                  ? <>Più care le <span style={{ color: l.inizio.lato === 'call' ? VERDE : ROSSO }}>{l.inizio.lato === 'call' ? 'CALL vertical (sopra)' : 'PUT vertical (sotto)'}</span>, {l.inizio.d === 0 ? "già dall'ATM" : `da ${l.inizio.d} punti`}</>
                   : <span className="text-slate-300">Bilanciate su tutte le distanze</span>}
               </div>
               <div className="text-sm text-slate-300 mt-1">
                 {l.bilanciati} bilanciate su {l.confrontabili} · {l.put} con put più care · {l.call} con call più care · scarto medio{' '}
                 <b style={{ color: (l.indice ?? 0) >= 0 ? VERDE : ROSSO }}>{fmt(l.indice, 1)}%</b>
               </div>
-              <div className="text-[11px] text-slate-500 mt-2">Sulle SPX le put lontane costano quasi sempre più delle call (skew): questa riga da sola dice &quot;put più care&quot; quasi ogni giorno.</div>
+              <div className="text-[11px] text-slate-500 mt-2">Un vertical da 5 vale circa 5 × la probabilità che SPX chiuda oltre la sua metà: qui si confronta quanto il mercato paga arrivare a +d contro −d. Con lo skew SPX i vertical put lontani di solito costano di più.</div>
             </div>
             <div className="p-4 rounded-lg bg-slate-900 border border-slate-800">
               <div className="text-[11px] uppercase tracking-wide text-slate-400 mb-1">Rispetto al solito (giorni passati, stessa ora)</div>
@@ -177,9 +177,9 @@ export default function SbilanciamentoPage() {
             <table className="w-full text-sm">
               <thead className="text-[11px] uppercase text-slate-400">
                 <tr className="border-b border-slate-800">
-                  <th className="p-2 text-right">Put a</th><th className="p-2 text-right">bid / ask</th><th className="p-2 text-right">IV</th>
+                  <th className="p-2 text-right">Put vertical</th><th className="p-2 text-right">bid / ask</th><th className="p-2 text-right">mid</th>
                   <th className="p-2 text-center">Dist.</th>
-                  <th className="p-2 text-left">IV</th><th className="p-2 text-left">bid / ask</th><th className="p-2 text-left">Call a</th>
+                  <th className="p-2 text-left">mid</th><th className="p-2 text-left">bid / ask</th><th className="p-2 text-left">Call vertical</th>
                   <th className="p-2 text-center w-56">Scarto (call − put)</th><th className="p-2 text-left">Stato</th>
                 </tr>
               </thead>
@@ -189,13 +189,13 @@ export default function SbilanciamentoPage() {
                   const c = coloreStato(r.stato);
                   return (
                     <tr key={r.d} className="border-b border-slate-800/60">
-                      <td className="p-2 text-right text-slate-300">{r.kPut}</td>
+                      <td className="p-2 text-right text-slate-300">{r.kPut} / {r.kPut2}</td>
                       <td className="p-2 text-right" style={{ color: r.stato === 'put' ? ROSSO : undefined }}>{fmt(r.put.bid)} / {fmt(r.put.ask)}</td>
-                      <td className="p-2 text-right text-slate-500">{fmt(r.put.iv, 1)}</td>
+                      <td className="p-2 text-right font-semibold" style={{ color: r.stato === 'put' ? ROSSO : undefined }}>{fmt(r.put.mid)}</td>
                       <td className="p-2 text-center font-semibold">±{r.d}</td>
-                      <td className="p-2 text-left text-slate-500">{fmt(r.call.iv, 1)}</td>
+                      <td className="p-2 text-left font-semibold" style={{ color: r.stato === 'call' ? VERDE : undefined }}>{fmt(r.call.mid)}</td>
                       <td className="p-2 text-left" style={{ color: r.stato === 'call' ? VERDE : undefined }}>{fmt(r.call.bid)} / {fmt(r.call.ask)}</td>
-                      <td className="p-2 text-left text-slate-300">{r.kCall}</td>
+                      <td className="p-2 text-left text-slate-300">{r.kCall} / {r.kCall2}</td>
                       <td className="p-2">
                         <div className="relative h-3 bg-slate-800 rounded">
                           <div className="absolute top-0 bottom-0 w-px bg-slate-500" style={{ left: '50%' }} />
@@ -205,7 +205,7 @@ export default function SbilanciamentoPage() {
                         <div className="text-[10px] text-center text-slate-400">{r.scarto > 0 ? '+' : ''}{r.scarto.toFixed(1)}%</div>
                       </td>
                       <td className="p-2 text-xs" style={{ color: c }}>
-                        {r.stato === 'bilanciati' ? 'bilanciate' : r.stato === 'economiche' ? 'troppo economiche' : r.stato === 'call' ? 'call più care' : 'put più care'}
+                        {r.stato === 'bilanciati' ? 'bilanciati' : r.stato === 'economiche' ? 'troppo economiche' : r.stato === 'call' ? 'call più care' : 'put più care'}
                       </td>
                     </tr>
                   );
@@ -213,8 +213,8 @@ export default function SbilanciamentoPage() {
               </tbody>
             </table>
             <div className="p-2 text-[11px] text-slate-500">
-              Bilanciate = gli intervalli bid-ask si sovrappongono (con quei prezzi non si può dire quale costi di più). Strike SPX veri, a coppie simmetriche attorno al centro (lo strike o il punto fra due strike più vicino al forward).
-              Sotto 0,10 di prezzo il confronto non vale.
+              Vertical da 5 punti: put = P(vicino) − P(lontano), call = C(vicino) − C(lontano), al mid. Bilanciate = mid entro 0,05 (un tick). Bid/ask = prezzi naturali del vertical, solo indicativi.
+              Strike SPX veri, a coppie simmetriche attorno al centro (lo strike o il punto fra due strike più vicino al forward); Dist. = dal centro allo strike vicino. Sotto 0,10 di mid il confronto non vale.
             </div>
           </div>
         )}
