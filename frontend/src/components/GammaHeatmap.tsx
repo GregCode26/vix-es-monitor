@@ -32,6 +32,12 @@ export interface FotografiaGamma {
   gexOi: number[];
   /** GEX dei dealer dal flusso Lee-Ready; assente nelle risposte di prima che la route lo calcolasse. */
   gexLr?: number[];
+  /** Contratti netti comprati dai clienti per strike (call + put, Lee-Ready): per le coperture teoriche. */
+  lrNet?: number[];
+  /** 1 sigma alla scadenza in punti SPX. */
+  sd?: number | null;
+  /** Lo spot della fotografia. */
+  px?: number | null;
 }
 
 /** Call comprate, call vendute, put comprate, put vendute (Lee-Ready, oggi). */
@@ -62,6 +68,8 @@ interface Props {
   spx?: { time: string; price: number }[];
   /** Minuti da mostrare fino all'ultimo dato, o tutta la sessione. */
   finestraMin: number | 'all';
+  /** Con la base Lee-Ready: le linee delle coperture teoriche dei market maker. */
+  coperture?: boolean;
 }
 
 /** Larghezza del kernel, in passi fra strike: abbastanza da fondere strike vicini in una macchia, non da cancellarli. */
@@ -140,6 +148,17 @@ function dollari(vM: number, decimali = 2) {
 }
 
 /** Passo "tondo" per circa `quanti` intervalli su `ampiezza`. */
+/** Normale cumulata (Abramowitz-Stegun 7.1.26 sull'erf, errore < 1.5e-7). */
+function normale(x: number) {
+  const z = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * z);
+  const erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
+  return x >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+}
+
+/** Le curve delle coperture, in ES per punto: 1, 2 e 3 volte il passo. */
+const SOGLIE_COPERTURA = 3;
+
 function passoTondo(ampiezza: number, quanti: number, passi: number[]) {
   const grezzo = ampiezza / quanti;
   return passi.find((p) => p >= grezzo) ?? passi[passi.length - 1];
@@ -176,7 +195,7 @@ interface Geometria {
   foto: number[][];
 }
 
-export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx = NESSUN_PREZZO, finestraMin, inizioLr = null, conti }: Props) {
+export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx = NESSUN_PREZZO, finestraMin, inizioLr = null, conti, coperture = false }: Props) {
   const contenitore = useRef<HTMLDivElement | null>(null);
   const tela = useRef<HTMLCanvasElement | null>(null);
   const [dimensioni, setDimensioni] = useState<{ w: number; h: number } | null>(null);
@@ -552,6 +571,145 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
       ctx.fillText(fine.sec >= inizioSpx ? 'SPX' : 'SPX (spot IBKR)', xPix(fine.sec) + 6, yPix(fine.price) - 4);
       ctx.font = '11px Arial';
     }
+
+    // ─── Coperture teoriche dei market maker (base Lee-Ready, 12/11/2026) ───
+    // Per ogni fotografia: i clienti hanno comprato netti c_k contratti sullo strike K, il dealer ha
+    // l'opposto. Delta di call e put da N((y-K)/sd) (differiscono di 1, che nelle variazioni sparisce),
+    // sigma ATM alla scadenza (sd) dal gamma, senza drift ne' smile: stima teorica.
+    //  - Nel tempo, curve degli ES per punto che il dealer scambia se SPX passa da quel livello:
+    //    2 x sum c_k phi(z)/sd (x100 indice /50 ES). Positivo = dealer corto gamma, compra se sale e vende
+    //    se scende (insegue il prezzo); negativo = lungo gamma, fa il contrario (lo frena). E' un campo
+    //    fisso sui prezzi: il cumulato dal prezzo di ogni momento saltava a ogni fotografia.
+    //  - Adesso, a destra: gli ES cumulati da comprare/vendere se SPX arriva a +-10, 20, 30, 40 punti.
+    // Il 12/11 su 11 sedute questa copertura non si ritrovava nel delta aggressivo ES di Bookmap
+    // (prevista 5-60 volte piu' grande).
+    let notaCoperture: string | null = null;
+    if (chiave === 'gexLr' && coperture) {
+      const daLr = inizioLr ? secondi(inizioLr) : 0;
+      const fc = serie
+        .map((f) => ({ sec: secondi(f.time), net: f.lrNet, sd: f.sd ?? null, px: f.px ?? null }))
+        .filter((f): f is { sec: number; net: number[]; sd: number; px: number } =>
+          Number.isFinite(f.sec) && f.sec >= daLr && Array.isArray(f.net) && f.net.length === strikes.length && f.sd != null && f.sd > 0 && f.px != null)
+        .sort((a, b) => a.sec - b.sec);
+      const perPunto = (f: { net: number[]; sd: number }, y: number) => {
+        let h = 0;
+        for (let k = 0; k < strikes.length; k++) {
+          const c = f.net[k];
+          if (!c) continue;
+          const z = (y - strikes[k]) / f.sd;
+          h += (c * Math.exp(-0.5 * z * z)) / (2.5066282746 * f.sd);
+        }
+        return 2 * h;
+      };
+      const cumulato = (f: { net: number[]; sd: number; px: number }, y: number) => {
+        let h = 0;
+        for (let k = 0; k < strikes.length; k++) {
+          const c = f.net[k];
+          if (c) h += c * (normale((y - strikes[k]) / f.sd) - normale((f.px - strikes[k]) / f.sd));
+        }
+        return 2 * h;
+      };
+      // Il passo delle curve si fissa sulla giornata, non sulla vista: la stessa curva vuol dire la
+      // stessa quantita' a ogni zoom. Sulla mediana, non sul massimo: verso la chiusura la sigma si
+      // stringe e i numeri esplodono, e un passo tarato li' lascerebbe vuoto il resto della seduta.
+      const tipici = fc
+        .map((f) => Math.max(...[-20, -10, 0, 10, 20].map((d) => Math.abs(perPunto(f, f.px + d)))))
+        .sort((x, y) => x - y);
+      const mediana = tipici[Math.floor(tipici.length / 2)] ?? 0;
+      const passoPt = passoTondo(mediana, 2, [10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000]);
+
+      const colonneC = Math.max(40, Math.min(240, Math.round(area.w / 4)));
+      const righeC = Math.max(40, Math.min(200, Math.round(area.h / 3)));
+      const campo = new Float32Array(colonneC * righeC).fill(NaN);
+      for (let c2 = 0; c2 < colonneC; c2++) {
+        const t = t0 + ((c2 + 0.5) / colonneC) * (t1 - t0);
+        let lo = -1;
+        let hi = fc.length - 1;
+        while (lo < hi) {
+          const m = (lo + hi + 1) >> 1;
+          if (fc[m].sec <= t) lo = m;
+          else hi = m - 1;
+        }
+        if (lo < 0 || t > ultimo + 60) continue;
+        // Fra due fotografie si interpola, cosi' i contorni non fanno scalini ogni due minuti.
+        const a = fc[lo];
+        const b = fc[Math.min(lo + 1, fc.length - 1)];
+        const q = b.sec > a.sec ? Math.min(1, (t - a.sec) / (b.sec - a.sec)) : 0;
+        const f = { net: a.net.map((v, i) => v + (b.net[i] - v) * q), sd: a.sd + (b.sd - a.sd) * q };
+        for (let r = 0; r < righeC; r++) {
+          const y = yMax - ((r + 0.5) / righeC) * (yMax - yMin);
+          campo[r * colonneC + c2] = perPunto(f, y);
+        }
+      }
+      const cwC = area.w / colonneC;
+      const chC = area.h / righeC;
+      const curvaC = (livello: number) => {
+        ctx.beginPath();
+        for (let r = 0; r < righeC - 1; r++) {
+          for (let c2 = 0; c2 < colonneC - 1; c2++) {
+            const a = campo[r * colonneC + c2];
+            const b = campo[r * colonneC + c2 + 1];
+            const d = campo[(r + 1) * colonneC + c2];
+            const e = campo[(r + 1) * colonneC + c2 + 1];
+            if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(d) || !Number.isFinite(e)) continue;
+            const punti: [number, number][] = [];
+            const lato = (v1: number, v2: number, x1: number, y1: number, x2: number, y2: number) => {
+              if ((v1 - livello) * (v2 - livello) < 0) {
+                const s2 = (livello - v1) / (v2 - v1);
+                punti.push([x1 + (x2 - x1) * s2, y1 + (y2 - y1) * s2]);
+              }
+            };
+            lato(a, b, c2, r, c2 + 1, r);
+            lato(b, e, c2 + 1, r, c2 + 1, r + 1);
+            lato(d, e, c2, r + 1, c2 + 1, r + 1);
+            lato(a, d, c2, r, c2, r + 1);
+            for (let i = 0; i + 1 < punti.length; i += 2) {
+              ctx.moveTo(area.x + (punti[i][0] + 0.5) * cwC, area.y + (punti[i][1] + 0.5) * chC);
+              ctx.lineTo(area.x + (punti[i + 1][0] + 0.5) * cwC, area.y + (punti[i + 1][1] + 0.5) * chC);
+            }
+          }
+        }
+        ctx.stroke();
+      };
+      for (let k = 1; k <= SOGLIE_COPERTURA; k++) {
+        ctx.lineWidth = 0.8 + k * 0.5;
+        // Arancio = dealer corto gamma (insegue il prezzo), azzurro = lungo gamma (lo frena).
+        ctx.strokeStyle = `rgba(251, 146, 60, ${0.45 + k * 0.17})`;
+        curvaC(k * passoPt);
+        ctx.strokeStyle = `rgba(56, 189, 248, ${0.45 + k * 0.17})`;
+        curvaC(-k * passoPt);
+      }
+
+      // La scala di adesso sul bordo destro: ES cumulati se SPX arriva a quel livello.
+      const ora = fc[fc.length - 1];
+      if (ora) {
+        ctx.font = '10px Arial';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        const xs = Math.min(area.x + area.w - 4, xPix(ultimo) - 4);
+        // Ogni 10 punti, o di piu' se la scala e' stretta: le etichette non si accavallano.
+        const pxPerPunto = area.h / (yMax - yMin);
+        const passoScala = [10, 20, 25, 50].find((p) => p * pxPerPunto >= 13) ?? 50;
+        for (const d of [-4, -3, -2, -1, 1, 2, 3, 4].map((i) => i * passoScala)) {
+          const y = ora.px + d;
+          if (y < yMin || y > yMax) continue;
+          const v = cumulato(ora, y);
+          const testo = `${v > 0 ? 'compra' : 'vende'} ${Math.abs(Math.round(v / 10) * 10).toLocaleString('it-IT')} ES`;
+          const w = ctx.measureText(testo).width + 6;
+          ctx.fillStyle = 'rgba(11, 12, 17, 0.8)';
+          ctx.fillRect(xs - w, yPix(y) - 6, w + 2, 12);
+          ctx.fillStyle = v > 0 ? '#4ade80' : '#f87171';
+          ctx.fillText(testo, xs, yPix(y));
+          ctx.fillRect(xs + 1, yPix(y) - 0.5, 4, 1);
+        }
+        ctx.font = '11px Arial';
+        const qui = perPunto(ora, ora.px);
+        const verso = qui > 0 ? 'compra se sale, vende se scende' : 'vende se sale, compra se scende';
+        notaCoperture = `Coperture MM teoriche, non verificate · curve ogni ${passoPt.toLocaleString('it-IT')} ES per punto: arancio corti gamma (inseguono il prezzo), azzurro lunghi (lo frenano) · a destra ES cumulati se SPX arriva li' · adesso ${Math.abs(Math.round(qui)).toLocaleString('it-IT')} ES/punto, ${verso}`;
+      } else {
+        notaCoperture = 'Coperture teoriche MM: in attesa delle fotografie con i conti Lee-Ready';
+      }
+    }
     ctx.restore();
 
     // Il prezzo di adesso: tratteggiata su tutta l'area e cartellino sull'asse.
@@ -579,6 +737,12 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
         area.x + 8,
         area.y + 6,
       );
+    }
+    if (notaCoperture) {
+      ctx.fillStyle = 'rgba(190, 242, 100, 0.9)';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(notaCoperture, area.x + 8, area.y + 22);
     }
 
     // ─── Asse dei prezzi ───
@@ -665,7 +829,7 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
     geo.current = { area, t0, t1, yMin, yMax, griglia, colonne, righe, secFoto, foto };
     strato.current = s;
     dipingi();
-  }, [strikes, serie, base, profilo, spot, spx, finestraMin, inizioLr, dimensioni, vistaY, vistaX, ampiezza, dipingi]);
+  }, [strikes, serie, base, profilo, spot, spx, finestraMin, inizioLr, coperture, dimensioni, vistaY, vistaX, ampiezza, dipingi]);
 
   const fissaX = useCallback((v: { t0: number; t1: number } | null) => {
     vistaXRef.current = v;

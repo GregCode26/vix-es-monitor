@@ -43,6 +43,9 @@ interface Prezzo {
   price: number;
 }
 
+/** Contratti netti comprati dai clienti, call + put. */
+const netto = (lr: ContiLr | undefined) => (lr ? lr[0] - lr[1] + lr[2] - lr[3] : 0);
+
 function secondi(hhmmss: string) {
   const [h, m, s] = hhmmss.split(':').map(Number);
   return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
@@ -85,6 +88,9 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
   const [profilo, setProfilo] = useState<RigaProfilo[]>([]);
   /** Da quando la route vede i conti Lee-Ready; si tiene il primo visto nella giornata. */
   const [inizioLr, setInizioLr] = useState<string | null>(null);
+  /** 1 sigma alla scadenza in punti, dall'ultima risposta che lo porta: per la colonna di adesso. */
+  const [sd, setSd] = useState<number | null>(null);
+  const [coperture, setCoperture] = useState(true);
   const [spot, setSpot] = useState<Prezzo[]>([]);
   const [spx, setSpx] = useState<Prezzo[]>([]);
   const [base, setBase] = useState<Base>('gexOi');
@@ -139,6 +145,7 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
         const profiloIn: RigaProfilo[] = json.profile ?? [];
         if (profiloIn.length > 0) setProfilo(profiloIn);
         if (json.inizioLr) setInizioLr((prec) => prec ?? json.inizioLr);
+        if (typeof json.sd === 'number' && json.sd > 0) setSd(json.sd);
 
         if (primo) {
           if (Array.isArray(json.strikes)) {
@@ -169,6 +176,9 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
                   gex: ks.map((k) => Math.round(mappa.get(k)?.gex ?? 0)),
                   gexOi: ks.map((k) => Math.round(mappa.get(k)?.gexOi ?? 0)),
                   gexLr: ks.map((k) => Math.round(mappa.get(k)?.gexLr ?? 0)),
+                  lrNet: ks.map((k) => netto(mappa.get(k)?.lr)),
+                  sd: typeof json.sd === 'number' ? json.sd : null,
+                  px: spotIn[spotIn.length - 1].price,
                 },
               ];
             });
@@ -258,9 +268,12 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
         gex: strikes.map((k) => Math.round(mappa.get(k)?.gex ?? 0)),
         gexOi: strikes.map((k) => Math.round(mappa.get(k)?.gexOi ?? 0)),
         gexLr: strikes.map((k) => Math.round(mappa.get(k)?.gexLr ?? 0)),
+        lrNet: strikes.map((k) => netto(mappa.get(k)?.lr)),
+        sd,
+        px: spot[spot.length - 1]?.price ?? null,
       },
     ];
-  }, [serie, spot, strikes, profilo]);
+  }, [serie, spot, strikes, profilo, sd]);
 
   return (
     <div className="flex flex-col h-full">
@@ -279,6 +292,15 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
           ]}
           onChange={setBase}
         />
+        {base === 'gexLr' && (
+          <button
+            onClick={() => setCoperture((c) => !c)}
+            title="Dove i market maker dovrebbero comprare o vendere ES per restare coperti, dalla loro posizione Lee-Ready: stima teorica, non verificata sui contratti eseguiti"
+            className={`px-2 py-0.5 rounded border ${coperture ? 'border-lime-400 text-lime-300 bg-lime-900/30' : 'border-slate-600 text-slate-400'}`}
+          >
+            Coperture MM
+          </button>
+        )}
         <Selettore<Finestra>
           valore={finestra}
           opzioni={[['all', 'Sessione'], [60, '60m'], [30, '30m']]}
@@ -304,6 +326,7 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
           finestraMin={finestra}
           inizioLr={inizioLr}
           conti={conti}
+          coperture={coperture}
         />
       </div>
     </div>

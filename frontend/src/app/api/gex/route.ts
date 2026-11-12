@@ -118,6 +118,15 @@ interface SerieFrame {
     gex: number[];
     gexOi: number[];
     gexLr: number[];
+    /**
+     * Per le coperture teoriche sulla mappa Lee-Ready (12/11/2026): contratti netti comprati dai
+     * clienti per strike, call + put, (cb-cs)+(pb-ps). Il dealer ha l'opposto.
+     */
+    lrNet: number[];
+    /** 1 sigma alla scadenza in punti SPX, dal gamma dello strike piu' vicino allo spot (0.3989 / gamma). */
+    sd: number | null;
+    /** Lo spot a cui e' valutata la fotografia. */
+    px: number | null;
 }
 
 /** Quanto lontano indietro guardano i pallini storici. */
@@ -213,6 +222,11 @@ interface Netti {
  * snapshot con lo spot e la volatilita', quindi differenziare il GEX
  * spaccerebbe per flusso anche la semplice rivalutazione di posizioni ferme.
  */
+/** Contratti netti comprati dai clienti su uno strike, call + put; 0 senza conti Lee-Ready. */
+function nettoClienti(lr: [number, number, number, number] | undefined): number {
+    return lr ? lr[0] - lr[1] + lr[2] - lr[3] : 0;
+}
+
 function elaboraSnapshot(
     snapshots: Snapshot[],
     dateStr: string,
@@ -227,6 +241,7 @@ function elaboraSnapshot(
     serie: SerieFrame[];
     conLr: boolean;
     inizioLr: string | null;
+    sd: number | null;
 } {
     const points: GexPoint[] = [];
     const precedenti = new Map<number, Netti>(base ?? []);
@@ -261,7 +276,13 @@ function elaboraSnapshot(
     // La serie storica del profilo: una fotografia ogni SERIE_STEP_SEC, per
     // tutta la sessione. E' quella che permette di vedere un muro costruirsi
     // invece che trovarselo gia' fatto.
-    const fotografie: { time: string; mappa: Map<number, ProfileRow> }[] = [];
+    const fotografie: { time: string; mappa: Map<number, ProfileRow>; sd: number | null; px: number | null }[] = [];
+    /**
+     * La sigma alla scadenza in punti, dal gamma ATM: per un'opzione ATM gamma = phi(0) / (S sigma radq(T)),
+     * quindi S sigma radq(T) = 0.3989 / gamma. Evita di cercare la IV: il poller dei volumi non la salva.
+     */
+    let ultimoSd: number | null = null;
+    let ultimoPx: number | null = null;
     let ultimaSerieSec = -Infinity;
 
     for (const snap of snapshots) {
@@ -276,6 +297,16 @@ function elaboraSnapshot(
         if (!snap.esterno && snapSec - ultimoSpotSec >= SPOT_STEP_SEC) {
             spotSerie.push({ time: orario, price: spot });
             ultimoSpotSec = snapSec;
+        }
+
+        if (!snap.esterno) {
+            let vicino: StrikeRow | null = null;
+            for (const row of snap.volumes) {
+                if (row.gamma == null || !(row.gamma > 0)) continue;
+                if (!vicino || Math.abs(row.strike - spot) < Math.abs(vicino.strike - spot)) vicino = row;
+            }
+            if (vicino && Math.abs(vicino.strike - spot) <= 5) ultimoSd = 0.3989 / vicino.gamma!;
+            ultimoPx = spot;
         }
 
         for (const row of snap.volumes) {
@@ -321,7 +352,7 @@ function elaboraSnapshot(
             coda.push({ sec: snapSec, time: orario, rows: freschi(snapSec) });
         }
         if (conStorico && snapSec - ultimaSerieSec >= SERIE_STEP_SEC) {
-            fotografie.push({ time: orario, mappa: new Map(freschi(snapSec).map((r) => [r.strike, r])) });
+            fotografie.push({ time: orario, mappa: new Map(freschi(snapSec).map((r) => [r.strike, r])), sd: ultimoSd, px: ultimoPx });
             ultimaSerieSec = snapSec;
         }
         if (!snap.esterno) ultimoValido = { time: orario, price: spot };
@@ -359,7 +390,7 @@ function elaboraSnapshot(
     // L'ultima fotografia deve essere lo stato di adesso, non quella di due
     // minuti fa: e' il bordo destro del grafico.
     if (conStorico && ultimoValido && fotografie[fotografie.length - 1]?.time !== ultimoValido.time) {
-        fotografie.push({ time: ultimoValido.time, mappa: new Map(profiloFinale.map((r) => [r.strike, r])) });
+        fotografie.push({ time: ultimoValido.time, mappa: new Map(profiloFinale.map((r) => [r.strike, r])), sd: ultimoSd, px: ultimoPx });
     }
 
     // Gli strike si fissano solo qui: uno comparso a meta' sessione manca
@@ -371,6 +402,9 @@ function elaboraSnapshot(
         gex: strikes.map((s) => Math.round(f.mappa.get(s)?.gex ?? 0)),
         gexOi: strikes.map((s) => Math.round(f.mappa.get(s)?.gexOi ?? 0)),
         gexLr: strikes.map((s) => Math.round(f.mappa.get(s)?.gexLr ?? 0)),
+        lrNet: strikes.map((s) => nettoClienti(f.mappa.get(s)?.lr)),
+        sd: f.sd != null ? Math.round(f.sd * 100) / 100 : null,
+        px: f.px,
     }));
 
     return {
@@ -382,6 +416,7 @@ function elaboraSnapshot(
         serie,
         conLr: haLr,
         inizioLr,
+        sd: ultimoSd != null ? Math.round(ultimoSd * 100) / 100 : null,
     };
 }
 
@@ -586,7 +621,7 @@ export async function GET(request: Request) {
         // dieci minuti i pallini: dopo, il client ha gia' i profili che ha
         // ricevuto e se li tiene da solo. Con `since` la finestra e' larga
         // pochi secondi e non conterrebbe comunque niente.
-        const { points, profile, spot, profileHistory, strikes, serie, conLr, inizioLr } = elaboraSnapshot(snapshots, targetDate, base, !since);
+        const { points, profile, spot, profileHistory, strikes, serie, conLr, inizioLr, sd } = elaboraSnapshot(snapshots, targetDate, base, !since);
         // `lastTime` (sopra) e' l'ora di Roma dell'ultimo snapshot: il client
         // la rimanda come `since`.
 
@@ -620,7 +655,7 @@ export async function GET(request: Request) {
         // `profile` sostituisce quello che il client ha, non ci si somma: e'
         // gia' il totale di giornata. `points` invece si accoda.
         return NextResponse.json(
-            { date: targetDate, since, lastTime, points: finali, profile, spot, profileHistory, strikes, serie, conLr, inizioLr, troncato: tagliati },
+            { date: targetDate, since, lastTime, points: finali, profile, spot, profileHistory, strikes, serie, conLr, inizioLr, sd, troncato: tagliati },
             { status: 200 },
         );
     } catch (e: unknown) {
