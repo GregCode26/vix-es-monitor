@@ -3,7 +3,7 @@ import json
 import time
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 try:
@@ -26,6 +26,10 @@ load_dotenv()
 # progetto, perche' /api/market?history=true rilegge tutta la giornata a ogni
 # caricamento della pagina.
 POLL_INTERVAL = 15  # seconds
+# Oltre questi secondi senza un tick ES (bid/ask/last, ne arrivano di continuo) la sottoscrizione si rifa'.
+# Il 12/11/2026 alle 18:33 TWS ha perso e ripreso la connessione con IBKR (1102 "Dati conservati"):
+# VIX e SPX sono ripartiti, ES no, e il poller ha scritto 7654.62 fisso fino a sera.
+ES_FERMO_SEC = 120
 START_HOUR = 0
 END_HOUR = 23
 
@@ -478,6 +482,7 @@ def main():
 
     giorno_sessione = get_today_key()
     prossime_chiusure = 0
+    ultimo_rinnovo_es = time.time()
 
     while True:
         # A mezzanotte la sessione finisce: gli strike ATM e le scadenze
@@ -495,6 +500,21 @@ def main():
         
         # Ensure we process incoming IBKR messages to keep subscriptions alive
         ib.sleep(POLL_INTERVAL)
+
+        # ES fermo: dopo un 1102 IBKR puo' non riattaccare una sottoscrizione. Si rifa' (al piu' ogni
+        # ES_FERMO_SEC), solo nella finestra attiva: fuori, ES puo' essere fermo davvero (pausa CME).
+        if is_active and timestamp - ultimo_rinnovo_es >= ES_FERMO_SEC:
+            ultimo_tick = esf_ticker.time
+            fermo = ultimo_tick is None or (datetime.now(timezone.utc) - ultimo_tick).total_seconds() > ES_FERMO_SEC
+            if fermo:
+                print(f"[{now.strftime('%H:%M:%S')}] ES senza tick da oltre {ES_FERMO_SEC}s (ultimo {ultimo_tick}): rifaccio la sottoscrizione.")
+                try:
+                    ib.cancelMktData(esf_contract)
+                except Exception as e:
+                    print(f"cancelMktData ES: {e}")
+                esf_ticker = ib.reqMktData(esf_contract, '233', False, False)
+                ib.sleep(2)
+                ultimo_rinnovo_es = time.time()
 
         # Se IBKR non risponde si riprova fra 10 minuti, non a ogni giro.
         if timestamp >= prossime_chiusure and chiusure_da_aggiornare():
