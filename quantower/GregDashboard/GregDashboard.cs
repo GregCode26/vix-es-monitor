@@ -141,6 +141,15 @@ namespace GregDashboard
         [InputParameter("Conferma: inverti segnale", 48)]
         public bool InvertiConferme = false;
 
+        /// <summary>
+        /// "Short su spinta del VIX" (13/11/2026, IN PROVA): VIX +0,14 in 5 minuti -> SHORT, target 2 punti,
+        /// stop un tick sopra il primo muro ask Bookmap >= 100, trailing sul muro. Calcolato da /api/short-vix
+        /// (frontend/src/lib/shortVix.ts, stesse costanti di execution/studio_ingressi_2pt.py); qui solo disegnato,
+        /// con una freccia magenta (le conferme sono triangoli gialli).
+        /// </summary>
+        [InputParameter("Short su spinta VIX (in prova)", 49)]
+        public bool MostraShortVix = true;
+
         [InputParameter("Smile IV (SPX 0DTE)", 50)]
         public bool MostraSmile = true;
 
@@ -227,6 +236,20 @@ namespace GregDashboard
             public int? FineSec;
         }
 
+        /// <summary>Un'operazione di /api/short-vix. Entrata null = segnale senza operazione (niente muro).</summary>
+        private sealed class OperazioneVix
+        {
+            public int Sec;
+            public double DVix;
+            public double? Entrata;
+            public double? Target;
+            public List<(int sec, double prezzo)> Stop = new List<(int, double)>();
+            public string Uscita;
+            public int? FineSec;
+            public double? PrezzoUscita;
+            public double? Punti;
+        }
+
         private sealed class CampioneBook
         {
             public int Sec;
@@ -276,6 +299,9 @@ namespace GregDashboard
             /// <summary>Contesto della giornata: "GIORNATA AMPIA x1.20" e le righe delle misure.</summary>
             public string Attesa;
             public double AttesaRange;
+            /// <summary>Riga COR1M del contesto (vol.contesto.cor1m); arancio sotto 10 (in prova, studio_vol_commento.py).</summary>
+            public string Cor1mRiga;
+            public bool Cor1mSotto10;
             public List<string> VociContesto = new List<string>();
             public string UltimaRiga;
             public string Divergenza;
@@ -334,6 +360,9 @@ namespace GregDashboard
         /// <summary>Il mid Bookmap di ogni secondo della giornata, in ordine: serve alla conferma sui range.</summary>
         private readonly List<(int sec, double mid)> midGiorno = new List<(int, double)>();
         private volatile List<Conferma> confermePronte = new List<Conferma>();
+        private volatile List<OperazioneVix> operazioniVix = new List<OperazioneVix>();
+        private volatile string giornoVix;
+        private volatile string riassuntoVix;
         /// <summary>
         /// GEX+ / GEX- (strike SPX) come li ha visti l'indicatore, ogni 15 s: l'API da' solo il
         /// profilo di adesso, e rileggere la sessione intera da /api/gex vorrebbe dire scaricarla
@@ -438,6 +467,7 @@ namespace GregDashboard
             var prossimoGex = DateTime.MinValue;
             var prossimoSmile = DateTime.MinValue;
             var prossimoZg = DateTime.MinValue;
+            var prossimoVix = DateTime.MinValue;
             while (!token.IsCancellationRequested)
             {
                 var ora = DateTime.Now;
@@ -481,6 +511,11 @@ namespace GregDashboard
                         if (MostraZeroGamma) await LeggiZeroGamma(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("zero gamma"); });
                         prossimoZg = ora.AddSeconds(60);
                     }
+                    if (ora >= prossimoVix)
+                    {
+                        if (MostraShortVix) await LeggiShortVix(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("short vix"); });
+                        prossimoVix = ora.AddSeconds(15);
+                    }
                     if (MostraLiquidita || MostraAssorbimenti) await LeggiBookmap(token).ContinueWith(t => { if (t.IsFaulted) errori.Add("bookmap"); });
                     PubblicaLivelli();
 
@@ -492,6 +527,114 @@ namespace GregDashboard
                 }
                 try { await Task.Delay(2000, token); } catch (TaskCanceledException) { return; }
             }
+        }
+
+        private async Task LeggiShortVix(CancellationToken token)
+        {
+            using var doc = await Get("/api/short-vix", token);
+            if (doc == null) return;
+            var r = doc.RootElement;
+            var lista = new List<OperazioneVix>();
+            if (r.TryGetProperty("operazioni", out var ops) && ops.ValueKind == JsonValueKind.Array)
+                foreach (var o in ops.EnumerateArray())
+                {
+                    var op = new OperazioneVix
+                    {
+                        Sec = Secondi(Stringa(o, "t") ?? "00:00:00"),
+                        DVix = Numero(o, "dVix") ?? 0,
+                        Entrata = Numero(o, "entrata"),
+                        Target = Numero(o, "target"),
+                        Uscita = Stringa(o, "uscita"),
+                        PrezzoUscita = Numero(o, "prezzoUscita"),
+                        Punti = Numero(o, "punti"),
+                    };
+                    var fine = Stringa(o, "fine");
+                    if (fine != null) op.FineSec = Secondi(fine);
+                    if (o.TryGetProperty("stop", out var st) && st.ValueKind == JsonValueKind.Array)
+                        foreach (var s in st.EnumerateArray())
+                            if (s.ValueKind == JsonValueKind.Array && s.GetArrayLength() >= 2)
+                                op.Stop.Add((Secondi(s[0].GetString()), s[1].GetDouble()));
+                    lista.Add(op);
+                }
+            giornoVix = Stringa(r, "date");
+            if (r.TryGetProperty("riassunto", out var ri) && ri.ValueKind == JsonValueKind.Object)
+            {
+                var netto = Numero(ri, "nettoPunti") ?? 0;
+                riassuntoVix = $"Short spinta VIX (in prova): {Numero(ri, "vinte") ?? 0:0}/{Numero(ri, "chiuse") ?? 0:0} vinte, netto {netto:+0.00;-0.00} pt"
+                    + $" · {Numero(ri, "segnali") ?? 0:0} segnali, {Numero(ri, "senzaMuro") ?? 0:0} senza muro";
+            }
+            operazioniVix = lista;
+        }
+
+        /// <summary>Freccia magenta in giu' sull'entrata, target verde, stop trailing rosso a gradini, pallino all'uscita.</summary>
+        private void DisegnaShortVix(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
+        {
+            var lista = operazioniVix;
+            var giorno = giornoVix;
+            using var font = new Font("Arial", 8f, FontStyle.Bold);
+            var magenta = Color.FromArgb(240, 232, 121, 249);
+            using var pennello = new SolidBrush(magenta);
+            g.DrawString(riassuntoVix ?? "Short spinta VIX (in prova): in attesa di /api/short-vix", font, pennello, area.Left + 8, area.Bottom - 50);
+            if (lista.Count == 0 || giorno == null) return;
+            if (!DateTime.TryParseExact(giorno, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) return;
+            var modo = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var bordo = new Pen(Color.FromArgb(230, 15, 23, 42), 1f);
+            using var verde = new Pen(Color.FromArgb(220, 34, 197, 94), 1.5f) { DashStyle = DashStyle.Dot };
+            using var rosso = new Pen(Color.FromArgb(230, 239, 68, 68), 1.5f);
+            using var traccia = new Pen(Color.FromArgb(160, 232, 121, 249), 1f) { DashStyle = DashStyle.Dash };
+            using var sfondo = new SolidBrush(Color.FromArgb(200, 15, 23, 42));
+            foreach (var op in lista)
+            {
+                if (op.Entrata == null) continue;   // segnale senza muro: solo nel conteggio
+                var x = (float)conv.GetChartX(Utc(mezzanotte, op.Sec));
+                var x2 = op.FineSec != null ? (float)conv.GetChartX(Utc(mezzanotte, op.FineSec.Value)) : area.Right;
+                if (x2 < area.Left - 20 || x > area.Right + 20) continue;
+                x2 = Math.Max(x + 6, x2);
+                var y = (float)conv.GetChartY(op.Entrata.Value);
+                if (op.Target != null)
+                {
+                    var yT = (float)conv.GetChartY(op.Target.Value);
+                    g.DrawLine(verde, x, yT, x2, yT);
+                }
+                // stop trailing a gradini: ogni livello vale fino al cambio dopo
+                for (var k = 0; k < op.Stop.Count; k++)
+                {
+                    var xa = Math.Max(x, (float)conv.GetChartX(Utc(mezzanotte, op.Stop[k].sec)));
+                    var xb = k + 1 < op.Stop.Count ? (float)conv.GetChartX(Utc(mezzanotte, op.Stop[k + 1].sec)) : x2;
+                    var ys = (float)conv.GetChartY(op.Stop[k].prezzo);
+                    g.DrawLine(rosso, xa, ys, Math.Max(xa + 1, xb), ys);
+                    if (k + 1 < op.Stop.Count) g.DrawLine(rosso, xb, ys, xb, (float)conv.GetChartY(op.Stop[k + 1].prezzo));
+                }
+                // freccia in giu' con l'asta: punta sull'entrata, corpo sopra
+                const float r = 6, asta = 12;
+                var freccia = new[]
+                {
+                    new PointF(x, y), new PointF(x - r, y - r * 1.4f), new PointF(x - r / 3, y - r * 1.4f),
+                    new PointF(x - r / 3, y - r * 1.4f - asta), new PointF(x + r / 3, y - r * 1.4f - asta),
+                    new PointF(x + r / 3, y - r * 1.4f), new PointF(x + r, y - r * 1.4f),
+                };
+                g.FillPolygon(pennello, freccia);
+                g.DrawPolygon(bordo, freccia);
+                if (op.PrezzoUscita != null && op.FineSec != null)
+                {
+                    var xu = (float)conv.GetChartX(Utc(mezzanotte, op.FineSec.Value));
+                    var yu = (float)conv.GetChartY(op.PrezzoUscita.Value);
+                    g.DrawLine(traccia, x, y, xu, yu);
+                    var colore = op.Uscita == "target" ? Color.FromArgb(240, 34, 197, 94)
+                        : op.Uscita == "stop" ? Color.FromArgb(240, 239, 68, 68) : Color.FromArgb(240, 148, 163, 184);
+                    using var b = new SolidBrush(colore);
+                    g.FillEllipse(b, xu - 4, yu - 4, 8, 8);
+                    g.DrawEllipse(bordo, xu - 4, yu - 4, 8, 8);
+                }
+                var esito = op.Punti != null ? $"{op.Punti.Value:+0.00;-0.00}" : (op.Uscita ?? "aperta");
+                var testo = $"VIX +{op.DVix.ToString("0.00", CultureInfo.InvariantCulture)} SHORT {esito}";
+                var dim = g.MeasureString(testo, font);
+                var ty = y - r * 1.4f - asta - dim.Height - 2;
+                g.FillRectangle(sfondo, x - dim.Width / 2, ty, dim.Width, dim.Height);
+                g.DrawString(testo, font, pennello, x - dim.Width / 2, ty);
+            }
+            g.SmoothingMode = modo;
         }
 
         private async Task LeggiZeroGamma(CancellationToken token)
@@ -857,6 +1000,14 @@ namespace GregDashboard
                         var rel = (Numero(v, "rangeRelativo") ?? 1).ToString("0.00", CultureInfo.InvariantCulture);
                         d.VociContesto.Add($"{nome} {testo} ({Numero(v, "percentile") ?? 0}°) ×{rel}");
                     }
+                if (c.TryGetProperty("cor1m", out var k) && k.ValueKind == JsonValueKind.Object)
+                {
+                    var val = (Numero(k, "valore") ?? 0).ToString("0.00", CultureInfo.InvariantCulture);
+                    d.Cor1mSotto10 = k.TryGetProperty("sotto10", out var s10) && s10.ValueKind == JsonValueKind.True;
+                    d.Cor1mRiga = d.Cor1mSotto10
+                        ? $"COR1M {val} < 10 da {Numero(k, "giorniSotto") ?? 0}g · SPX 5g debole (in prova)"
+                        : $"COR1M {val}";
+                }
             }
             if (vol.TryGetProperty("ultima", out var u) && u.ValueKind == JsonValueKind.Object)
             {
@@ -1285,6 +1436,7 @@ namespace GregDashboard
                 if (MostraSmile) DisegnaSmile(g, area, conv);
                 if (MostraAssorbimenti) DisegnaAssorbimenti(g, area, conv);
                 if (MostraConferme) DisegnaConferme(g, area, conv);
+                if (MostraShortVix) DisegnaShortVix(g, area, conv);
 
                 var s = stato;
                 if (s != null)
@@ -2123,6 +2275,7 @@ namespace GregDashboard
                 righe.Add((true, s.Attesa == "AMPIA" ? SM_ARANCIO : s.Attesa == "STRETTA" ? SM_AZZURRO : ColorTranslator.FromHtml("#cbd5e1"),
                     $"GIORNATA {s.Attesa} ×{s.AttesaRange.ToString("0.00", CultureInfo.InvariantCulture)}"));
                 foreach (var v in s.VociContesto) righe.Add((false, chiaro, v));
+                if (s.Cor1mRiga != null) righe.Add((false, s.Cor1mSotto10 ? SM_ARANCIO : grigio, s.Cor1mRiga));
             }
             if (s.Bande != null)
             {

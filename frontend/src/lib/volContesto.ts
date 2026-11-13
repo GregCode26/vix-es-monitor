@@ -17,6 +17,11 @@
  *   (scritte da `tws_poller.py`) contro i percentili dal 2022
  *   (`volCalibrazioneGiorno.ts`): prevedono l'ampiezza della giornata, non la
  *   direzione.
+ * - **cor1m**: la correlazione implicita a 1 mese di Cboe (`data/vol/cor1m.json`,
+ *   scritto da `tws_poller.py` dal CSV Cboe). Sotto 10 (dal 2017, 24 episodi)
+ *   SPX nei 5 giorni dopo e' andato peggio che con lo stesso VIX: -0,19 sigma,
+ *   16 episodi su 24 negativi (`execution/studio_vol_commento.py`, 13/11/2026).
+ *   In sample e con la soglia presa da un commento: un avviso, IN PROVA.
  *
  * Tutto locale: legge `data/market/<giorno>.json` (campi `spx`, `vix1d`) e
  * `data/vol/chiusure.json`.
@@ -67,6 +72,15 @@ export interface Contesto {
     /** Dalla misura che prevede meglio (VIX1D/VIX, altrimenti VIX9D/VIX). */
     attesa: 'AMPIA' | 'NORMALE' | 'STRETTA';
     rangeRelativo: number;
+    cor1m: Cor1m | null;
+}
+
+export interface Cor1m {
+    valore: number;
+    data: string;
+    sotto10: boolean;
+    /** Chiusure consecutive sotto 10 fino a `data` (0 se sopra). */
+    giorniSotto: number;
 }
 
 export interface Vol {
@@ -187,6 +201,19 @@ function percentile(x: number, percentili: readonly number[]): number {
     return Math.round(j - 1 + (b > a ? (x - a) / (b - a) : 0));
 }
 
+function leggiCor1m(dati: string): Cor1m | null {
+    try {
+        const f = JSON.parse(fs.readFileSync(path.join(dati, 'vol', 'cor1m.json'), 'utf-8'));
+        if (typeof f?.chiusura !== 'number' || typeof f?.data !== 'string') return null;
+        const storia: [string, number][] = Array.isArray(f.storia) ? f.storia : [];
+        let giorniSotto = 0;
+        for (let i = storia.length - 1; i >= 0 && storia[i][1] < 10; i--) giorniSotto++;
+        return { valore: f.chiusura, data: f.data, sotto10: f.chiusura < 10, giorniSotto };
+    } catch {
+        return null;
+    }
+}
+
 function calcolaContesto(dati: string): Contesto | null {
     let file: { chiusure?: Record<string, { data: string; chiusura: number }> };
     try {
@@ -219,7 +246,10 @@ function calcolaContesto(dati: string): Contesto | null {
     const guida = voci.find((v) => v.nome === 'VIX1D/VIX') ?? voci.find((v) => v.nome === 'VIX9D/VIX') ?? voci[0];
     if (!guida) return null;
     const r = guida.rangeRelativo;
-    return { data: vix.data, voci, attesa: r >= 1.1 ? 'AMPIA' : r <= 0.9 ? 'STRETTA' : 'NORMALE', rangeRelativo: r };
+    return {
+        data: vix.data, voci, attesa: r >= 1.1 ? 'AMPIA' : r <= 0.9 ? 'STRETTA' : 'NORMALE', rangeRelativo: r,
+        cor1m: leggiCor1m(dati),
+    };
 }
 
 export function calcolaVol(dati: string, giorno: string, adesso: Date = new Date()): Vol {

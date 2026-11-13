@@ -394,6 +394,51 @@ def aggiorna_chiusure_vol(ib):
     print("  " + ", ".join(f"{k} {v['chiusura']} ({v['data']})" for k, v in chiusure.items()))
 
 
+# COR1M (correlazione implicita a 1 mese) dal CSV ufficiale Cboe, non da IBKR:
+# le chiusure IBKR differiscono (11/11/2026: 9.98 contro 9.79 Cboe) e lo studio
+# execution/studio_vol_commento.py usa quelle Cboe, con la soglia di 10 nel mezzo.
+# Una richiesta HTTP (~270 KB) quando finisce una seduta, ripetuta ogni 10 minuti
+# finche' il CSV non ha la stessa data delle chiusure IBKR.
+FILE_COR1M = os.path.join(SCRIPT_DIR, '..', 'frontend', 'data', 'vol', 'cor1m.json')
+URL_COR1M = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/COR1M_History.csv'
+
+
+def cor1m_da_aggiornare():
+    try:
+        with open(FILE_COR1M, encoding='utf-8') as f:
+            c = json.load(f)
+    except Exception:
+        return True
+    if c.get('scritto', 0) < _ultima_fine_seduta_ny().timestamp():
+        return True
+    try:
+        with open(FILE_CHIUSURE, encoding='utf-8') as f:
+            vix = json.load(f)['chiusure']['VIX']['data']
+        return c.get('data', '') < vix
+    except Exception:
+        return False
+
+
+def aggiorna_cor1m():
+    import urllib.request
+    req = urllib.request.Request(URL_COR1M, headers={'User-Agent': 'Mozilla/5.0'})
+    righe = urllib.request.urlopen(req, timeout=30).read().decode().strip().splitlines()[-15:]
+    storia = []
+    for r in righe:
+        campi = r.split(',')
+        try:
+            m, g, a = campi[0].split('/')
+            storia.append([f'{a}-{m}-{g}', float(campi[-1])])
+        except (ValueError, IndexError):
+            continue
+    if not storia:
+        return
+    os.makedirs(os.path.dirname(FILE_COR1M), exist_ok=True)
+    with open(FILE_COR1M, 'w', encoding='utf-8') as f:
+        json.dump({'scritto': time.time(), 'data': storia[-1][0], 'chiusura': storia[-1][1], 'storia': storia}, f)
+    print(f"  COR1M {storia[-1][1]} ({storia[-1][0]}, Cboe)")
+
+
 def main():
     print("Starting Market Poller background service (IBKR TWS API)...")
     print(f"Data directory: {DATA_DIR}")
@@ -482,6 +527,7 @@ def main():
 
     giorno_sessione = get_today_key()
     prossime_chiusure = 0
+    prossimo_cor1m = 0
     ultimo_rinnovo_es = time.time()
 
     while True:
@@ -523,6 +569,12 @@ def main():
                 aggiorna_chiusure_vol(ib)
             except Exception as e:
                 print(f"Chiusure indici vol non aggiornate: {e}")
+        if timestamp >= prossimo_cor1m and cor1m_da_aggiornare():
+            prossimo_cor1m = timestamp + 600
+            try:
+                aggiorna_cor1m()
+            except Exception as e:
+                print(f"COR1M Cboe non aggiornato: {e}")
 
         if is_active:
             # We get marketPrice() which uses last price, or bid/ask average if last price is not available

@@ -220,6 +220,11 @@ function righeResoconto(s: DatiSmile['smile'], vol: Vol | undefined): Riga[] {
             const valore = v.nome === 'SKEW' ? v.valore.toFixed(0) : v.valore.toFixed(2);
             righe.push(['10px Arial', '#94a3b8', `${v.nome} ${valore} (${v.percentile}°) ×${v.rangeRelativo.toFixed(2)}`]);
         }
+        // COR1M sotto 10: unico caso con una tendenza su SPX a 5 giorni (studio_vol_commento.py), in prova
+        const k = c.cor1m;
+        if (k) righe.push(['10px Arial', k.sotto10 ? ARANCIO : '#64748b', k.sotto10
+            ? `COR1M ${k.valore.toFixed(2)} < 10 da ${k.giorniSotto}g · SPX 5g debole (in prova)`
+            : `COR1M ${k.valore.toFixed(2)}`]);
     }
     const b = vol?.bande;
     if (b) {
