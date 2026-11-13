@@ -25,6 +25,7 @@ import { minutiRomaDaNy, oraRomaDaNy } from '@/lib/orarioNy';
 import { SMILE_COL, smilePlugin, type DatiSmile } from '@/lib/smileChart';
 import AiSignalPanel, { type RispostaAi } from '@/components/AiSignalPanel';
 import ZeroGammaInput from '@/components/ZeroGammaInput';
+import { calcolaRsi, rsiPlugin, RSI_PREDEFINITO, type ImpostazioniRsi } from '@/lib/rsi';
 import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
 import {
     CHIAVE_AUTO, FINE_GEX_NY, GEX_FERMO_MS, PUNTO_RECENTE_MS, descriviArrivo, frecceAiPlugin, leggiFrecce,
@@ -652,6 +653,13 @@ export default function MarketPage() {
      * prezzo di oggi.
      */
     const [mostraSpx, setMostraSpx] = useState(false);
+    /**
+     * Pannello RSI sotto il grafico (lib/rsi.ts). Valori di partenza da
+     * execution/studio_rsi_swing.py: barra 1 minuto, periodo 5, 20/80.
+     */
+    const [mostraRsi, setMostraRsi] = useState(false);
+    const [rsiCfg, setRsiCfg] = useState<ImpostazioniRsi>(RSI_PREDEFINITO);
+    const rsiCanvasRef = useRef<HTMLCanvasElement | null>(null);
     const [mostraAi, setMostraAi] = useState(false);
     /**
      * Analisi AI automatica quando ES arriva a 1 punto da un range o da
@@ -813,6 +821,12 @@ export default function MarketPage() {
             if (savedSmile !== null) setMostraSmile(savedSmile === 'true');
             const savedSpx = localStorage.getItem('marketShowSpx');
             if (savedSpx !== null) setMostraSpx(savedSpx === 'true');
+            const savedRsi = localStorage.getItem('marketShowRsi');
+            if (savedRsi !== null) setMostraRsi(savedRsi === 'true');
+            try {
+                const cfg = JSON.parse(localStorage.getItem('marketRsi') ?? 'null');
+                if (cfg && typeof cfg === 'object') setRsiCfg({ ...RSI_PREDEFINITO, ...cfg });
+            } catch { }
             const savedSpxOb = localStorage.getItem('marketShowRangeSpxOb');
             if (savedSpxOb !== null) setMostraRangeSpxOb(savedSpxOb === 'true');
             const savedGamma = localStorage.getItem('marketShowMajorGamma');
@@ -907,6 +921,11 @@ export default function MarketPage() {
     useEffect(() => {
         localStorage.setItem('marketShowSpx', String(mostraSpx));
     }, [mostraSpx]);
+
+    useEffect(() => {
+        localStorage.setItem('marketShowRsi', String(mostraRsi));
+        localStorage.setItem('marketRsi', JSON.stringify(rsiCfg));
+    }, [mostraRsi, rsiCfg]);
 
     useEffect(() => {
         localStorage.setItem('marketShowMajorGamma', String(mostraGamma));
@@ -1709,6 +1728,17 @@ export default function MarketPage() {
 
         chart.update('none');
     }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, picchiGex, mostraPicchiGex, picchiSerie, mostraPicchiSerie]);
+
+    // RSI: calcolato sui punti della pagina, disegnato dal plugin rsiPlugin
+    // sul canvas sotto il grafico con la stessa scala x.
+    useEffect(() => {
+        const chart = chartRef.current;
+        if (!chart) return;
+        chart.$rsi = mostraRsi
+            ? { ...calcolaRsi(dataPoints, rsiCfg), impostazioni: rsiCfg, canvas: rsiCanvasRef.current, segniSuPrezzo: true }
+            : null;
+        chart.draw();
+    }, [dataPoints, mostraRsi, rsiCfg]);
 
     // ---- Analisi AI sui livelli ----
     useEffect(() => {
@@ -2986,6 +3016,67 @@ export default function MarketPage() {
                             {mostraSpx ? '◉' : '◌'} SPX
                         </button>
 
+                        {/* RSI sotto il grafico, con i segnali di uscita dalle zone sulla linea di ES */}
+                        <button
+                            onClick={() => setMostraRsi((v) => !v)}
+                            title={mostraRsi ? 'Nascondi il pannello RSI' : "Mostra l'RSI sotto il grafico (default da studio_rsi_swing.py: 1 min, 5, 20/80)"}
+                            className={`px-2 py-1 border rounded-md text-[11px] font-bold transition-colors ${mostraRsi
+                                ? 'bg-violet-600/30 text-violet-300 border-violet-500/50 hover:bg-violet-600/40'
+                                : 'bg-slate-700/50 text-slate-400 border-slate-600 hover:bg-slate-700'}`}
+                        >
+                            {mostraRsi ? '◉' : '◌'} RSI
+                        </button>
+                        {mostraRsi && (
+                            <div className="flex items-center gap-1 text-[11px] text-slate-400" title="Barra in minuti, periodo, soglia bassa/alta">
+                                <select
+                                    value={rsiCfg.barraMin}
+                                    onChange={(e) => setRsiCfg((c) => ({ ...c, barraMin: Number(e.target.value) }))}
+                                    className="bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-slate-200"
+                                >
+                                    {[1, 2, 3, 5, 10, 15].map((m) => <option key={m} value={m}>{m}m</option>)}
+                                </select>
+                                <input
+                                    type="number" min={2} max={50} value={rsiCfg.periodo}
+                                    onChange={(e) => { const v = Number(e.target.value); if (v >= 2 && v <= 50) setRsiCfg((c) => ({ ...c, periodo: v })); }}
+                                    className="w-11 bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-slate-200"
+                                />
+                                <input
+                                    type="number" min={1} max={49} value={rsiCfg.basso}
+                                    onChange={(e) => { const v = Number(e.target.value); if (v >= 1 && v <= 49) setRsiCfg((c) => ({ ...c, basso: v })); }}
+                                    className="w-11 bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-green-300"
+                                />
+                                <input
+                                    type="number" min={51} max={99} value={rsiCfg.alto}
+                                    onChange={(e) => { const v = Number(e.target.value); if (v >= 51 && v <= 99) setRsiCfg((c) => ({ ...c, alto: v })); }}
+                                    className="w-11 bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-red-300"
+                                />
+                                <button
+                                    onClick={() => setRsiCfg((c) => ({ ...c, basso: 10, alto: 90 }))}
+                                    className="px-1.5 py-0.5 border border-slate-600 rounded hover:bg-slate-700"
+                                    title="Soglie 10/90 (studio: un quarto dei segnali, nessun miglioramento)"
+                                >10/90</button>
+                                <button
+                                    onClick={() => setRsiCfg((c) => ({ ...c, immediato: !c.immediato }))}
+                                    className={`px-1.5 py-0.5 border rounded hover:bg-slate-700 ${rsiCfg.immediato ? 'border-violet-500/60 text-violet-300' : 'border-slate-600'}`}
+                                    title={rsiCfg.immediato
+                                        ? "Freccia nel momento in cui l'RSI esce dalla zona (clic: solo a barra chiusa)"
+                                        : "Freccia solo a barra chiusa (clic: nel momento in cui l'RSI esce dalla zona)"}
+                                >{rsiCfg.immediato ? 'immediato' : 'a chiusura'}</button>
+                                <button
+                                    onClick={() => setRsiCfg((c) => ({ ...c, soloLivelli: !c.soloLivelli }))}
+                                    className={`px-1.5 py-0.5 border rounded hover:bg-slate-700 ${rsiCfg.soloLivelli ? 'border-violet-500/60 text-violet-300' : 'border-slate-600'}`}
+                                    title={rsiCfg.soloLivelli
+                                        ? 'Solo i segnali con ES entro 2 punti da un livello disegnato (range, GEX+/-, 0γ). Clic: tutti'
+                                        : 'Tutti i segnali. Clic: solo entro 2 punti da un livello disegnato'}
+                                >{rsiCfg.soloLivelli ? 'livelli ±2' : 'tutti'}</button>
+                                <button
+                                    onClick={() => setRsiCfg(RSI_PREDEFINITO)}
+                                    className="px-1.5 py-0.5 border border-slate-600 rounded hover:bg-slate-700"
+                                    title="Torna ai valori predefiniti: 1 min, 5, 20/80, immediato, livelli ±2"
+                                >↺</button>
+                            </div>
+                        )}
+
                         {/* Major Pos / Neg Gamma, dalla pagina GEX */}
                         <button
                             onClick={() => setMostraGamma((v) => !v)}
@@ -3317,7 +3408,7 @@ export default function MarketPage() {
                                 ref={chartRef}
                                 data={chartData}
                                 options={chartOptions}
-                                plugins={[scaleBackgroundPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin, frecceAiPlugin, crosshairPlugin]}
+                                plugins={[scaleBackgroundPlugin, priceTagPlugin, spxAxisPlugin, etichetteSinistraPlugin, smilePlugin, frecceAiPlugin, rsiPlugin, crosshairPlugin]}
                             />
                         ) : (
                             <div className="flex items-center justify-center h-full">
@@ -3332,6 +3423,10 @@ export default function MarketPage() {
                             </div>
                         )}
                           </div>
+                          <canvas
+                              ref={rsiCanvasRef}
+                              className={mostraRsi && dataPoints.length > 0 ? 'block h-[120px] mt-1' : 'hidden'}
+                          />
                       </div>
                     ) : (
                       <div className="w-full h-[calc(100vh-240px)] min-h-[400px] bg-[#0c0d10] border border-slate-800/50 rounded-lg p-4 shadow-2xl">

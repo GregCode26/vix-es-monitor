@@ -150,6 +150,36 @@ namespace GregDashboard
         [InputParameter("Short su spinta VIX (in prova)", 49)]
         public bool MostraShortVix = true;
 
+        /// <summary>
+        /// Segnali RSI sui livelli (13/11/2026, IN PROVA, a richiesta): lo stesso segnale del pannello RSI di /market
+        /// (frontend/src/lib/rsi.ts, execution/studio_rsi_swing.py): RSI di Wilder su barre da N minuti del mid Bookmap
+        /// preso ogni 15 s, freccia nel momento in cui l'RSI provvisorio esce dalla zona (o a barra chiusa), tenuta solo
+        /// con ES entro la distanza scelta da un range OB, GEX+/GEX- o lo 0γ di quel secondo, dalle 9:35 alle 15:59 NY.
+        /// execution/studio_rsi_livelli.py, 17 sedute: con 10/90 vicino ai livelli PERDE in entrambe le meta'
+        /// (-0,48 e -1,50 pt a operazione sul primo fra +4 e -3), peggio che vicino a livelli finti. Il conto in basso
+        /// usa lo stesso +4/-3 (30 min, netto 0,25) per giudicarlo sulle sedute nuove.
+        /// </summary>
+        [InputParameter("Segnali RSI sui livelli (in prova)", 54)]
+        public bool MostraRsi = true;
+
+        [InputParameter("RSI periodo", 55, 2, 50, 1, 0)]
+        public int RsiPeriodo = 5;
+
+        [InputParameter("RSI barra (minuti)", 56, 1, 15, 1, 0)]
+        public int RsiBarraMin = 1;
+
+        [InputParameter("RSI soglia bassa", 57, 1, 49, 1, 0)]
+        public int RsiBasso = 10;
+
+        [InputParameter("RSI soglia alta", 58, 51, 99, 1, 0)]
+        public int RsiAlto = 90;
+
+        [InputParameter("RSI distanza dal livello (pt)", 59, 0.25, 10, 0.25, 2)]
+        public double RsiDistanza = 2;
+
+        [InputParameter("RSI segnale immediato (no = a barra chiusa)", 61)]
+        public bool RsiImmediato = true;
+
         [InputParameter("Smile IV (SPX 0DTE)", 50)]
         public bool MostraSmile = true;
 
@@ -232,6 +262,17 @@ namespace GregDashboard
             public int Sec;
             public int Verso;
             public double Entrata;
+            public double? Esito;
+            public int? FineSec;
+        }
+
+        /// <summary>Un segnale RSI vicino a un livello. Verso +1 = uscita dalla zona bassa (LONG).</summary>
+        private sealed class SegnaleRsi
+        {
+            public int Sec;
+            public int Verso;
+            public double Prezzo;
+            public string Livello;
             public double? Esito;
             public int? FineSec;
         }
@@ -360,6 +401,7 @@ namespace GregDashboard
         /// <summary>Il mid Bookmap di ogni secondo della giornata, in ordine: serve alla conferma sui range.</summary>
         private readonly List<(int sec, double mid)> midGiorno = new List<(int, double)>();
         private volatile List<Conferma> confermePronte = new List<Conferma>();
+        private volatile List<SegnaleRsi> rsiPronti = new List<SegnaleRsi>();
         private volatile List<OperazioneVix> operazioniVix = new List<OperazioneVix>();
         private volatile string giornoVix;
         private volatile string riassuntoVix;
@@ -1053,6 +1095,7 @@ namespace GregDashboard
                 quoteRecenti.Clear();
                 midGiorno.Clear();
                 confermePronte = new List<Conferma>();
+                rsiPronti = new List<SegnaleRsi>();
                 if (since != null)
                 {
                     ultimoTempoBook = null;
@@ -1093,6 +1136,7 @@ namespace GregDashboard
             // Gli assorbimenti no: sono pochi (~2.000 al giorno) e devono restare tutta la giornata.
             Pubblica();
             if (MostraConferme) CalcolaConferme();
+            if (MostraRsi) CalcolaRsi();
         }
 
         private static string FileSerieGex(string giorno) => Path.Combine(Path.GetTempPath(), $"GregDashboard-gex-{giorno}.txt");
@@ -1268,6 +1312,128 @@ namespace GregDashboard
             confermePronte = trovate.OrderBy(c => c.Sec).ToList();
         }
 
+        // Uscita usata solo per il conto in basso, come execution/studio_rsi_livelli.py: primo fra +4 e -3, 30 minuti.
+        private const double RSI_TARGET = 4, RSI_STOP = 3;
+        private const int RSI_DURATA = 1800, RSI_PASSO = 15;
+
+        /// <summary>
+        /// I segnali RSI (vedi MostraRsi): stessa logica di segnali_punti() in execution/studio_rsi_swing.py e di
+        /// calcolaRsi() in frontend/src/lib/rsi.ts. Si rifa' da capo a ogni giro, come le conferme.
+        /// </summary>
+        private void CalcolaRsi()
+        {
+            if (midGiorno.Count < 2) { rsiPronti = new List<SegnaleRsi>(); return; }
+            int s0 = midGiorno[0].sec, s1 = midGiorno[^1].sec, n = s1 - s0 + 1;
+            var mid = new double[n];
+            var j = 0;
+            for (var s = s0; s <= s1; s++)
+            {
+                while (j + 1 < midGiorno.Count && midGiorno[j + 1].sec <= s) j++;
+                mid[s - s0] = midGiorno[j].mid;
+            }
+            var livelli = new List<(string nome, double[] prezzi)>();
+            foreach (var l in livelliRange.Where(l => !l.Tratteggiato))
+                livelli.Add((l.Etichetta, Enumerable.Repeat(l.Prezzo, n).ToArray()));
+            var base_ = BaseAlSecondo(s0, n);
+            if (serieGex.Count > 0)
+            {
+                livelli.Add(("GEX+", AGradini(serieGex.Select(g => (g.sec, g.pos)).ToList(), s0, n, 300, base_)));
+                livelli.Add(("GEX-", AGradini(serieGex.Select(g => (g.sec, g.neg)).ToList(), s0, n, 300, base_)));
+            }
+            if (zgTraccia is { } zg) livelli.Add(("0γ", AGradini(zg.Punti, s0, n, 180, base_)));
+            if (livelli.Count == 0) { rsiPronti = new List<SegnaleRsi>(); return; }
+            var da = Math.Max(s0, Secondi(OraLocaleDaNy(9, 35) + ":00"));
+            var fine = Math.Min(s1, Secondi(OraLocaleDaNy(16, 0) + ":00") - 60);
+
+            int periodo = Math.Max(2, RsiPeriodo), b = Math.Max(1, RsiBarraMin);
+            double basso = RsiBasso, alto = RsiAlto;
+            static double Rsi(double su, double giu) => giu == 0 ? (su == 0 ? 50 : 100) : 100 - 100 / (1 + su / giu);
+            int? barra = null;
+            double chius = 0;
+            double? prec = null, rsiChiuso = null, rsiPunto = null;
+            var tUlt = 0;
+            var chiuse = 0;
+            double ss = 0, sg = 0, ms = 0, mg = 0;
+            bool fattoMax = false, fattoMin = false;
+            var segnali = new List<(int sec, int verso)>();
+            for (var t = s0 - s0 % RSI_PASSO + RSI_PASSO; t <= s1; t += RSI_PASSO)
+            {
+                var v = mid[t - s0];
+                var bb = t / 60 / b;
+                if (barra != null && bb != barra)
+                {
+                    if (prec != null)
+                    {
+                        var d = chius - prec.Value;
+                        if (chiuse <= periodo)
+                        {
+                            ss += Math.Max(d, 0); sg += Math.Max(-d, 0);
+                            if (chiuse == periodo) { ms = ss / periodo; mg = sg / periodo; }
+                        }
+                        else
+                        {
+                            ms = (ms * (periodo - 1) + Math.Max(d, 0)) / periodo;
+                            mg = (mg * (periodo - 1) + Math.Max(-d, 0)) / periodo;
+                        }
+                        if (chiuse >= periodo)
+                        {
+                            var r = Rsi(ms, mg);
+                            if (!RsiImmediato && rsiChiuso != null && chiuse >= 2 * periodo)
+                            {
+                                if (rsiChiuso >= alto && r < alto) segnali.Add((tUlt, -1));
+                                else if (rsiChiuso <= basso && r > basso) segnali.Add((tUlt, 1));
+                            }
+                            rsiChiuso = r;
+                        }
+                    }
+                    prec = chius;
+                    chiuse++;
+                    fattoMax = fattoMin = false;
+                }
+                barra = bb;
+                chius = v;
+                tUlt = t;
+                if (prec != null && chiuse > periodo)
+                {
+                    var r = Rsi((ms * (periodo - 1) + Math.Max(v - prec.Value, 0)) / periodo,
+                                (mg * (periodo - 1) + Math.Max(prec.Value - v, 0)) / periodo);
+                    if (RsiImmediato && rsiPunto != null && chiuse >= 2 * periodo)
+                    {
+                        if (rsiPunto >= alto && r < alto && !fattoMax) { segnali.Add((t, -1)); fattoMax = true; }
+                        else if (rsiPunto <= basso && r > basso && !fattoMin) { segnali.Add((t, 1)); fattoMin = true; }
+                    }
+                    rsiPunto = r;
+                }
+            }
+
+            var trovati = new List<SegnaleRsi>();
+            foreach (var (sec, verso) in segnali)
+            {
+                if (sec < da || sec > fine) continue;
+                var prezzo = mid[sec - s0];
+                string nome = null;
+                var migliore = double.MaxValue;
+                foreach (var (nomeL, prezzi) in livelli)
+                {
+                    var L = prezzi[sec - s0];
+                    if (double.IsNaN(L)) continue;
+                    var dist = Math.Abs(prezzo - L);
+                    if (dist <= RsiDistanza && dist < migliore) { migliore = dist; nome = nomeL; }
+                }
+                if (nome == null) continue;
+                var segnale = new SegnaleRsi { Sec = sec, Verso = verso, Prezzo = prezzo, Livello = nome };
+                for (var t = sec + 1; t <= s1; t++)
+                {
+                    var z = verso * (mid[t - s0] - prezzo);
+                    if (z >= RSI_TARGET) { segnale.Esito = RSI_TARGET; segnale.FineSec = t; break; }
+                    if (z <= -RSI_STOP) { segnale.Esito = -RSI_STOP; segnale.FineSec = t; break; }
+                    if (t - sec >= RSI_DURATA) { segnale.Esito = z; segnale.FineSec = t; break; }
+                }
+                trovati.Add(segnale);
+            }
+            rsiPronti = trovati;
+        }
+
         /// <summary>
         /// Gli assorbimenti di prima della finestra iniziale (/api/bookmap?assorbimenti=1),
         /// coi secondi di bid/ask che servono alla tenuta. Fino al 04/11/2026 sparivano
@@ -1437,6 +1603,7 @@ namespace GregDashboard
                 if (MostraAssorbimenti) DisegnaAssorbimenti(g, area, conv);
                 if (MostraConferme) DisegnaConferme(g, area, conv);
                 if (MostraShortVix) DisegnaShortVix(g, area, conv);
+                if (MostraRsi) DisegnaRsi(g, area, conv);
 
                 var s = stato;
                 if (s != null)
@@ -1860,6 +2027,53 @@ namespace GregDashboard
                 var ty = c.Verso > 0 ? y + 1.6f * r + 2 : y - 1.6f * r - dim.Height - 2;
                 g.FillRectangle(sfondo, x - dim.Width / 2, ty, dim.Width, dim.Height);
                 g.DrawString(testo, font, Brushes.Gold, x - dim.Width / 2, ty);
+            }
+            g.SmoothingMode = modo;
+        }
+
+        /// <summary>Frecce dei segnali RSI: verde in su sotto il prezzo (LONG), rossa in giu' sopra (SHORT), col nome del livello.</summary>
+        private void DisegnaRsi(Graphics g, Rectangle area, TradingPlatform.BusinessLayer.Chart.IChartWindowCoordinatesConverter conv)
+        {
+            var lista = rsiPronti;
+            var giorno = giornoBook;
+            using var font = new Font("Arial", 8f, FontStyle.Bold);
+            using var viola = new SolidBrush(Color.FromArgb(255, 196, 181, 253));
+            var chiuse = lista.Where(c => c.Esito != null).ToList();
+            var riassunto = $"RSI {RsiPeriodo} {RsiBarraMin}m {RsiBasso}/{RsiAlto} {(RsiImmediato ? "immediato" : "a chiusura")} entro {RsiDistanza:0.##} pt dai livelli (in prova): "
+                + (lista.Count == 0 ? "nessun segnale oggi"
+                    : $"{chiuse.Count(c => c.Esito > 0)}/{chiuse.Count} vinti a +4/-3, {chiuse.Sum(c => c.Esito.Value - 0.25):+0.00;-0.00} pt");
+            g.DrawString(riassunto, font, viola, area.Left + 8, area.Bottom - 66);
+            if (lista.Count == 0 || giorno == null) return;
+            if (!DateTime.TryParseExact(giorno, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var mezzanotte)) return;
+
+            var modo = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var verde = new SolidBrush(Color.FromArgb(240, 34, 197, 94));
+            using var rosso = new SolidBrush(Color.FromArgb(240, 239, 68, 68));
+            using var bordo = new Pen(Color.FromArgb(230, 15, 23, 42), 1f);
+            using var sfondo = new SolidBrush(Color.FromArgb(200, 15, 23, 42));
+            foreach (var c in lista)
+            {
+                var x = (float)conv.GetChartX(Utc(mezzanotte, c.Sec));
+                if (x < area.Left - 20 || x > area.Right + 20) continue;
+                var y = (float)conv.GetChartY(c.Prezzo);
+                var v = c.Verso > 0 ? 1 : -1;      // LONG: freccia sotto il prezzo che punta in su
+                var punta = y + v * 4;
+                var coda = y + v * 22;
+                var testa = y + v * 12;
+                var freccia = new[]
+                {
+                    new PointF(x, punta), new PointF(x - 7, testa), new PointF(x - 2.5f, testa), new PointF(x - 2.5f, coda),
+                    new PointF(x + 2.5f, coda), new PointF(x + 2.5f, testa), new PointF(x + 7, testa),
+                };
+                g.FillPolygon(c.Verso > 0 ? verde : rosso, freccia);
+                g.DrawPolygon(bordo, freccia);
+                var esito = c.Esito == null ? "aperta" : $"{c.Esito.Value:+0.00;-0.00}";
+                var testo = $"RSI {c.Livello} {esito}";
+                var dim = g.MeasureString(testo, font);
+                var ty = c.Verso > 0 ? coda + 2 : coda - dim.Height - 2;
+                g.FillRectangle(sfondo, x - dim.Width / 2, ty, dim.Width, dim.Height);
+                g.DrawString(testo, font, viola, x - dim.Width / 2, ty);
             }
             g.SmoothingMode = modo;
         }
