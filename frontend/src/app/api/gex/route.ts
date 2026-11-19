@@ -85,8 +85,16 @@ interface ProfileRow {
     gexOi: number;
     /** GEX dei dealer dal flusso Lee-Ready; 0 dove il poller non lo conta ancora. */
     gexLr: number;
+    /** Open interest netto in contratti, call - put, senza gamma: fermo per tutta la giornata. */
+    oi: number;
     /** I conti Lee-Ready di oggi: [call comprate, call vendute, put comprate, put vendute]. */
     lr?: [number, number, number, number];
+    /** DEX (vedi `strikeDex`) sui contratti scambiati oggi, in M$ di delta. */
+    dex: number;
+    /** DEX sull'open interest. */
+    dexOi: number;
+    /** DEX dei clienti dal flusso Lee-Ready (comprate - vendute); 0 dove il poller non lo conta ancora. */
+    dexLr: number;
 }
 
 /**
@@ -118,11 +126,17 @@ interface SerieFrame {
     gex: number[];
     gexOi: number[];
     gexLr: number[];
+    /** Open interest netto in contratti, call - put (vedi ProfileRow.oi). */
+    oi: number[];
     /**
      * Per le coperture teoriche sulla mappa Lee-Ready (12/11/2026): contratti netti comprati dai
      * clienti per strike, call + put, (cb-cs)+(pb-ps). Il dealer ha l'opposto.
      */
     lrNet: number[];
+    /** DEX per strike in M$ di delta: volume, open interest, Lee-Ready (vedi ProfileRow). */
+    dex: number[];
+    dexOi: number[];
+    dexLr: number[];
     /** 1 sigma alla scadenza in punti SPX, dal gamma dello strike piu' vicino allo spot (0.3989 / gamma). */
     sd: number | null;
     /** Lo spot a cui e' valutata la fotografia. */
@@ -190,6 +204,65 @@ const CONTRACT_SIZE = 100;
 function strikeGex(gamma: number, netContracts: number, spot: number): number {
     const dollars = gamma * netContracts * CONTRACT_SIZE * spot * spot * 0.01;
     return Math.round((dollars / 1e6) * 100) / 100;
+}
+
+/**
+ * Open interest per strike e lato (call, put) visto per ultimo con un valore > 0, per giorno.
+ *
+ * L'OI e' fermo alla chiusura del giorno prima, ma IBKR a volte lo manda a 0 per uno snapshot
+ * (19/11/2026 alle 15:01:50: call 7255/7285 e put 7280 a zero e subito di nuovo come prima), e
+ * il profilo OI faceva un picco di un istante. Un OI che scende a 0 dopo essere stato > 0 si
+ * considera un buco e si tiene il valore di prima; un valore nuovo > 0 invece vale sempre (il
+ * 18/11 alle 17:18 le put di 7250/7260 sono arrivate in ritardo, da 0 al valore vero).
+ * In memoria di modulo perche' le chiamate con `since` vedono pochi snapshot alla volta.
+ */
+const oiValidi = new Map<string, [number, number]>();
+
+/** Open interest pulito di call e put, separati (il DEX li pesa con delta diverse). */
+function oiPulito(dateStr: string, row: StrikeRow): [number, number] {
+    const chiave = `${dateStr}|${row.strike}`;
+    const prec = oiValidi.get(chiave) ?? [0, 0];
+    const c = row.callsOi != null && row.callsOi > 0 ? row.callsOi : prec[0];
+    const p = row.putsOi != null && row.putsOi > 0 ? row.putsOi : prec[1];
+    oiValidi.set(chiave, [c, p]);
+    return [c, p];
+}
+
+/** Funzione di ripartizione normale (Abramowitz-Stegun 7.1.26, errore < 1.5e-7). */
+function normCdf(x: number): number {
+    const t = 1 / (1 + 0.3275911 * Math.abs(x) / Math.SQRT2);
+    const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x / 2);
+    return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
+}
+
+/**
+ * Delta della CALL dello strike. Il poller scrive una sola `delta` per strike, quella del primo
+ * lato che arriva con i modelGreeks: in pratica sempre la call (37 su 37 il 18/11), ma se fosse
+ * la put (negativa) si passa alla call con la parita', Δcall = 1 + Δput (0DTE, tasso trascurabile).
+ * Dopo la scadenza IBKR manda gamma e delta a 0: allora vale il solo intrinseco, 1 o 0.
+ * Senza delta, la normale sulla sigma alla scadenza dal gamma ATM (come le coperture MM).
+ */
+function deltaCall(row: StrikeRow, spot: number, sd: number | null): number | null {
+    const d = row.delta;
+    if (d != null && Number.isFinite(d) && d !== 0) return d > 0 ? d : 1 + d;
+    if (d === 0 && row.gamma === 0) return spot > row.strike ? 1 : 0;
+    if (sd != null && sd > 0) return normCdf((spot - row.strike) / sd);
+    return null;
+}
+
+/**
+ * DEX di uno strike in milioni di dollari di delta (equivalente in SPX):
+ *
+ *   DEX = (call x Δcall + put x Δput) x 100 x S / 1e6,   Δput = Δcall - 1
+ *
+ * Convenzione dei fornitori di DEX: e' la delta in mano a chi HA le opzioni, call positive e put
+ * negative. Su volume e OI si suppone che i clienti abbiano comprato tutto (non si sa chi ha
+ * comprato), su Lee-Ready i contratti sono quelli netti comprati dai clienti. I dealer hanno
+ * l'opposto: DEX positivo = dealer corti di delta, coperti comprando futures. 1 M$ ≈ 2,7 contratti ES a 7400 (50 x 7400 = 370.000 $ l'uno).
+ */
+function strikeDex(call: number, put: number, dCall: number, spot: number): number {
+    const dollari = (call * dCall + put * (dCall - 1)) * CONTRACT_SIZE * spot;
+    return Math.round((dollari / 1e6) * 100) / 100;
 }
 
 /** Contratti netti di uno strike all'ultimo snapshot visto. */
@@ -313,20 +386,26 @@ function elaboraSnapshot(
             if (row.gamma == null || !Number.isFinite(row.gamma)) continue;
 
             const vol = (row.calls ?? 0) - (row.puts ?? 0);
-            const oi = (row.callsOi ?? 0) - (row.putsOi ?? 0);
+            const [oiC, oiP] = oiPulito(dateStr, row);
+            const oi = oiC - oiP;
             const conLr = row.cb != null && row.cs != null && row.pb != null && row.ps != null;
             if (conLr) {
                 haLr = true;
                 if (inizioLr == null) inizioLr = orario;
             }
             const dealer = conLr ? -(row.cb! - row.cs!) - (row.pb! - row.ps!) : 0;
+            const dC = deltaCall(row, spot, ultimoSd);
 
             profilo.set(row.strike, {
                 strike: row.strike,
                 gex: strikeGex(row.gamma, vol, spot),
                 gexOi: strikeGex(row.gamma, oi, spot),
                 gexLr: strikeGex(row.gamma, dealer, spot),
+                oi,
                 ...(conLr ? { lr: [row.cb!, row.cs!, row.pb!, row.ps!] as [number, number, number, number] } : {}),
+                dex: dC == null ? 0 : strikeDex(row.calls ?? 0, row.puts ?? 0, dC, spot),
+                dexOi: dC == null ? 0 : strikeDex(oiC, oiP, dC, spot),
+                dexLr: dC == null || !conLr ? 0 : strikeDex(row.cb! - row.cs!, row.pb! - row.ps!, dC, spot),
             });
             vistoIl.set(row.strike, snapSec);
 
@@ -402,7 +481,11 @@ function elaboraSnapshot(
         gex: strikes.map((s) => Math.round(f.mappa.get(s)?.gex ?? 0)),
         gexOi: strikes.map((s) => Math.round(f.mappa.get(s)?.gexOi ?? 0)),
         gexLr: strikes.map((s) => Math.round(f.mappa.get(s)?.gexLr ?? 0)),
+        oi: strikes.map((s) => f.mappa.get(s)?.oi ?? 0),
         lrNet: strikes.map((s) => nettoClienti(f.mappa.get(s)?.lr)),
+        dex: strikes.map((s) => Math.round(f.mappa.get(s)?.dex ?? 0)),
+        dexOi: strikes.map((s) => Math.round(f.mappa.get(s)?.dexOi ?? 0)),
+        dexLr: strikes.map((s) => Math.round(f.mappa.get(s)?.dexLr ?? 0)),
         sd: f.sd != null ? Math.round(f.sd * 100) / 100 : null,
         px: f.px,
     }));
@@ -596,7 +679,7 @@ export async function GET(request: Request) {
                 for (const row of precedente.volumes ?? []) {
                     base.set(row.strike, {
                         vol: (row.calls ?? 0) - (row.puts ?? 0),
-                        oi: (row.callsOi ?? 0) - (row.putsOi ?? 0),
+                        oi: (([c, p]) => c - p)(oiPulito(targetDate, row)),
                     });
                 }
             }

@@ -7,6 +7,8 @@ import dynamic from 'next/dynamic';
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false });
 // Su canvas e con i suoi dati: si monta solo con la vista Mappa Calore aperta.
 const GammaHeatmapLive = dynamic(() => import('@/components/GammaHeatmapLive'), { ssr: false });
+// La verifica della linea piu' alta contro ES (/linea-alta), come vista dopo Serie Temporali.
+const LineaAlta = dynamic(() => import('@/components/LineaAlta'), { ssr: false });
 
 interface HedgingPressureRow {
     strike: number;
@@ -65,7 +67,7 @@ const VARIAZIONE_MIN = 5;
 /** Quanti strike lampeggiano in tutto: sopra lo spot in verde, sotto in rosso. */
 const LAMPEGGIANTI = 2;
 
-type ViewMode = 'profile' | 'timeseries' | 'heatmap';
+type ViewMode = 'profile' | 'timeseries' | 'lineaAlta' | 'heatmap';
 
 /** Un singolo trade grande dallo scanner (`/api/spx-scanner`, `python -m spx_flow_scanner.main trade`). */
 interface GrandeTrade {
@@ -688,7 +690,7 @@ export default function HedgingPressurePage() {
                     </div>
                     <div className="flex gap-2 items-center">
                         <div className="flex rounded-lg overflow-hidden border border-slate-700">
-                            {(['profile', 'timeseries', 'heatmap'] as const).map((mode) => (
+                            {(['profile', 'timeseries', 'lineaAlta', 'heatmap'] as const).map((mode) => (
                                 <button
                                     key={mode}
                                     onClick={() => {
@@ -701,7 +703,7 @@ export default function HedgingPressurePage() {
                                             : 'bg-slate-800 hover:bg-slate-700 text-slate-400'
                                     }`}
                                 >
-                                    {mode === 'profile' ? 'Profilo' : mode === 'timeseries' ? 'Serie Temporali' : 'Mappa Calore'}
+                                    {mode === 'profile' ? 'Profilo' : mode === 'timeseries' ? 'Serie Temporali' : mode === 'lineaAlta' ? 'Linea Alta' : 'Mappa Calore'}
                                 </button>
                             ))}
                         </div>
@@ -832,7 +834,12 @@ export default function HedgingPressurePage() {
                                 <GammaHeatmapLive attiva={viewMode === 'heatmap'} />
                             </div>
                         )}
-                        {viewMode === 'heatmap' ? null : pronto ? (
+                        {viewMode === 'lineaAlta' && (
+                            <div className="h-full overflow-y-auto">
+                                <LineaAlta incorporata />
+                            </div>
+                        )}
+                        {viewMode === 'heatmap' || viewMode === 'lineaAlta' ? null : pronto ? (
                             <ReactECharts
                                 option={viewMode === 'profile' ? option : timeseriesOption}
                                 style={{ height: '100%', width: '100%' }}

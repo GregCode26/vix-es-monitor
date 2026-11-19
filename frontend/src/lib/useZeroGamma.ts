@@ -12,7 +12,8 @@ import { useCallback, useEffect, useState } from 'react';
 
 export interface ZeroGammaStato {
   manuale: { ora: string; valore: number } | null;
-  cboe: { ora: string; principale: number | null; spot: number } | null;
+  /** gexOiB/gexVolB: GEX netto di TUTTA la catena SPX (tutte le scadenze), B$ per 1%, Cboe ritardato 15 min. */
+  cboe: { ora: string; principale: number | null; spot: number; gexOiB: number | null; gexVolB: number | null } | null;
   /** [ora di Roma 'HH:MM:SS', Zero Gamma SPX], una al minuto dall'apertura cash. */
   traccia: [string, number][];
   /** L'ultimo della traccia, o il Cboe se la traccia non c'e' (poller fermo, Vercel). */
@@ -41,7 +42,10 @@ export function useZeroGamma(): ZeroGammaStato & { imposta: (v: number | null) =
       const j = await res.json();
       const traccia: [string, number][] = j.poller?.serie ?? [];
       const ultimo = traccia[traccia.length - 1];
-      const cboe = j.cboe ? { ora: j.cboe.ora, principale: j.cboe.principale, spot: j.cboe.spot } : null;
+      const cboe = j.cboe ? {
+        ora: j.cboe.ora, principale: j.cboe.principale, spot: j.cboe.spot,
+        gexOiB: j.cboe.gexOiB ?? null, gexVolB: j.cboe.gexVolB ?? null,
+      } : null;
       setStato({
         manuale: j.manuale ?? null,
         cboe,

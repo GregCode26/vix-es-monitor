@@ -529,6 +529,9 @@ def main():
     prossime_chiusure = 0
     prossimo_cor1m = 0
     ultimo_rinnovo_es = time.time()
+    # Bid/ask ES visti l'ultima volta e quando sono cambiati (vedi book_es_fermo sotto).
+    ultimo_ba_es = None
+    ba_es_cambiato = time.time()
 
     while True:
         # A mezzanotte la sessione finisce: gli strike ATM e le scadenze
@@ -547,13 +550,29 @@ def main():
         # Ensure we process incoming IBKR messages to keep subscriptions alive
         ib.sleep(POLL_INTERVAL)
 
+        # Book ES fermo: il 17/11/2026 alle 19:22, dopo un 1100/1102, sono ripartiti i trade (RTVolume, quindi
+        # esf_ticker.time restava fresco e il controllo sotto non scattava) ma non bid/ask, fermi a
+        # 7353.50/7353.75. marketPrice() da' il mid quando l'ultimo trade e' fuori dal bid/ask, e il poller ha
+        # scritto 7353.62 fisso fino a sera. Un book vivo non lascia trade fuori dal bid/ask per due minuti:
+        # in quel caso si rifa' la sottoscrizione e intanto si scrive l'ultimo trade.
+        ba_es = (esf_ticker.bid, esf_ticker.ask)
+        if ba_es != ultimo_ba_es:
+            ultimo_ba_es = ba_es
+            ba_es_cambiato = timestamp
+        _bid, _ask, _last = esf_ticker.bid, esf_ticker.ask, esf_ticker.last
+        book_es_fermo = (timestamp - ba_es_cambiato >= ES_FERMO_SEC
+                         and all(v == v and v is not None and v > 0 for v in (_bid, _ask, _last))
+                         and not (_bid <= _last <= _ask))
+
         # ES fermo: dopo un 1102 IBKR puo' non riattaccare una sottoscrizione. Si rifa' (al piu' ogni
         # ES_FERMO_SEC), solo nella finestra attiva: fuori, ES puo' essere fermo davvero (pausa CME).
         if is_active and timestamp - ultimo_rinnovo_es >= ES_FERMO_SEC:
             ultimo_tick = esf_ticker.time
             fermo = ultimo_tick is None or (datetime.now(timezone.utc) - ultimo_tick).total_seconds() > ES_FERMO_SEC
-            if fermo:
-                print(f"[{now.strftime('%H:%M:%S')}] ES senza tick da oltre {ES_FERMO_SEC}s (ultimo {ultimo_tick}): rifaccio la sottoscrizione.")
+            if fermo or book_es_fermo:
+                motivo = (f"bid/ask fermi a {ultimo_ba_es} da oltre {ES_FERMO_SEC}s, ultimo trade {_last}"
+                          if book_es_fermo and not fermo else f"senza tick da oltre {ES_FERMO_SEC}s (ultimo {ultimo_tick})")
+                print(f"[{now.strftime('%H:%M:%S')}] ES {motivo}: rifaccio la sottoscrizione.")
                 try:
                     ib.cancelMktData(esf_contract)
                 except Exception as e:
@@ -580,6 +599,8 @@ def main():
             # We get marketPrice() which uses last price, or bid/ask average if last price is not available
             vix = vix_ticker.marketPrice()
             esf = esf_ticker.marketPrice()
+            if book_es_fermo and _last == _last and _last and _last > 0:
+                esf = _last
             spx = spx_ticker.marketPrice()
 
             # Riferimento SPX per il pannello Range: l'indice non viene

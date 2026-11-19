@@ -40,6 +40,12 @@ interface ProfileRow {
   strike: number;
   gex: number;
   gexOi: number;
+  /** Open interest netto in contratti (call - put), senza gamma: fermo tutto il giorno. */
+  oi?: number;
+  /** DEX in M$ di delta: volume, open interest, Lee-Ready (vedi strikeDex in /api/gex). */
+  dex?: number;
+  dexOi?: number;
+  dexLr?: number;
 }
 
 /**
@@ -50,6 +56,10 @@ interface SerieFrame {
   time: string;
   gex: number[];
   gexOi: number[];
+  oi?: number[];
+  dex?: number[];
+  dexOi?: number[];
+  dexLr?: number[];
 }
 
 interface SpxHistoryPoint {
@@ -77,16 +87,48 @@ interface SpxHistoryPoint {
  * sessione: se un giorno i livelli li superano, il metro si allunga da solo
  * (e non si accorcia piu' fino a domani), cosi' niente esce dal grafico.
  */
-const FONDO_SCALA_M: Record<GexBasis, number> = { volume: 150000, oi: 10000, oiVol: 160000 };
+const FONDO_SCALA_M: Record<GexBasis, number> = {
+  volume: 150000, oi: 10000, oiVol: 160000, oiContratti: 3000,
+  // DEX, dal 18-19/11/2026: massimo per strike a fine seduta ~50-65k sul volume, ~4k OI, ~3-4k Lee-Ready.
+  dexVol: 50000, dexOi: 4000, dexLr: 3000,
+};
 
 /**
  * Su quale quantita' di contratti si pesa il gamma. `oiVol` = open interest +
  * volume di oggi: il GEX per strike e' gamma x contratti, quindi e' la somma
  * delle altre due misure (gexOi + gex), senza nulla di nuovo dal server.
  */
-type GexBasis = 'volume' | 'oi' | 'oiVol';
-const gexDiBase = (basis: GexBasis, gex: number, gexOi: number) =>
-  basis === 'oi' ? gexOi : basis === 'oiVol' ? gex + gexOi : gex;
+type GexBasis = 'volume' | 'oi' | 'oiVol' | 'oiContratti' | 'dexVol' | 'dexOi' | 'dexLr';
+/** Il valore di uno strike nella base scelta. */
+const gexDiBase = (basis: GexBasis, r: ProfileRow) =>
+  basis === 'oi' ? r.gexOi : basis === 'oiVol' ? r.gex + r.gexOi : basis === 'oiContratti' ? (r.oi ?? 0)
+    : basis === 'dexVol' ? (r.dex ?? 0) : basis === 'dexOi' ? (r.dexOi ?? 0) : basis === 'dexLr' ? (r.dexLr ?? 0) : r.gex;
+/** La stessa scelta su una fotografia della serie (valori nell'ordine degli strike). */
+const serieDiBase = (basis: GexBasis, f: SerieFrame): number[] => {
+  const zeri = () => f.gex.map(() => 0);
+  switch (basis) {
+    case 'oi': return f.gexOi;
+    case 'oiVol': return f.gex.map((v, i) => v + (f.gexOi[i] ?? 0));
+    case 'oiContratti': return f.oi ?? zeri();
+    case 'dexVol': return f.dex ?? zeri();
+    case 'dexOi': return f.dexOi ?? zeri();
+    case 'dexLr': return f.dexLr ?? zeri();
+    default: return f.gex;
+  }
+};
+/**
+ * DEX (19/11/2026): delta in mano a chi ha le opzioni, call + e put −, in M$ di delta (SPX x 100 x
+ * contratti x delta). Volume e OI suppongono i clienti compratori di tutto; Lee-Ready usa i netti
+ * comprati dai clienti. Positivo = dealer corti di delta, coperti comprando futures.
+ */
+const isDex = (basis: GexBasis) => basis === 'dexVol' || basis === 'dexOi' || basis === 'dexLr';
+const sigla = (basis: GexBasis) => (isDex(basis) ? 'DEX' : 'GEX');
+/**
+ * `oiContratti` (19/11/2026): l'open interest netto in contratti, call - put, senza gamma. Il GEX OI
+ * cambia per tutto il giorno anche a posizioni ferme, perche' il gamma si muove con lo spot e col
+ * tempo alla scadenza; questa base resta ferma come l'OI. Unita': contratti, non M$.
+ */
+const inContratti = (basis: GexBasis) => basis === 'oiContratti';
 
 /**
  * Ogni quanto il client allunga la storia del profilo. E' lo stesso passo con
@@ -338,6 +380,10 @@ export default function GexPage() {
                 time: oraEt,
                 gex: strikes.map((k) => Math.round(mappa.get(k)?.gex ?? 0)),
                 gexOi: strikes.map((k) => Math.round(mappa.get(k)?.gexOi ?? 0)),
+                oi: strikes.map((k) => mappa.get(k)?.oi ?? 0),
+                dex: strikes.map((k) => Math.round(mappa.get(k)?.dex ?? 0)),
+                dexOi: strikes.map((k) => Math.round(mappa.get(k)?.dexOi ?? 0)),
+                dexLr: strikes.map((k) => Math.round(mappa.get(k)?.dexLr ?? 0)),
               }];
             });
           }
@@ -451,8 +497,15 @@ export default function GexPage() {
   const gexProfile = useMemo(() => {
     // Il totale di giornata arriva gia' cumulato dal server: qui si sceglie
     // solo quale misura mostrare (OI + volume = somma delle due).
-    return profile.map((p) => ({ strike: p.strike, gex: gexDiBase(gexBasis, p.gex, p.gexOi) }));
+    return profile.map((p) => ({ strike: p.strike, gex: gexDiBase(gexBasis, p) }));
   }, [profile, gexBasis]);
+
+  /** Totali del profilo nella base scelta: somma degli strike positivi, dei negativi e netto. */
+  const totali = useMemo(() => {
+    let pos = 0, neg = 0;
+    for (const p of gexProfile) { if (p.gex > 0) pos += p.gex; else neg += p.gex; }
+    return { pos, neg, netto: pos + neg };
+  }, [gexProfile]);
 
   const currentBasis = useMemo(() => {
     for (let i = spxHistory.length - 1; i >= 0; i--) {
@@ -688,8 +741,7 @@ export default function GexPage() {
       const strikeSerie = latestStrikes.current;
       const fotogrammi = latestSerie.current.map((f) => {
         const t = f.time.includes(':') ? f.time : `${f.time}:00`;
-        return { t: new Date(`${todayStr}T${t}`).getTime(), valori: gexBasis === 'oiVol' ? f.gex.map((v, i) => v + (f.gexOi[i] ?? 0))
-          : gexBasis === 'oi' ? f.gexOi : f.gex };
+        return { t: new Date(`${todayStr}T${t}`).getTime(), valori: serieDiBase(gexBasis, f) };
       }).filter((f) => !isNaN(f.t));
       // L'ultima colonna e' il profilo di adesso, non la fotografia di due
       // minuti fa: cosi' il bordo destro della mappa e' il muro attuale.
@@ -715,7 +767,7 @@ export default function GexPage() {
     };
 
     const posGexDataset = {
-      type: 'bar' as const, chiave: 'gex-pos', label: 'Positive GEX (M$/1%)',
+      type: 'bar' as const, chiave: 'gex-pos', label: inContratti(gexBasis) ? 'OI netto call (contratti)' : isDex(gexBasis) ? 'DEX + (M$ di delta)' : 'Positive GEX (M$/1%)',
       data: currentGexProfile.map((p) => ({ x: p.gex > 0 ? p.gex : 0, y: p.strike })),
       xAxisID: 'xGex', yAxisID: 'y',
       backgroundColor: (ctx: any) => `rgba(34, 197, 94, ${intensita(ctx, 0.12, 0.75)})`,
@@ -723,7 +775,7 @@ export default function GexPage() {
       borderWidth: 1, barThickness: 8, indexAxis: 'y' as const,
     };
     const negGexDataset = {
-      type: 'bar' as const, chiave: 'gex-neg', label: 'Negative GEX (M$/1%)',
+      type: 'bar' as const, chiave: 'gex-neg', label: inContratti(gexBasis) ? 'OI netto put (contratti)' : isDex(gexBasis) ? 'DEX − (M$ di delta)' : 'Negative GEX (M$/1%)',
       data: currentGexProfile.map((p) => ({ x: p.gex < 0 ? Math.abs(p.gex) : 0, y: p.strike })),
       xAxisID: 'xGex', yAxisID: 'y',
       backgroundColor: (ctx: any) => `rgba(239, 68, 68, ${intensita(ctx, 0.12, 0.75)})`,
@@ -1080,6 +1132,7 @@ export default function GexPage() {
         chart.data.datasets[i].data = ds.data as any;
         if ('backgroundColor' in ds) chart.data.datasets[i].backgroundColor = ds.backgroundColor as any;
         if ('borderColor' in ds) chart.data.datasets[i].borderColor = ds.borderColor as any;
+        chart.data.datasets[i].label = ds.label;
       } else {
         chart.data.datasets[i] = ds as any;
       }
@@ -1087,6 +1140,11 @@ export default function GexPage() {
     if (chart.data.datasets.length > newDatasets.length) {
       chart.data.datasets.length = newDatasets.length;
     }
+
+    // Il titolo dell'asse segue la base: M$ per 1% oppure contratti.
+    const asseGex = (chart.options.scales as any)?.xGex;
+    if (asseGex?.title) asseGex.title.text = inContratti(gexBasis) ? 'Open interest netto (contratti, call - put)'
+      : isDex(gexBasis) ? 'SPX Delta Exposure (M$ di delta, call + / put −)' : 'SPX Gamma Exposure (M$ per 1%)';
 
     // Update annotations
     const annOpts = (chart.options.plugins as any)?.annotation;
@@ -1134,7 +1192,7 @@ export default function GexPage() {
     }
 
     chart.update('none');
-  }, [spxHistory, gexProfile, lineAnnotations, yLimits, timeWindow, lineDate, buildDatasets]);
+  }, [spxHistory, gexProfile, lineAnnotations, yLimits, timeWindow, lineDate, buildDatasets, gexBasis]);
 
   // ─── Reset zoom ───
   const handleResetZoom = useCallback(() => {
@@ -1193,6 +1251,28 @@ export default function GexPage() {
             >
               OI + Volume
             </button>
+            <button
+              onClick={() => setGexBasis('oiContratti')}
+              title="Open interest netto per strike in contratti (call - put), senza gamma: resta fermo per tutta la giornata, come l'OI"
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${gexBasis === 'oiContratti' ? 'bg-slate-800 text-teal-400 shadow-md border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              OI contratti
+            </button>
+            <span className="text-[10px] font-bold text-slate-500 pl-2 pr-0.5 border-l border-slate-700/60">DEX</span>
+            {([
+              ['dexVol', 'Volume', 'Delta dei contratti scambiati oggi, call + / put −, come se i clienti avessero comprato tutto: flusso. Positivo = dealer corti di delta (coperti comprando futures)'],
+              ['dexOi', 'OI', 'Delta delle posizioni aperte (OI di ieri sera) alla delta di adesso, call + / put −: il DEX canonico'],
+              ['dexLr', 'Lee-Ready', 'Delta netta comprata dai clienti oggi, classificata trade per trade (comprate − vendute): la sola con il lato vero. Solo da quando il poller conta, niente posizioni pregresse'],
+            ] as const).map(([b, nome, spiega]) => (
+              <button
+                key={b}
+                onClick={() => setGexBasis(b)}
+                title={spiega}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-all ${gexBasis === b ? 'bg-slate-800 text-teal-400 shadow-md border border-slate-700/60' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                {nome}
+              </button>
+            ))}
             {isZoomed && (
               <button
                 onClick={handleResetZoom}
@@ -1202,6 +1282,47 @@ export default function GexPage() {
               </button>
             )}
           </div>
+
+          {gexProfile.length > 0 && (() => {
+            const fmt = (v: number) => {
+              const segno = v > 0 ? '+' : v < 0 ? '−' : '';
+              const a = Math.abs(v);
+              if (inContratti(gexBasis)) return `${segno}${Math.round(a).toLocaleString('it-IT')}`;
+              return a >= 1000 ? `${segno}${(a / 1000).toFixed(2)} Bn` : `${segno}${a.toFixed(0)} M`;
+            };
+            return (
+              <div
+                className="flex items-center gap-3 bg-slate-900/60 px-3 py-1.5 rounded-lg border border-slate-800 font-mono text-xs whitespace-nowrap"
+                title={inContratti(gexBasis)
+                  ? 'Somma sugli strike del profilo: OI netto degli strike con piu\' call (+), con piu\' put (−), e il netto. In contratti'
+                  : isDex(gexBasis)
+                    ? 'Somma sugli strike del profilo: DEX degli strike positivi, dei negativi, e il netto. In $ di delta (1 M$ ≈ 2,7 contratti ES)'
+                    : 'Somma sugli strike del profilo nella base scelta: strike con GEX positivo, con GEX negativo, e il netto. In $ per 1% di SPX'}
+              >
+                <span className="text-green-400">{sigla(gexBasis)}+ {fmt(totali.pos)}</span>
+                <span className="text-red-400">{sigla(gexBasis)}− {fmt(totali.neg)}</span>
+                <span className={totali.netto >= 0 ? 'text-green-300 font-bold' : 'text-red-300 font-bold'}>Net {fmt(totali.netto)}</span>
+                {inContratti(gexBasis) && <span className="text-slate-500">contratti</span>}
+              </div>
+            );
+          })()}
+
+          {zeroGamma.cboe && (zeroGamma.cboe.gexOiB != null || zeroGamma.cboe.gexVolB != null) && (() => {
+            const c = zeroGamma.cboe;
+            const fmtB = (v: number | null) => v == null ? '—' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(2)} B$`;
+            const colore = (v: number | null) => v == null ? 'text-slate-500' : v >= 0 ? 'text-green-400' : 'text-red-400';
+            return (
+              <div
+                className="flex items-center gap-3 bg-slate-900/60 px-3 py-1.5 rounded-lg border border-slate-800 font-mono text-xs whitespace-nowrap"
+                title={`GEX netto di tutta la catena SPX (tutte le scadenze, non solo 0DTE), in miliardi di $ per 1% di SPX: gamma Cboe x open interest / x volume di oggi, call +, put -. Catena Cboe ritardata di 15 minuti, delle ${c.ora}, spot ${c.spot}`}
+              >
+                <span className="text-slate-500">Catena</span>
+                <span className={colore(c.gexOiB)}>GEX by OI {fmtB(c.gexOiB)}</span>
+                <span className={colore(c.gexVolB)}>GEX by Vol {fmtB(c.gexVolB)}</span>
+                <span className="text-slate-600">{c.ora.slice(0, 5)}</span>
+              </div>
+            );
+          })()}
 
           <div className="flex items-center gap-1 bg-slate-900/60 p-0.5 rounded-lg border border-slate-800">
             {(['5', '15', '30', 'all'] as const).map((w) => (
@@ -1285,7 +1406,7 @@ export default function GexPage() {
             )}
             {fondoMappa > 0 && (
               <span className="text-slate-500 font-mono text-[10px] whitespace-nowrap" title={modoMappa === 'livello' ? "Il colore pieno: il muro piu' grande della sessione" : "Il colore pieno: 98° percentile delle variazioni della sessione"}>
-                pieno = {modoMappa === 'variazione' ? '±' : ''}{(fondoMappa / 1000).toFixed(1)} Bn
+                pieno = {modoMappa === 'variazione' ? '±' : ''}{inContratti(gexBasis) ? `${Math.round(fondoMappa).toLocaleString('it-IT')} contratti` : `${(fondoMappa / 1000).toFixed(1)} Bn`}
               </span>
             )}
             {currentBasis !== 0 && (
