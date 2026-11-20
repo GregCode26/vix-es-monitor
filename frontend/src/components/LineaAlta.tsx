@@ -95,6 +95,10 @@ export default function LineaAlta({ incorporata = false }: { incorporata?: boole
   const canvas = useRef<HTMLCanvasElement | null>(null);
   const grafico = useRef<ChartJS | null>(null);
   const [pronto, setPronto] = useState(false);
+  // Linea della pressione (verde/rossa) accesa/spenta dal tasto: l'effetto che ricostruisce
+  // i dataset la nasconde da questo stato, quindi i refresh da 10 s non la riaccendono.
+  const [lineaOn, setLineaOn] = useState(true);
+  const commutaLinea = () => setLineaOn((v) => !v);
   const cambi = useRef<Cambio[]>([]);
   /** Posizione del mouse sul grafico, in pixel, per il mirino. */
   const mirino = useRef<{ x: number; y: number } | null>(null);
@@ -332,10 +336,12 @@ export default function LineaAlta({ incorporata = false }: { incorporata?: boole
     }
     cambi.current = lista;
     // Frecce: dove il segnale cambia verso (stessa regola dello studio), sulla linea di ES.
+    // Solo verdi con lo strike sopra l'ATM e solo rosse con lo strike sotto (richiesta utente 20/11):
+    // il cambio di verso conta sempre, si salta solo il disegno della freccia dell'altro colore.
     const su: { x: number; y: number }[] = [], giu: { x: number; y: number }[] = [];
     let prec = 0;
     for (const e of eventi) {
-      if (e.seg !== prec) {
+      if (e.seg !== prec && ((e.seg > 0 && e.lato > 0) || (e.seg < 0 && e.lato < 0))) {
         const y = valoreA(es, e.t);
         if (y != null) (e.seg > 0 ? su : giu).push({ x: x(e.t), y });
       }
@@ -363,9 +369,9 @@ export default function LineaAlta({ incorporata = false }: { incorporata?: boole
         label: 'Cambio strike', data: lista, yAxisID: 'es', showLine: false, pointRadius: 3.5,
         backgroundColor: lista.map((q) => q.colore), borderColor: '#0c0d10', borderWidth: 1,
       },
-    ] as ChartConfiguration<'line'>['data']['datasets']).map((d, i) => ({ ...d, hidden: nascoste[i] ?? false }));
+    ] as ChartConfiguration<'line'>['data']['datasets']).map((d, i) => ({ ...d, hidden: i === 0 ? !lineaOn : (nascoste[i] ?? false) }));
     ch.update('none');
-  }, [punti, es, eventi, k, pronto]);
+  }, [punti, es, eventi, k, pronto, lineaOn]);
 
   if (!autorizzato) return null;
 
@@ -386,6 +392,10 @@ export default function LineaAlta({ incorporata = false }: { incorporata?: boole
             {[1, 2, 5].map((v) => <option key={v} value={v}>{v} min</option>)}
           </select>
         </label>
+        <button onClick={commutaLinea} title="Mostra/nasconde la linea della pressione (verde = strike sopra ATM, rosso = sotto)"
+          className={`px-3 py-1 text-xs border rounded ${lineaOn ? 'bg-emerald-900/50 border-emerald-700 text-emerald-200' : 'bg-slate-800 border-slate-700 text-slate-500'}`}>
+          Linea verde/rossa: {lineaOn ? 'ON' : 'OFF'}
+        </button>
         <button onClick={() => grafico.current?.resetZoom()} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">Reset zoom</button>
         {!incorporata && <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">MARKET MAKER</button>}
         {!incorporata && <button onClick={() => router.push('/market')} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">MARKET</button>}
