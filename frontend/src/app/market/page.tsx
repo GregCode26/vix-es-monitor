@@ -2958,6 +2958,7 @@ export default function MarketPage() {
                             <button onClick={() => router.push('/linea-alta')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Verifica: la linea piu' alta della serie di MARKET MAKER contro ES">LINEA ALTA</button>
                             <button onClick={() => router.push('/livelli-azionari')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Straddle e livelli L1/L2/L3 di un'azione sulle 3 scadenze più vicine, da IBKR (solo locale)">LIVELLI AZIONARI</button>
                             <button onClick={() => router.push('/vendita-opzioni')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Put e call da vendere a ~45 giorni sui titoli in portafoglio, con la IV rispetto al suo anno (solo locale)">VENDITA OPZIONI</button>
+                            <button onClick={() => router.push('/dax')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">DAX</button>
                         </div>
                     </div>
 
