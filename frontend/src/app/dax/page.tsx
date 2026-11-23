@@ -7,7 +7,7 @@ import annotationPlugin from 'chartjs-plugin-annotation';
 import { Line } from 'react-chartjs-2';
 import {
     type Gamba, type Impostazioni, type Mercato, type Scenario, type TipoGamba,
-    bs, curva, dataDa, giorniTra, griglia, isoGiorno, ivImplicita, pareggi, scadenzaTrimestraleVicinaA, scadenzaVicinaA, totali, valutaGamba,
+    bs, curva, dataDa, giorniTra, griglia, isoGiorno, ivImplicita, pareggi, riporto, riportoDaParita, scadenzaTrimestraleVicinaA, scadenzaVicinaA, totali, valutaGamba,
 } from '@/lib/daxStrategia';
 
 ChartJS.register(LinearScale, PointElement, LineElement, Tooltip, Filler, LineController, ScatterController, annotationPlugin);
@@ -152,13 +152,15 @@ function Bottone({ onClick, children, tono = 'neutro', titolo, disabled }: {
  * Simboli provati nel widget incorporato (23/11/2026): XETR:DAX e EUREX:FDAX1!
  * danno solo D/W/M (dati di fine giornata fuori da tradingview.com), TVC:DEU40
  * non e' disponibile, Pepperstone/Capital.com restano vuoti. Al minuto
- * funzionano solo i CFD OANDA e FOREX.com. Il grafico parte sul giornaliero.
+ * funzionano solo i CFD OANDA e FOREX.com, gli unici aggiornati in tempo reale
+ * (Xetra e FDAX nel widget sono dati di fine giornata: la candela di oggi manca).
+ * Il grafico parte sul giornaliero.
  */
 const SIMBOLI_TV = [
-    { s: 'XETR:DAX', n: 'DAX indice Xetra' },
-    { s: 'EUREX:FDAX1!', n: 'FDAX future' },
-    { s: 'OANDA:DE30EUR', n: 'DAX CFD OANDA (anche intraday)' },
-    { s: 'FOREXCOM:GRXEUR', n: 'DAX CFD FOREX.com (anche intraday)' },
+    { s: 'OANDA:DE30EUR', n: 'DAX CFD OANDA (tempo reale)' },
+    { s: 'FOREXCOM:GRXEUR', n: 'DAX CFD FOREX.com (tempo reale)' },
+    { s: 'XETR:DAX', n: 'DAX indice Xetra (fermo a ieri)' },
+    { s: 'EUREX:FDAX1!', n: 'FDAX future (fermo a ieri)' },
 ];
 
 function GraficoTradingView({ onClose }: { onClose: () => void }) {
@@ -252,10 +254,14 @@ export default function DaxPage() {
 
     // IBKR
     const [inLettura, setInLettura] = useState(false);
-    const [auto, setAuto] = useState(false);
+    const [auto, setAuto] = useState(true);
+    const [ivMercato, setIvMercato] = useState(true);
+    const leggiRef = useRef<(() => void) | null>(null);
+    const inLetturaRef = useRef(false);
     const [statoIbkr, setStatoIbkr] = useState<string>('');
     const [scadenzeIbkr, setScadenzeIbkr] = useState<string[]>([]);
     const [mostraTv, setMostraTv] = useState(false);
+    const [fonteIndice, setFonteIndice] = useState('a mano');
 
     // modello strategia
     const [mostraModello, setMostraModello] = useState(false);
@@ -319,22 +325,47 @@ export default function DaxPage() {
             });
             const j: RispostaIbkr = await r.json();
             if (!r.ok || j.errore) { setStatoIbkr(j.errore || `errore ${r.status}`); return; }
+            // L'indice DAX senza abbonamento arriva ritardato di 15 min mentre future e
+            // opzioni sono live: in quel caso l'indice = future live - base di ieri
+            // (close future - close indice), altrimenti IV e P&L partono da un prezzo vecchio.
+            const futLive = j.future?.last ?? (j.future?.bid && j.future?.ask ? (j.future.bid + j.future.ask) / 2 : null);
+            const idxIbkr = j.indice?.last ?? (j.indice?.bid && j.indice?.ask ? (j.indice.bid + j.indice.ask) / 2 : null);
+            const ritardato = !!j.indice?.tipoDati?.includes('delayed');
+            const daFuture = ritardato && j.future?.tipoDati === 'live' && futLive != null && j.future?.close && j.indice?.close
+                ? Math.round((futLive - (j.future.close - j.indice.close)) * 100) / 100 : null;
+            setFonteIndice(daFuture != null ? `da future (IBKR ritardato: ${fmt(idxIbkr, 0)})` : ritardato ? 'IBKR ritardato 15 min' : 'IBKR');
+            const indiceNuovo = daFuture ?? idxIbkr;
+            let carry: number | null = null;
+            if (j.atm?.put != null && j.atm?.call != null && indiceNuovo) {
+                const T = Math.max(0, giorniTra(new Date(), dataDa(j.atm.scadenza))) / 365;
+                carry = riportoDaParita(j.atm.call, j.atm.put, j.atm.strike, indiceNuovo, T, imp.tasso / 100);
+            }
             setMkt(m => ({
-                indiceLast: j.indice?.last ?? (j.indice?.bid && j.indice?.ask ? (j.indice.bid + j.indice.ask) / 2 : m.indiceLast),
+                indiceLast: indiceNuovo ?? m.indiceLast,
                 indiceClose: j.indice?.close ?? m.indiceClose,
-                futureLast: j.future?.last ?? (j.future?.bid && j.future?.ask ? (j.future.bid + j.future.ask) / 2 : m.futureLast),
+                futureLast: futLive ?? m.futureLast,
                 futureClose: j.future?.close ?? m.futureClose,
+                carry: carry != null && j.atm ? { ...(m.carry ?? {}), [j.atm.scadenza]: carry } : m.carry,
             }));
             if (j.scadenze) setScadenzeIbkr(j.scadenze);
             if (j.atm?.iv != null) setIvAtm(j.atm.iv);
             const perId = new Map((j.gambe ?? []).map(q => [q.id, q]));
-            let errori = 0;
+            const errori = (j.gambe ?? []).filter(q => q.errore).length;
+            // Con "IV dal mercato" la IV di ogni gamba si ricalcola dal mid (stesso modello
+            // del grafico), cosi' valore simulato = prezzo di mercato e il P&L e' quello vero.
+            const tasso = imp.tasso / 100;
             setGambe(gs => gs.map(g => {
                 const q = perId.get(g.id);
-                if (!q) return g;
-                if (q.errore) { errori++; return g; }
+                if (!q || q.errore) return g;
                 const mid = q.mid ?? q.last ?? q.close ?? null;
-                return { ...g, mid: mid ?? g.mid, ivIbkr: q.iv ?? null, apertura: g.apertura ?? mid } as Gamba;
+                let iv = g.iv ?? q.iv ?? null;
+                if (ivMercato && g.tipo !== 'F') {
+                    const T = Math.max(0, giorniTra(new Date(), dataDa(g.scadenza))) / 365;
+                    const b = carry != null && j.atm?.scadenza === g.scadenza ? carry : riporto(g.scadenza, imp, mkt);
+                    const daMid = mid != null && indiceNuovo ? ivImplicita(g.tipo, mid, indiceNuovo, g.strike, T, tasso, b) : null;
+                    iv = daMid != null ? Math.round(daMid * 100) / 100 : (q.iv ?? iv);
+                }
+                return { ...g, mid: mid ?? g.mid, ivIbkr: q.iv ?? null, iv, apertura: g.apertura ?? mid } as Gamba;
             }));
             const tipo = j.indice?.tipoDati ? ` (${j.indice.tipoDati})` : '';
             setStatoIbkr(`IBKR ${new Date().toLocaleTimeString('it-IT')}${tipo}${errori ? ` · ${errori} gambe non trovate` : ''}`);
@@ -343,13 +374,21 @@ export default function DaxPage() {
         } finally {
             setInLettura(false);
         }
-    }, [imp.classeFuture]);
+    }, [imp, mkt, ivMercato]);
 
     useEffect(() => {
-        if (!auto) return;
-        const t = setInterval(() => { if (!inLettura) leggiIbkr(); }, 60_000);
+        leggiRef.current = leggiIbkr;
+    }, [leggiIbkr]);
+    useEffect(() => { inLetturaRef.current = inLettura; }, [inLettura]);
+
+    // auto: una lettura subito all'apertura della pagina, poi ogni 60 s
+    useEffect(() => {
+        if (!auto || !caricato || !locale) return;
+        const leggi = () => { if (!inLetturaRef.current) leggiRef.current?.(); };
+        leggi();
+        const t = setInterval(leggi, 60_000);
         return () => clearInterval(t);
-    }, [auto, inLettura, leggiIbkr]);
+    }, [auto, caricato, locale]);
 
     // ----- scenario -----
     const oggiReale = useMemo(() => new Date(), []);
@@ -443,7 +482,7 @@ export default function DaxPage() {
         if (g.tipo === 'F' || g.chiusura != null || !indiceLive) return g;
         const prezzo = g.mid ?? g.apertura;
         const T = Math.max(0, giorniTra(new Date(), dataDa(g.scadenza))) / 365;
-        const iv = prezzo != null ? ivImplicita(g.tipo, prezzo, indiceLive, g.strike, T, imp.tasso / 100) : null;
+        const iv = prezzo != null ? ivImplicita(g.tipo, prezzo, indiceLive, g.strike, T, imp.tasso / 100, riporto(g.scadenza, imp, mkt)) : null;
         return iv != null ? { ...g, iv: Math.round(iv * 100) / 100 } : g;
     }));
     const usaIvIbkr = () => setGambe(gs => gs.map(g => (g.ivIbkr != null ? { ...g, iv: g.ivIbkr } : g)));
@@ -547,6 +586,9 @@ export default function DaxPage() {
                         <label className="flex items-center gap-1 text-[10px] text-slate-400" title="Rilegge IBKR ogni 60 secondi">
                             <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} disabled={!locale} /> auto 60s
                         </label>
+                        <label className="flex items-center gap-1 text-[10px] text-slate-400" title="A ogni lettura IBKR la IV di ogni gamba si ricalcola dal mid: grafico e P&L seguono i prezzi di mercato. Spento = IV scritte a mano">
+                            <input type="checkbox" checked={ivMercato} onChange={(e) => setIvMercato(e.target.checked)} /> IV dal mercato
+                        </label>
                         <Link href="/market" className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[10px] transition-colors">← MARKET</Link>
                     </div>
                 </div>
@@ -558,8 +600,9 @@ export default function DaxPage() {
                     <Card titolo={<>S1 · indice DAX</>}>
                         <div className="text-xl font-bold font-mono text-cyan-400">{fmt(mkt.indiceLast, 0)}</div>
                         <div className={`text-xs font-mono ${colore(varIndice)}`}>{varIndice == null ? '—' : `${varIndice > 0 ? '+' : ''}${fmt(varIndice)}%`}</div>
+                        <div className={`text-[9px] ${fonteIndice.startsWith('da future') ? 'text-amber-400' : 'text-slate-500'}`}>{fonteIndice}</div>
                         <div className="mt-2 space-y-1">
-                            <Campo etichetta="last"><Num valore={mkt.indiceLast} onChange={(v) => setMkt(m => ({ ...m, indiceLast: v }))} className="w-20" /></Campo>
+                            <Campo etichetta="last"><Num valore={mkt.indiceLast} onChange={(v) => { setFonteIndice('a mano'); setMkt(m => ({ ...m, indiceLast: v })); }} className="w-20" /></Campo>
                             <Campo etichetta="close"><Num valore={mkt.indiceClose} onChange={(v) => setMkt(m => ({ ...m, indiceClose: v }))} className="w-20" /></Campo>
                         </div>
                     </Card>
@@ -575,6 +618,11 @@ export default function DaxPage() {
                             {varFuture == null ? '—' : `${varFuture > 0 ? '+' : ''}${fmt(varFuture)}%`}
                             {mkt.futureLast != null && mkt.indiceLast != null && <span className="text-slate-500 ml-2">base {fmt(mkt.futureLast - mkt.indiceLast, 1)}</span>}
                         </div>
+                        {Object.entries(mkt.carry ?? {}).map(([sc, c]) => (
+                            <div key={sc} className="text-[9px] text-slate-500" title="Riporto implicito dalla parità put-call ATM: le opzioni si prezzano sul forward indice·e^(riporto·T)">
+                                riporto {sc} <span className="font-mono text-slate-300">{fmt(c * 100, 2)}%</span>
+                            </div>
+                        ))}
                         <div className="mt-2 space-y-1">
                             <Campo etichetta="last"><Num valore={mkt.futureLast} onChange={(v) => setMkt(m => ({ ...m, futureLast: v }))} className="w-20" /></Campo>
                             <Campo etichetta="close"><Num valore={mkt.futureClose} onChange={(v) => setMkt(m => ({ ...m, futureClose: v }))} className="w-20" /></Campo>

@@ -37,6 +37,14 @@ export interface Mercato {
     indiceClose: number | null;
     futureLast: number | null;
     futureClose: number | null;
+    /**
+     * Riporto annuo implicito per scadenza (YYYY-MM-DD), da parita' put-call ATM:
+     * forward = indice x e^(riporto x T). Senza, si usa il tasso. Il 23/11/2026 il
+     * forward di mar 27 era 25.292 con l'indice a 24.991 (riporto ~3,8%, non il
+     * 2% del tasso): con il solo tasso la IV ATM usciva 18,4 contro 19,45 di IBKR,
+     * con il forward 19,46.
+     */
+    carry?: Record<string, number>;
 }
 
 export interface Scenario {
@@ -58,37 +66,43 @@ export function nCdf(x: number) {
 
 export interface Greche { prezzo: number; delta: number; gamma: number; theta: number; vega: number }
 
-/** Black-Scholes europeo. T in anni, r e sigma decimali. theta per giorno, vega per 1 punto di vol. */
-export function bs(tipo: 'C' | 'P', S: number, K: number, T: number, r: number, sigma: number): Greche {
+/**
+ * Black-Scholes europeo con costo di riporto b (= Black-76 sul forward S·e^(bT)).
+ * T in anni, r, b e sigma decimali; b omesso = r. Greche rispetto all'indice:
+ * theta per giorno, vega per 1 punto di vol.
+ */
+export function bs(tipo: 'C' | 'P', S: number, K: number, T: number, r: number, sigma: number, b: number = r): Greche {
     if (T <= 0 || sigma <= 0) {
         const intr = tipo === 'C' ? Math.max(S - K, 0) : Math.max(K - S, 0);
         const delta = tipo === 'C' ? (S > K ? 1 : 0) : (S < K ? -1 : 0);
         return { prezzo: intr, delta, gamma: 0, theta: 0, vega: 0 };
     }
     const sq = Math.sqrt(T);
-    const d1 = (Math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * sq);
+    const d1 = (Math.log(S / K) + (b + sigma * sigma / 2) * T) / (sigma * sq);
     const d2 = d1 - sigma * sq;
     const sc = Math.exp(-r * T);
-    const gamma = nPdf(d1) / (S * sigma * sq);
-    const vega = S * nPdf(d1) * sq / 100;
+    const sb = Math.exp((b - r) * T);
+    const gamma = sb * nPdf(d1) / (S * sigma * sq);
+    const vega = S * sb * nPdf(d1) * sq / 100;
+    const decad = -S * sb * nPdf(d1) * sigma / (2 * sq);
     if (tipo === 'C') {
-        const prezzo = S * nCdf(d1) - K * sc * nCdf(d2);
-        const theta = (-S * nPdf(d1) * sigma / (2 * sq) - r * K * sc * nCdf(d2)) / 365;
-        return { prezzo, delta: nCdf(d1), gamma, theta, vega };
+        const prezzo = S * sb * nCdf(d1) - K * sc * nCdf(d2);
+        const theta = (decad - (b - r) * S * sb * nCdf(d1) - r * K * sc * nCdf(d2)) / 365;
+        return { prezzo, delta: sb * nCdf(d1), gamma, theta, vega };
     }
-    const prezzo = K * sc * nCdf(-d2) - S * nCdf(-d1);
-    const theta = (-S * nPdf(d1) * sigma / (2 * sq) + r * K * sc * nCdf(-d2)) / 365;
-    return { prezzo, delta: nCdf(d1) - 1, gamma, theta, vega };
+    const prezzo = K * sc * nCdf(-d2) - S * sb * nCdf(-d1);
+    const theta = (decad + (b - r) * S * sb * nCdf(-d1) + r * K * sc * nCdf(-d2)) / 365;
+    return { prezzo, delta: sb * (nCdf(d1) - 1), gamma, theta, vega };
 }
 
 /** IV implicita (in %) dal prezzo, per bisezione. null se il prezzo e' sotto l'intrinseco. */
-export function ivImplicita(tipo: 'C' | 'P', prezzo: number, S: number, K: number, T: number, r: number): number | null {
+export function ivImplicita(tipo: 'C' | 'P', prezzo: number, S: number, K: number, T: number, r: number, b: number = r): number | null {
     if (!(prezzo > 0) || T <= 0) return null;
     let lo = 0.001, hi = 3;
-    if (bs(tipo, S, K, T, r, lo).prezzo > prezzo || bs(tipo, S, K, T, r, hi).prezzo < prezzo) return null;
+    if (bs(tipo, S, K, T, r, lo, b).prezzo > prezzo || bs(tipo, S, K, T, r, hi, b).prezzo < prezzo) return null;
     for (let i = 0; i < 100; i++) {
         const m = (lo + hi) / 2;
-        if (bs(tipo, S, K, T, r, m).prezzo > prezzo) hi = m; else lo = m;
+        if (bs(tipo, S, K, T, r, m, b).prezzo > prezzo) hi = m; else lo = m;
         if (hi - lo < 1e-6) break;
     }
     return ((lo + hi) / 2) * 100;
@@ -135,6 +149,18 @@ export interface ValoreGamba extends Greche {
     chiusa: boolean;
 }
 
+/** Riporto annuo della scadenza: quello implicito letto da IBKR, altrimenti il tasso. */
+export function riporto(scadenza: string, imp: Impostazioni, mkt: Mercato): number {
+    return mkt.carry?.[scadenza] ?? imp.tasso / 100;
+}
+
+/** Riporto implicito dalla parita' put-call: F = (C - P)·e^(rT) + K, b = ln(F/S)/T. */
+export function riportoDaParita(call: number, put: number, K: number, S: number, T: number, r: number): number | null {
+    if (!(T > 0) || !(S > 0)) return null;
+    const F = (call - put) * Math.exp(r * T) + K;
+    return F > 0 ? Math.log(F / S) / T : null;
+}
+
 /** Valore di una gamba nello scenario. Gambe chiuse: P&L realizzato, greche zero. */
 export function valutaGamba(g: Gamba, sc: Scenario, imp: Impostazioni, mkt: Mercato): ValoreGamba {
     const molt = g.tipo === 'F' ? imp.moltFuture : imp.moltOpzioni;
@@ -158,7 +184,7 @@ export function valutaGamba(g: Gamba, sc: Scenario, imp: Impostazioni, mkt: Merc
         gr = { prezzo: sc.indice + base, delta: 1, gamma: 0, theta: 0, vega: 0 };
     } else {
         const sigma = Math.max(0.01, ((g.iv ?? 20) + sc.shiftIv) / 100);
-        gr = bs(g.tipo, sc.indice, g.strike, T, imp.tasso / 100, sigma);
+        gr = bs(g.tipo, sc.indice, g.strike, T, imp.tasso / 100, sigma, riporto(g.scadenza, imp, mkt));
     }
     const punti = (gr.prezzo - apertura) * g.qta;
     return {
