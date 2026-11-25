@@ -22,7 +22,7 @@ from datetime import date
 from ib_insync import IB, Future, Index, Option
 
 ATTESA_QUOTE_S = 6.0
-BLOCCO = 6
+BLOCCO = 8
 TIPI_DATI = {1: 'live', 2: 'frozen', 3: 'delayed', 4: 'delayed-frozen'}
 
 
@@ -150,6 +150,88 @@ def calcola(ib: IB, richiesta: dict) -> dict:
     return risultato
 
 
+def spot_stimato(t_idx, t_fut) -> tuple[float | None, str]:
+    """Indice DAX: se IBKR lo da' ritardato e il future e' live, future - base di ieri."""
+    idx = t_idx.last if positivo(t_idx.last) else t_idx.close
+    ritardato = t_idx.marketDataType in (3, 4)
+    if t_fut is not None and ritardato and t_fut.marketDataType == 1:
+        fut = t_fut.last if positivo(t_fut.last) else ((t_fut.bid + t_fut.ask) / 2 if positivo(t_fut.bid) and positivo(t_fut.ask) else None)
+        if fut and positivo(t_fut.close) and positivo(t_idx.close):
+            return fut - (t_fut.close - t_idx.close), 'future - base di ieri'
+    return (idx, 'indice ritardato' if ritardato else 'indice') if positivo(idx) else (None, 'nessuno')
+
+
+def trimestrale(s: str) -> bool:
+    """Terzo venerdi' di marzo/giugno/settembre/dicembre (le scadenze del video)."""
+    d = date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    return d.month in (3, 6, 9, 12) and d.weekday() == 4 and 15 <= d.day <= 21
+
+
+# Zone degli strike in frazione dello spot e passo, come le gambe della strategia (lezione 18/11/2026):
+# V1 largo 500 a ~-3,5/-7% (comprata e venduta), V2 comprata a ~-13/-20%, put vendute a ~-35/-44% (e 200 sotto).
+ZONE = ((0.90, 0.97, 250), (0.80, 0.87, 250), (0.55, 0.66, 200))
+# V2 largo 1000-1500 (1300 nell'ultima versione, 21500/20200): le vendute del V2 sono comprata - larghezza, anche fuori dal passo 250.
+LARGHEZZE_V2 = (1000, 1300, 1500)
+
+
+def catena(ib: IB, richiesta: dict) -> dict:
+    """Put delle scadenze trimestrali tra dteMin e dteMax, sugli strike delle tre zone, piu' l'ATM."""
+    ib.reqMarketDataType(4)
+    indice = Index('DAX', 'EUREX', 'EUR')
+    if not ib.qualifyContracts(indice):
+        return {'errore': 'Indice DAX non trovato su IBKR'}
+    fut = future_vicino(ib, richiesta.get('classeFuture') or 'FDXM')
+    t = leggi(ib, [indice] + ([fut] if fut else []))
+    spot, fonte = spot_stimato(t[0], t[1] if fut else None)
+    if not spot:
+        return {'errore': 'Nessun prezzo per il DAX'}
+
+    catene = ib.reqSecDefOptParams('DAX', '', 'IND', indice.conId)
+    odax = next((c for c in catene if c.tradingClass == 'ODAX' and c.exchange == 'EUREX'), None)
+    if not odax:
+        return {'errore': 'Catena ODAX non trovata'}
+    oggi = date.today()
+    dte_min, dte_max = int(richiesta.get('dteMin', 70)), int(richiesta.get('dteMax', 150))
+    scadenze = []
+    for s in sorted(odax.expirations):
+        dte = (date(int(s[:4]), int(s[4:6]), int(s[6:8])) - oggi).days
+        if trimestrale(s) and dte_min <= dte <= dte_max:
+            scadenze.append((s, dte))
+    scadenze = scadenze[:2]
+    if not scadenze:
+        return {'errore': f'Nessuna scadenza trimestrale tra {dte_min} e {dte_max} giorni'}
+
+    strike_disp = set(odax.strikes)
+    out = []
+    for s, dte in scadenze:
+        iso = f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+        ks = set()
+        for lo, hi, passo in ZONE:
+            k = int(spot * lo // passo * passo)
+            while k <= spot * hi:
+                if k in strike_disp and k >= spot * lo:
+                    ks.add(k)
+                k += passo
+        lo_v2, hi_v2 = ZONE[1][0], ZONE[1][1]
+        for k3 in [k for k in ks if spot * lo_v2 <= k <= spot * hi_v2]:
+            ks.update(k3 - w for w in LARGHEZZE_V2 if k3 - w in strike_disp)
+        # ATM per la parita' sul passo 100 (24950/24975 non esistono su tutte le scadenze, la parita' saltava)
+        k_atm = round(spot / 100) * 100
+        richieste = [{'id': f'P{k}', 'tipo': 'P', 'strike': k, 'scadenza': iso} for k in sorted(ks)]
+        richieste += [{'id': 'atmP', 'tipo': 'P', 'strike': k_atm, 'scadenza': iso},
+                      {'id': 'atmC', 'tipo': 'C', 'strike': k_atm, 'scadenza': iso}]
+        quote = {q['id']: q for q in quota_opzioni(ib, richieste)}
+        put = [{k: q.get(k) for k in ('strike', 'bid', 'ask', 'mid', 'iv', 'delta')}
+               for i, q in quote.items() if i.startswith('P') and not q.get('errore') and (q.get('bid') or q.get('mid'))]
+        a_p, a_c = quote.get('atmP', {}), quote.get('atmC', {})
+        ivs = [x['iv'] for x in (a_p, a_c) if x.get('iv')]
+        out.append({'scadenza': iso, 'dte': dte, 'put': put,
+                    'atm': {'strike': k_atm, 'put': a_p.get('mid'), 'call': a_c.get('mid'),
+                            'iv': tondo(sum(ivs) / len(ivs)) if ivs else None}})
+    return {'spot': tondo(spot), 'fonteSpot': fonte, 'future': base(t[1]) if fut else None,
+            'indiceIbkr': base(t[0]), 'catene': out}
+
+
 def main() -> None:
     try:
         richiesta = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
@@ -161,7 +243,7 @@ def main() -> None:
     try:
         # Fascia propria: poller 1000-9999, studi 20000-29999, scanner 30000-39999.
         ib.connect('127.0.0.1', 7496, clientId=random.randint(40000, 49999), timeout=10, readonly=True)
-        risultato = calcola(ib, richiesta)
+        risultato = catena(ib, richiesta) if richiesta.get('modo') == 'catena' else calcola(ib, richiesta)
     except Exception as e:
         risultato = {'errore': f'IBKR: {e or type(e).__name__}'}
     finally:

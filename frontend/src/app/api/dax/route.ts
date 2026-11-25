@@ -32,9 +32,19 @@ export async function PUT(req: NextRequest) {
     if (process.env.VERCEL) return NextResponse.json({ errore: 'Funziona solo in locale' }, { status: 400 });
     const corpo = await req.json().catch(() => null);
     if (!corpo || typeof corpo !== 'object') return NextResponse.json({ errore: 'Corpo non valido' }, { status: 400 });
+    // Salvataggio partito da una versione diversa da quella sul file (un'altra scheda,
+    // o il file cambiato a mano): non si sovrascrive, si rimanda la posizione attuale.
+    const { base, ...posizione } = corpo as { base?: number | null } & Record<string, unknown>;
+    let attuale: Record<string, unknown> | null = null;
+    try { attuale = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { /* nessun file */ }
+    const versioneAttuale = typeof attuale?.versione === 'number' ? attuale.versione : null;
+    if (versioneAttuale != null && base !== versioneAttuale) {
+        return NextResponse.json({ errore: 'versione cambiata', posizione: attuale }, { status: 409 });
+    }
+    const versione = Date.now();
     fs.mkdirSync(path.dirname(FILE), { recursive: true });
-    fs.writeFileSync(FILE, JSON.stringify(corpo, null, 1));
-    return NextResponse.json({ ok: true });
+    fs.writeFileSync(FILE, JSON.stringify({ ...posizione, versione }, null, 1));
+    return NextResponse.json({ ok: true, versione });
 }
 
 export async function POST(req: NextRequest) {

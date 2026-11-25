@@ -1,10 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 import Link from 'next/link';
 import { Chart as ChartJS, LinearScale, PointElement, LineElement, Tooltip, Filler, LineController, ScatterController, type Plugin } from 'chart.js';
 import annotationPlugin from 'chartjs-plugin-annotation';
 import { Line } from 'react-chartjs-2';
+import type { Candidato } from '@/lib/daxOttimizza';
 import {
     type Gamba, type Impostazioni, type Mercato, type Scenario, type TipoGamba,
     bs, curva, dataDa, giorniTra, griglia, isoGiorno, ivImplicita, pareggi, riporto, riportoDaParita, scadenzaTrimestraleVicinaA, scadenzaVicinaA, totali, valutaGamba,
@@ -36,12 +37,15 @@ function gamba(p: Partial<Gamba>): Gamba {
     };
 }
 
-/** Le gambe del foglio Excel, come esempio iniziale. */
+/** Le gambe del foglio Excel (i due vertical) piu' le put vendute secondo la regola del video, come esempio iniziale. */
 const GAMBE_ESEMPIO: Gamba[] = [
     gamba({ qta: 1, strike: 25000, iv: 17.75, apertura: 665.5, mid: 665.5, gruppo: 'V1' }),
     gamba({ qta: -1, strike: 24500, iv: 18.91, apertura: 548.5, mid: 548.5, gruppo: 'V1' }),
     gamba({ qta: 1, strike: 22000, iv: 24.96, apertura: 228.5, mid: 228.5, gruppo: 'V2' }),
     gamba({ qta: -1, strike: 20700, iv: 28.2, apertura: 152.25, mid: 152.25, gruppo: 'V2' }),
+    // put vendute ~-36% in rapporto 1:2, ai prezzi del 23/11/2026 (DAX 25.017)
+    gamba({ qta: -2, strike: 16000, iv: 42.07, apertura: 49.5, mid: 49.5, gruppo: 'S' }),
+    gamba({ qta: -4, strike: 15800, iv: 42.63, apertura: 46.25, mid: 46.25, gruppo: 'S' }),
 ];
 
 type Zoom = 'strike' | 'passi' | '10' | '25' | '40';
@@ -75,7 +79,23 @@ const REGISTRO_ESEMPIO: Ciclo[] = [
 interface Salvataggio {
     gambe: Gamba[]; imp: Impostazioni; mkt: Mercato; passo: number; zoom: Zoom;
     supporti?: string; registro?: Ciclo[]; ivAtm?: number | null;
+    studio?: Gamba[];      // la strategia da aprire (vista STUDIO); `gambe` e' quella aperta
+    analisi?: Analisi | null;
+    versione?: number;     // ms del salvataggio, messa dal server
 }
+
+/** Risposta di /api/dax/ottimizza: combinazioni calcolate e scelta di Claude. */
+interface Analisi {
+    spot: number; fonteSpot?: string; provate: number; candidati: Candidato[]; ora: string;
+    scelta: { scelta: number; seconda: number; motivazione: string; rischi: string; quando_entrare: string } | null;
+    erroreClaude?: string; modello?: string;
+    caricato?: number | null;  // id del candidato messo nello STUDIO
+}
+
+type Vista = 'aperta' | 'studio';
+
+/** Chiave di un contratto: le due viste possono avere la stessa opzione, IBKR la legge una volta. */
+const chiaveContratto = (g: Gamba) => `${g.tipo}${g.strike}@${g.scadenza}`;
 
 interface RispostaIbkr {
     errore?: string;
@@ -93,6 +113,8 @@ const fmt = (v: number | null | undefined, d = 2) =>
     v == null || !isFinite(v) ? '—' : v.toLocaleString('it-IT', { minimumFractionDigits: d, maximumFractionDigits: d });
 const eur = (v: number | null | undefined, d = 2) => (v == null || !isFinite(v) ? '—' : `${fmt(v, d)} €`);
 const colore = (v: number | null | undefined) => (v == null || Math.abs(v) < 1e-9 ? 'text-slate-300' : v > 0 ? 'text-green-400' : 'text-red-400');
+/** |vega| / theta: fino a 4 bene, 4-5 al limite, oltre troppo esposto alla volatilita' (lezione 18/11/2026). */
+const coloreVegaTheta = (v: number | null | undefined) => (v == null ? 'text-red-400' : v <= 4 ? 'text-green-400' : v <= 5 ? 'text-amber-300' : 'text-red-400');
 const dataLunga = (d: Date) => d.toLocaleDateString('it-IT', { weekday: 'long', day: '2-digit', month: 'short', year: 'numeric' });
 
 // ---------- piccoli componenti ----------
@@ -238,7 +260,17 @@ const etichettePassi: Plugin<'line'> = {
 // ---------- pagina ----------
 
 export default function DaxPage() {
-    const [gambe, setGambe] = useState<Gamba[]>(GAMBE_ESEMPIO);
+    const [gambeAperta, setGambeAperta] = useState<Gamba[]>(GAMBE_ESEMPIO);
+    const [gambeStudio, setGambeStudio] = useState<Gamba[]>([]);
+    const [vista, setVista] = useState<Vista>('aperta');
+    // /dax?vista=studio apre direttamente lo STUDIO
+    useEffect(() => { if (new URLSearchParams(window.location.search).get('vista') === 'studio') setVista('studio'); }, []);
+    const [analisi, setAnalisi] = useState<Analisi | null>(null);
+    const [inAnalisi, setInAnalisi] = useState(false);
+    const [caricatoId, setCaricatoId] = useState<number | null>(null);
+    // Tutta la pagina lavora sulle gambe della vista corrente.
+    const gambe = vista === 'aperta' ? gambeAperta : gambeStudio;
+    const setGambe = useCallback((f: SetStateAction<Gamba[]>) => (vista === 'aperta' ? setGambeAperta : setGambeStudio)(f), [vista]);
     const [imp, setImp] = useState<Impostazioni>(IMP_DEFAULT);
     const [mkt, setMkt] = useState<Mercato>(MKT_DEFAULT);
     const [passo, setPasso] = useState(100);
@@ -272,6 +304,25 @@ export default function DaxPage() {
     const [ivAtm, setIvAtm] = useState<number | null>(15.9);
 
     // ----- caricamento e salvataggio -----
+    // Versione del file che questa scheda ha letto o scritto per ultima: il server
+    // rifiuta (409) un salvataggio partito da una versione vecchia, cosi' una scheda
+    // aperta non cancella cio' che un'altra scheda (o una modifica al file) ha scritto.
+    const versioneRef = useRef<number | null>(null);
+
+    const applica = useCallback((dati: Salvataggio) => {
+        if (Array.isArray(dati.gambe)) setGambeAperta(dati.gambe);
+        if (Array.isArray(dati.studio)) setGambeStudio(dati.studio);
+        if (dati.analisi !== undefined) { setAnalisi(dati.analisi); setCaricatoId(dati.analisi?.caricato ?? null); }
+        if (dati.imp) setImp({ ...IMP_DEFAULT, ...dati.imp });
+        if (dati.mkt) setMkt({ ...MKT_DEFAULT, ...dati.mkt });
+        if (dati.passo) setPasso(dati.passo);
+        if (dati.zoom) setZoom(dati.zoom);
+        if (typeof dati.supporti === 'string') setSupporti(dati.supporti);
+        if (Array.isArray(dati.registro)) setRegistro(dati.registro);
+        if (dati.ivAtm !== undefined) setIvAtm(dati.ivAtm);
+        versioneRef.current = dati.versione ?? null;
+    }, []);
+
     useEffect(() => {
         (async () => {
             let dati: Salvataggio | null = null;
@@ -284,33 +335,31 @@ export default function DaxPage() {
             if (!dati) {
                 try { dati = JSON.parse(localStorage.getItem(CHIAVE_LOCALE) || 'null'); } catch { /* niente */ }
             }
-            if (dati) {
-                if (Array.isArray(dati.gambe)) setGambe(dati.gambe);
-                if (dati.imp) setImp({ ...IMP_DEFAULT, ...dati.imp });
-                if (dati.mkt) setMkt({ ...MKT_DEFAULT, ...dati.mkt });
-                if (dati.passo) setPasso(dati.passo);
-                if (dati.zoom) setZoom(dati.zoom);
-                if (typeof dati.supporti === 'string') setSupporti(dati.supporti);
-                if (Array.isArray(dati.registro)) setRegistro(dati.registro);
-                if (dati.ivAtm !== undefined) setIvAtm(dati.ivAtm);
-            }
+            if (dati) applica(dati);
             setCaricato(true);
         })();
-    }, []);
+    }, [applica]);
 
     useEffect(() => {
         if (!caricato) return;
-        const dati: Salvataggio = { gambe, imp, mkt, passo, zoom, supporti, registro, ivAtm };
+        const dati: Salvataggio = { gambe: gambeAperta, studio: gambeStudio, analisi, imp, mkt, passo, zoom, supporti, registro, ivAtm };
         const t = setTimeout(() => {
             try { localStorage.setItem(CHIAVE_LOCALE, JSON.stringify(dati)); } catch { /* niente */ }
-            if (locale) fetch('/api/dax', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dati) }).catch(() => { });
+            if (!locale) return;
+            fetch('/api/dax', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...dati, base: versioneRef.current }) })
+                .then(async (r) => {
+                    const j = await r.json();
+                    if (r.status === 409 && j.posizione) { applica(j.posizione); setStatoIbkr("posizione cambiata da un'altra scheda: ricaricata"); }
+                    else if (r.ok) versioneRef.current = j.versione ?? null;
+                })
+                .catch(() => { });
         }, 700);
         return () => clearTimeout(t);
-    }, [gambe, imp, mkt, passo, zoom, supporti, registro, ivAtm, caricato, locale]);
+    }, [gambeAperta, gambeStudio, analisi, imp, mkt, passo, zoom, supporti, registro, ivAtm, caricato, locale, applica]);
 
     // ----- IBKR -----
-    const gambeRef = useRef(gambe);
-    gambeRef.current = gambe;
+    const tutteRef = useRef({ aperta: gambeAperta, studio: gambeStudio });
+    tutteRef.current = { aperta: gambeAperta, studio: gambeStudio };
 
     const leggiIbkr = useCallback(async () => {
         setInLettura(true);
@@ -318,10 +367,17 @@ export default function DaxPage() {
         try {
             const r = await fetch('/api/dax', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    gambe: gambeRef.current.filter(g => g.tipo !== 'F' && g.chiusura == null), classeFuture: imp.classeFuture,
-                    scadenzaAtm: gambeRef.current.filter(g => g.tipo !== 'F' && g.chiusura == null).map(g => g.scadenza).sort().at(-1) ?? null,
-                }),
+                body: JSON.stringify((() => {
+                    const vive = (gs: Gamba[]) => gs.filter(g => g.tipo !== 'F' && g.chiusura == null);
+                    const uniche = new Map<string, Gamba>();
+                    for (const g of [...vive(tutteRef.current.aperta), ...vive(tutteRef.current.studio)]) uniche.set(chiaveContratto(g), g);
+                    const scad = vive(tutteRef.current.aperta).map(g => g.scadenza).sort().at(-1)
+                        ?? vive(tutteRef.current.studio).map(g => g.scadenza).sort().at(-1) ?? null;
+                    return {
+                        gambe: [...uniche.entries()].map(([id, g]) => ({ id, tipo: g.tipo, strike: g.strike, scadenza: g.scadenza })),
+                        classeFuture: imp.classeFuture, scadenzaAtm: scad,
+                    };
+                })()),
             });
             const j: RispostaIbkr = await r.json();
             if (!r.ok || j.errore) { setStatoIbkr(j.errore || `errore ${r.status}`); return; }
@@ -354,8 +410,8 @@ export default function DaxPage() {
             // Con "IV dal mercato" la IV di ogni gamba si ricalcola dal mid (stesso modello
             // del grafico), cosi' valore simulato = prezzo di mercato e il P&L e' quello vero.
             const tasso = imp.tasso / 100;
-            setGambe(gs => gs.map(g => {
-                const q = perId.get(g.id);
+            const conQuote = (gs: Gamba[]) => gs.map(g => {
+                const q = perId.get(chiaveContratto(g));
                 if (!q || q.errore) return g;
                 const mid = q.mid ?? q.last ?? q.close ?? null;
                 let iv = g.iv ?? q.iv ?? null;
@@ -366,7 +422,9 @@ export default function DaxPage() {
                     iv = daMid != null ? Math.round(daMid * 100) / 100 : (q.iv ?? iv);
                 }
                 return { ...g, mid: mid ?? g.mid, ivIbkr: q.iv ?? null, iv, apertura: g.apertura ?? mid } as Gamba;
-            }));
+            });
+            setGambeAperta(conQuote);
+            setGambeStudio(conQuote);
             const tipo = j.indice?.tipoDati ? ` (${j.indice.tipoDati})` : '';
             setStatoIbkr(`IBKR ${new Date().toLocaleTimeString('it-IT')}${tipo}${errori ? ` · ${errori} gambe non trovate` : ''}`);
         } catch (e) {
@@ -439,8 +497,12 @@ export default function DaxPage() {
     const piuLontanaVenduta = opzAperte.filter(g => g.qta < 0).sort((a, b) => a.strike - b.strike)[0] ?? null;
     const livelliSupporto = useMemo(() => supporti.split(/[,;\s]+/).map(Number).filter(x => x > 0), [supporti]);
 
-    const registraApertura = () => {
-        const descr = [...opzAperte].sort((a, b) => b.strike - a.strike).map(g => `${g.qta > 0 ? '+' : ''}${g.qta} ${g.tipo}${g.strike}`).join(' / ');
+    const registraApertura = (gs: Gamba[] = gambeAperta) => {
+        const opz = gs.filter(g => g.attiva && g.chiusura == null && g.tipo !== 'F');
+        const primaComprata = opz.filter(g => g.qta > 0).sort((a, b) => b.strike - a.strike)[0] ?? null;
+        const piuLontanaVenduta = opz.filter(g => g.qta < 0).sort((a, b) => a.strike - b.strike)[0] ?? null;
+        const scadenzaMax = opz.map(g => g.scadenza).sort().at(-1);
+        const descr = [...opz].sort((a, b) => b.strike - a.strike).map(g => `${g.qta > 0 ? '+' : ''}${g.qta} ${g.tipo}${g.strike}`).join(' / ');
         const scad = scadenzaMax ? dataDa(scadenzaMax).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' }) : '';
         setRegistro(r => [...r, {
             id: nuovoId(), apertura: isoGiorno(new Date()), scadenza: scad, last: mkt.indiceLast, ivAtm,
@@ -468,6 +530,56 @@ export default function DaxPage() {
             return { nome, gs, apertura, ultimo, sim, larghezza, pnl };
         });
     }, [gambe, valori]);
+
+    // ----- STUDIO -----
+    const caricaCandidato = (c: Candidato) => {
+        const oggi = isoGiorno(new Date());
+        setGambeStudio(c.gambe.map(g => gamba({
+            qta: g.qta, tipo: 'P', strike: g.strike, scadenza: c.scadenza, iv: g.iv, apertura: g.prezzo, mid: g.mid ?? g.prezzo,
+            gruppo: g.gruppo, dataApertura: oggi,
+        })));
+        setCaricatoId(c.id);
+        setAnalisi(a => (a ? { ...a, caricato: c.id } : a));
+        setVista('studio');
+    };
+
+    const cercaConClaude = async () => {
+        setInAnalisi(true);
+        setStatoIbkr('Claude: lettura della catena da IBKR e ricerca delle combinazioni…');
+        try {
+            const r = await fetch('/api/dax/ottimizza', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    supporti: livelliSupporto, tasso: imp.tasso, commOpzioni: imp.commOpzioni, moltOpzioni: imp.moltOpzioni,
+                    classeFuture: imp.classeFuture,
+                    registro: registro.map(({ apertura, scadenza, last, ivAtm, ivPrimaComprata, ivLontana, gambe, chiusura, lastChiusura, pnl, note }) =>
+                        ({ apertura, scadenza, last, ivAtm, ivPrimaComprata, ivLontana, gambe, chiusura, lastChiusura, pnl, note })),
+                    aperta: gambeAperta.filter(g => g.chiusura == null).map(g => `${g.qta > 0 ? '+' : ''}${g.qta} ${g.tipo}${g.strike} ${g.scadenza} @${g.apertura}`),
+                }),
+            });
+            const j = await r.json();
+            if (!r.ok || j.errore) { setStatoIbkr(`Claude: ${j.errore || `errore ${r.status}`}`); return; }
+            setAnalisi({ ...(j as Analisi), caricato: null });
+            const scelto = (j as Analisi).candidati.find(c => c.id === j.scelta?.scelta) ?? (j as Analisi).candidati[0];
+            if (scelto) caricaCandidato(scelto);
+            setStatoIbkr(j.scelta ? `Claude ha scelto la combinazione #${j.scelta.scelta} su ${j.provate} provate` : `Combinazioni calcolate (${j.provate}), Claude non ha risposto: ${j.erroreClaude ?? ''}`);
+        } catch (e) {
+            setStatoIbkr(`Claude: ${e instanceof Error ? e.message : e}`);
+        } finally {
+            setInAnalisi(false);
+        }
+    };
+
+    /** Lo STUDIO diventa la strategia aperta (nuovi id, prezzo di apertura = quello dello studio) e si annota nel registro. */
+    const apriStudio = () => {
+        if (!gambeStudio.length) return;
+        if (gambeAperta.some(g => g.chiusura == null) && !confirm('C\'è già una strategia aperta: sostituirla con quella dello STUDIO? (chiudi prima quella vecchia nel registro, se serve)')) return;
+        const oggi = isoGiorno(new Date());
+        const nuove = gambeStudio.map(g => ({ ...g, id: nuovoId(), dataApertura: oggi, apertura: g.apertura ?? g.mid }));
+        setGambeAperta(nuove);
+        registraApertura(nuove);
+        setVista('aperta');
+    };
 
     // ----- azioni sulle gambe -----
     const aggiorna = (id: string, p: Partial<Gamba>) => setGambe(gs => gs.map(g => (g.id === id ? { ...g, ...p } : g)));
@@ -592,7 +704,33 @@ export default function DaxPage() {
                         <Link href="/market" className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[10px] transition-colors">← MARKET</Link>
                     </div>
                 </div>
-                {statoIbkr && <div className="text-[10px] text-slate-500">{statoIbkr}</div>}
+                <div className="flex flex-wrap items-center gap-2">
+                    {(['aperta', 'studio'] as Vista[]).map(v => (
+                        <button key={v} onClick={() => setVista(v)}
+                            className={`px-4 py-1.5 rounded-lg text-xs font-bold border transition-colors ${vista === v
+                                ? (v === 'aperta' ? 'bg-blue-600 border-blue-500 text-white' : 'bg-amber-600 border-amber-500 text-white')
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'}`}>
+                            {v === 'aperta' ? `📌 STRATEGIA APERTA (${gambeAperta.filter(g => g.chiusura == null).length})` : `🧪 STUDIO (${gambeStudio.length})`}
+                        </button>
+                    ))}
+                    {vista === 'studio' && (<>
+                        <Bottone tono="viola" onClick={cercaConClaude} disabled={inAnalisi || !locale}
+                            titolo="Legge da IBKR le put delle scadenze trimestrali a 75-150 giorni, prova tutte le combinazioni con le regole della strategia e chiede a Claude la migliore, che viene caricata qui">
+                            {inAnalisi ? '✦ CLAUDE STA ANALIZZANDO… (1-3 min)' : '✦ CLAUDE: CERCA LA COMBINAZIONE'}
+                        </Bottone>
+                        <Bottone onClick={() => { setGambeStudio(gambeAperta.filter(g => g.chiusura == null).map(g => ({ ...g, id: nuovoId() }))); setCaricatoId(null); }}
+                            titolo="Copia nello STUDIO le gambe della strategia aperta, per provare modifiche">COPIA DALLA APERTA</Bottone>
+                        <Bottone tono="verde" onClick={apriStudio} disabled={!gambeStudio.length}
+                            titolo="Lo STUDIO diventa la strategia aperta e si annota nel registro cicli">APRI QUESTA STRATEGIA →</Bottone>
+                    </>)}
+                    {statoIbkr && <span className="text-[10px] text-slate-500">{statoIbkr}</span>}
+                </div>
+                {vista === 'studio' && (
+                    <div className="text-amber-300 bg-amber-950/30 border border-amber-900/50 px-2 py-1 rounded text-[10px]">
+                        STUDIO: strategia da aprire, non è la posizione in portafoglio. Prezzi di apertura = quelli eseguibili adesso (ask per le comprate, bid per le vendute).
+                    </div>
+                )}
+                {vista === 'studio' && gambeStudio.length > 0 && <SequenzaOrdini gambe={gambeStudio} />}
                 {!locale && <div className="text-amber-300 bg-amber-950/30 border border-amber-900/50 p-2 rounded text-[10px]">Su Vercel non c&apos;è IBKR: prezzi a mano, posizione salvata solo in questo browser.</div>}
 
                 {/* riga 1: mercato, impostazioni, date, simulazione, pareggi */}
@@ -771,6 +909,14 @@ export default function DaxPage() {
                                     <div className="text-[9px] text-slate-500">per +1 punto IV</div>
                                 </div>
                             </div>
+                            {(() => {
+                                const vt = tot.thetaEur > 0 ? Math.abs(tot.vegaEur) / tot.thetaEur : null;
+                                return (
+                                    <div className="mt-1 text-[10px] text-slate-400" title="Regola della lezione: |vega| / theta intorno a 4 e non oltre, se no la posizione e' troppo esposta a un aumento di volatilita' delle put vendute">
+                                        |vega| / theta: <span className={`font-mono font-bold ${coloreVegaTheta(vt)}`}>{vt != null ? fmt(vt, 1) : 'theta ≤ 0'}</span> <span className="text-slate-500">(regola: ~4, non oltre)</span>
+                                    </div>
+                                );
+                            })()}
                         </Card>
                         <Card titolo="Volatilità d'ingresso · skew">
                             <div className="grid grid-cols-3 gap-2 text-center">
@@ -824,15 +970,17 @@ export default function DaxPage() {
                     </div>
                 </div>
 
+                {vista === 'studio' && analisi && <PannelloAnalisi analisi={analisi} caricatoId={caricatoId} onCarica={caricaCandidato} />}
+
                 {/* riga 3: gambe */}
                 <Card>
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                        <span className="text-xs font-bold text-blue-400">GAMBE · ODAX / future</span>
+                        <span className={`text-xs font-bold ${vista === 'studio' ? 'text-amber-400' : 'text-blue-400'}`}>{vista === 'studio' ? 'GAMBE STUDIO · da aprire' : 'GAMBE · strategia aperta'}</span>
                         <div className="flex flex-wrap gap-1.5">
                             <Bottone onClick={() => aggiungi('P')}>+ PUT</Bottone>
                             <Bottone onClick={() => aggiungi('C')}>+ CALL</Bottone>
                             <Bottone onClick={() => aggiungi('F')}>+ FUTURE</Bottone>
-                            <Bottone tono="viola" onClick={() => setMostraModello(true)} titolo="Costruisce la strategia: 2 vertical di put + put lontane vendute">✦ MODELLO STRATEGIA</Bottone>
+                            {vista === 'studio' && <Bottone tono="viola" onClick={() => setMostraModello(true)} titolo="Costruisce la strategia: 2 vertical di put + put lontane vendute">✦ MODELLO STRATEGIA</Bottone>}
                             <Bottone tono="blu" onClick={calcolaIv} titolo="IV implicita dal mid (o dal prezzo di apertura) con l'indice attuale">CALCOLA IV</Bottone>
                             <Bottone onClick={usaIvIbkr} disabled={!gambe.some(g => g.ivIbkr != null)} titolo="Copia la IV del modello IBKR">IV DA IBKR</Bottone>
                             <Bottone tono="rosso" onClick={() => setGambe(gs => gs.map(g => ({ ...g, iv: null })))}>CANCELLA IV</Bottone>
@@ -907,7 +1055,7 @@ export default function DaxPage() {
                         <span className="text-xs font-bold text-blue-400">REGISTRO CICLI</span>
                         <div className="flex items-center gap-2">
                             <span className="text-[10px] text-slate-400">totale chiusi <span className={`font-mono font-bold ${colore(totaleRegistro)}`}>{eur(totaleRegistro)}</span></span>
-                            <Bottone tono="viola" onClick={registraApertura} disabled={!opzAperte.length} titolo="Annota oggi: indice, IV ATM, IV della 1ª comprata e della venduta più lontana, gambe">+ REGISTRA APERTURA</Bottone>
+                            <Bottone tono="viola" onClick={() => registraApertura()} disabled={!gambeAperta.some(g => g.chiusura == null)} titolo="Annota oggi: indice, IV ATM, IV della 1ª comprata e della venduta più lontana, gambe">+ REGISTRA APERTURA</Bottone>
                         </div>
                     </div>
                     <div className="overflow-x-auto">
@@ -958,6 +1106,130 @@ export default function DaxPage() {
                 />
             )}
         </main>
+    );
+}
+
+// ---------- analisi di Claude ----------
+
+/**
+ * Come aprirla senza ordini combo (lezione 18/11/2026, min 92-99): prima tante put vendute quante
+ * pagano il V1, poi il V1 (comprata e venduta), poi le altre vendute e il V2; tutto al mid, una gamba
+ * alla volta, solo con spread bid/ask stretti. Cosi' se il mercato scappa a meta' si resta coperti.
+ */
+function SequenzaOrdini({ gambe }: { gambe: Gamba[] }) {
+    const prezzo = (g: Gamba) => g.mid ?? g.apertura ?? 0;
+    const vendute = gambe.filter(g => g.gruppo === 'S' && g.qta < 0).sort((a, b) => b.strike - a.strike);
+    const per = (gr: string, segno: number) => gambe.find(g => g.gruppo === gr && Math.sign(g.qta) === segno);
+    const v1c = per('V1', 1), v1v = per('V1', -1), v2c = per('V2', 1), v2v = per('V2', -1);
+    if (!vendute.length || !v1c || !v1v) return null;
+    // put vendute che pagano il V1 (al mid), dalla piu' alta
+    const costoV1 = prezzo(v1c) - prezzo(v1v);
+    const prima: { g: Gamba; q: number }[] = [];
+    let incasso = 0;
+    for (const g of vendute) {
+        let q = 0;
+        while (q < -g.qta && incasso < costoV1) { q++; incasso += prezzo(g); }
+        if (q) prima.push({ g, q });
+        if (incasso >= costoV1) break;
+    }
+    const resto = vendute.map(g => ({ g, q: -g.qta - (prima.find(p => p.g.id === g.id)?.q ?? 0) })).filter(x => x.q > 0);
+    const riga = (n: number, testo: string, g: Gamba, q: number, verso: 'VENDI' | 'COMPRA') => (
+        <li key={`${n}-${g.id}`} className="flex gap-1.5">
+            <span className="text-slate-500 w-3 text-right">{n}</span>
+            <span className={`font-bold w-14 ${verso === 'VENDI' ? 'text-red-400' : 'text-green-400'}`}>{verso} {q}</span>
+            <span className="font-mono text-slate-200 w-16">P{g.strike}</span>
+            <span className="font-mono text-slate-400 w-14">mid {fmt(prezzo(g), 1)}</span>
+            <span className="text-slate-500">{testo}</span>
+        </li>
+    );
+    let n = 0;
+    return (
+        <Card titolo="Sequenza ordini senza combo · una gamba alla volta, al mid">
+            <ol className="text-[10px] space-y-0.5">
+                {prima.map(({ g, q }) => riga(++n, `pagano il V1 (${fmt(costoV1, 1)} pt)`, g, q, 'VENDI'))}
+                {riga(++n, 'appena eseguite le vendute (al limite un tick sopra il mid)', v1c, v1c.qta, 'COMPRA')}
+                {riga(++n, 'chiude il V1', v1v, -v1v.qta, 'VENDI')}
+                {resto.map(({ g, q }) => riga(++n, 'le altre vendute', g, q, 'VENDI'))}
+                {v2c && riga(++n, 'V2', v2c, v2c.qta, 'COMPRA')}
+                {v2v && riga(++n, 'chiude il V2', v2v, -v2v.qta, 'VENDI')}
+            </ol>
+            <p className="mt-1 text-[9px] text-slate-500 leading-snug">
+                Solo a mercato aperto (9:00-17:30) e con spread bid/ask stretti: se sono larghi si aspetta. Prima un ordine di prova per vedere che la piattaforma lo prende.
+                Se a metà si va in rosso, vendere lo strike un po&apos; più alto (es. 15800 invece di 15600) per incassare di più. Obiettivo: netto −5/−6 punti, che pagano le commissioni.
+            </p>
+        </Card>
+    );
+}
+
+function PannelloAnalisi({ analisi, caricatoId, onCarica }: { analisi: Analisi; caricatoId: number | null; onCarica: (c: Candidato) => void }) {
+    const s = analisi.scelta;
+    const scelto = s ? analisi.candidati.find(c => c.id === s.scelta) : null;
+    const descr = (c: Candidato) => c.gambe.map(g => `${g.qta > 0 ? '+' : ''}${g.qta} ${g.strike}`).join(' ');
+    return (
+        <Card titolo={<>Analisi di Claude · {new Date(analisi.ora).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })} · DAX {fmt(analisi.spot, 0)} · {analisi.provate} combinazioni provate{analisi.modello ? ` · ${analisi.modello}` : ''}</>}>
+            {s && scelto ? (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 mb-2">
+                    <div className="bg-violet-950/30 border border-violet-800/50 rounded p-2">
+                        <div className="text-[10px] text-violet-300 font-bold">SCELTA #{s.scelta} · {scelto.scadenza} ({scelto.dte} g)</div>
+                        <div className="font-mono text-[11px] text-slate-200 my-1">{descr(scelto)}</div>
+                        <div className="text-[10px] text-slate-300 leading-snug">{s.motivazione}</div>
+                    </div>
+                    <div className="bg-red-950/20 border border-red-900/40 rounded p-2">
+                        <div className="text-[10px] text-red-300 font-bold">RISCHI</div>
+                        <div className="text-[10px] text-slate-300 leading-snug mt-1">{s.rischi}</div>
+                    </div>
+                    <div className="bg-amber-950/20 border border-amber-900/40 rounded p-2">
+                        <div className="text-[10px] text-amber-300 font-bold">QUANDO ENTRARE · seconda scelta #{s.seconda}</div>
+                        <div className="text-[10px] text-slate-300 leading-snug mt-1">{s.quando_entrare}</div>
+                    </div>
+                </div>
+            ) : (
+                <div className="text-[10px] text-amber-300 mb-2">Claude non ha risposto{analisi.erroreClaude ? `: ${analisi.erroreClaude}` : ''}. Le combinazioni qui sotto sono comunque calcolate sui prezzi IBKR.</div>
+            )}
+            <div className="overflow-x-auto">
+                <table className="w-full text-[10px] whitespace-nowrap">
+                    <thead>
+                        <tr className="text-[9px] text-slate-500 uppercase border-b border-slate-700">
+                            <th className="p-1 text-left">#</th><th className="p-1">scad.</th><th className="p-1 text-left">gambe</th>
+                            <th className="p-1 text-right">V1 / V2</th><th className="p-1 text-right">netto pt</th><th className="p-1 text-right">max €</th>
+                            <th className="p-1 text-right">pareggio</th><th className="p-1 text-right">vendute</th><th className="p-1 text-right">a −40%</th>
+                            <th className="p-1 text-right">a −45%</th><th className="p-1 text-right">P sotto pareggio</th>
+                            <th className="p-1 text-right" title="|vega| / theta della posizione: intorno a 4, non oltre">vega/θ</th>
+                            <th className="p-1 text-right" title="Variazione di valore oggi rispetto ad adesso (senza spread e commissioni) con il DAX -5% e -10% a IV ferme, e -10% con tutte le IV +10 punti: la curva a oggi deve restare intorno allo zero">oggi −5 / −10 / −10 IV+10</th><th />
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {analisi.candidati.map(c => (
+                            <tr key={c.id} className={`border-b border-slate-800 ${c.id === s?.scelta ? 'bg-violet-950/40' : c.id === s?.seconda ? 'bg-amber-950/20' : ''}`}>
+                                <td className="p-1 font-bold text-slate-200">{c.id}{c.id === s?.scelta ? ' ✦' : ''}</td>
+                                <td className="p-1 text-center text-amber-400">{c.scadenza.slice(2)}</td>
+                                <td className="p-1 font-mono text-slate-300">{descr(c)}</td>
+                                <td className="p-1 text-right font-mono">{fmt(c.costoV1, 0)} / {fmt(c.costoV2, 0)}</td>
+                                <td className={`p-1 text-right font-mono ${c.nettoPunti > 0 ? 'text-red-400' : 'text-green-400'}`}>{fmt(c.nettoPunti, 1)}</td>
+                                <td className="p-1 text-right font-mono text-green-400">{fmt(c.maxGuadagnoEur, 0)}</td>
+                                <td className="p-1 text-right font-mono">{c.beGiu ? `${fmt(c.beGiu, 0)} (${fmt(c.beGiuPct, 1)}%)` : '—'}</td>
+                                <td className="p-1 text-right font-mono">{fmt(c.distVendutePct, 1)}%</td>
+                                <td className={`p-1 text-right font-mono ${colore(c.perdita40Eur)}`}>{fmt(c.perdita40Eur, 0)}</td>
+                                <td className={`p-1 text-right font-mono ${colore(c.perdita45Eur)}`}>{fmt(c.perdita45Eur, 0)}</td>
+                                <td className="p-1 text-right font-mono">{c.pSottoBe != null ? `${fmt(c.pSottoBe * 100, 1)}%` : '—'}</td>
+                                <td className={`p-1 text-right font-mono ${coloreVegaTheta(c.vegaTheta)}`}>{fmt(c.vegaTheta, 1)}</td>
+                                <td className="p-1 text-right font-mono">
+                                    <span className={colore(c.oggiMeno5Eur)}>{fmt(c.oggiMeno5Eur, 0)}</span> / <span className={colore(c.oggiMeno10Eur)}>{fmt(c.oggiMeno10Eur, 0)}</span> / <span className={colore(c.oggiMeno10IvEur)}>{fmt(c.oggiMeno10IvEur, 0)}</span>
+                                </td>
+                                <td className="p-1">
+                                    <button onClick={() => onCarica(c)} className={`px-1.5 rounded text-[9px] font-bold ${caricatoId === c.id ? 'bg-amber-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}>
+                                        {caricatoId === c.id ? 'IN STUDIO' : 'CARICA'}
+                                    </button>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            <p className="mt-1 text-[9px] text-slate-500">
+                Prezzi eseguibili (ask comprate, bid vendute) con commissioni. &quot;P sotto pareggio&quot;: probabilità neutrale al rischio di chiudere a scadenza sotto il pareggio, con la IV della put venduta più lontana (lo skew reale è più ripido: è un minimo). Margine non calcolato.
+            </p>
+        </Card>
     );
 }
 
