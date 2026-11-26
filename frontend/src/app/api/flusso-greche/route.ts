@@ -170,14 +170,53 @@ export async function GET(request: NextRequest) {
 
     // Candele a 1 minuto dello spot (undPrice, il sottostante su cui IBKR valuta il gamma), dalle 9:30 NY.
     const aperturaSec = minutiRomaDaNy('09:30', mezzogiornoDi(data)) * 60;
-    const candele: { t: string; o: number; h: number; l: number; c: number }[] = [];
+    // Ogni candela porta anche `mm`: gli ES che il market maker ha dovuto comprare (+) o vendere (−) in quel
+    // minuto per restare coperto = variazione del delta totale dei clienti (Lee-Ready, delta IBKR dello snapshot),
+    // contratti SPX x 100 / 50 = ES. Comprende i nuovi scambi (`mmFlusso`, nuovi contratti x delta di prima) e
+    // il movimento di prezzo/tempo/vol sulle posizioni gia' aperte (`mmGreche`). Delta mancante = l'ultimo noto
+    // dello strike, delta negativo (put) riportato a quello della call per parita'.
+    const candele: { t: string; o: number; h: number; l: number; c: number; mm?: number; mmFlusso?: number; mmGreche?: number }[] = [];
+    const ultimoDelta = new Map<number, number>();
+    // Per strike: n = call + put nette dei clienti, ip = put nette, d = delta call. Delta clienti = n*d - ip.
+    type Pos = { n: number; ip: number; d: number };
+    let prec: Map<number, Pos> | null = null;
     for (const sn of snap) {
         const px = spotDi(sn);
         if (!px || sec(sn.time) < aperturaSec) continue;
         const t = sn.time.slice(0, 5);
-        const ult = candele[candele.length - 1];
+        let ult = candele[candele.length - 1];
         if (ult && ult.t === t) { ult.h = Math.max(ult.h, px); ult.l = Math.min(ult.l, px); ult.c = px; }
-        else candele.push({ t, o: px, h: px, l: px, c: px });
+        else { ult = { t, o: px, h: px, l: px, c: px }; candele.push(ult); }
+
+        if (!(sn.volumes ?? []).some(conLr)) continue;
+        const ora = new Map<number, Pos>();
+        for (const r of sn.volumes ?? []) {
+            if (!conLr(r)) continue;
+            let d = typeof r.delta === 'number' && Number.isFinite(r.delta) ? r.delta : ultimoDelta.get(r.strike);
+            if (d == null) continue;
+            if (d < 0) d += 1;
+            d = Math.min(1, Math.max(0, d));
+            ultimoDelta.set(r.strike, d);
+            const ip = r.pb! - r.ps!;
+            ora.set(r.strike, { n: (r.cb! - r.cs!) + ip, ip, d });
+        }
+        if (prec) {
+            // Variazione di n*d - ip: nuovi contratti al delta di prima (flusso) + posizioni col delta cambiato (greche).
+            let flusso = 0, greche = 0;
+            for (const [k, x] of ora) {
+                const p = prec.get(k);
+                if (!p) { flusso += x.n * x.d - x.ip; continue; }
+                flusso += (x.n - p.n) * p.d - (x.ip - p.ip);
+                greche += x.n * (x.d - p.d);
+            }
+            ult.mmFlusso = (ult.mmFlusso ?? 0) + flusso * 2;
+            ult.mmGreche = (ult.mmGreche ?? 0) + greche * 2;
+            ult.mm = ult.mmFlusso + ult.mmGreche;
+        }
+        prec = ora;
+    }
+    for (const c of candele) {
+        if (c.mm != null) { c.mm = Math.round(c.mm); c.mmFlusso = Math.round(c.mmFlusso!); c.mmGreche = Math.round(c.mmGreche!); }
     }
 
     const primoLr = snap.find((s) => (s.volumes ?? []).some(conLr))?.time ?? null;

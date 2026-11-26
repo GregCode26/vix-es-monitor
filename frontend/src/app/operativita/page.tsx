@@ -329,12 +329,6 @@ export default function OperativitaPage() {
             >
               {sim ? '◉' : '◌'} SIMULAZIONE
             </button>
-            <button
-              onClick={() => router.push('/market')}
-              className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300"
-            >
-              ← CHART
-            </button>
           </div>
         </div>
 

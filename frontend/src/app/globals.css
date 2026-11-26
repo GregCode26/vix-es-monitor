@@ -1,6 +1,8 @@
 @import "tailwindcss";
 
 :root {
+  /* Altezza della barra fissata in alto (components/BarraSuperiore.tsx) */
+  --barra-h: 40px;
   --background: #ffffff;
   --foreground: #171717;
 }

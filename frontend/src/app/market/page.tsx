@@ -356,36 +356,6 @@ interface RangeCalcInput {
  */
 // Funzioni e non costanti: in ora di Roma cambiano nelle settimane in cui
 // l'ora legale italiana e quella americana non coincidono (vedi orarioNy).
-/** Roma e New York, aggiornati ogni secondo; vuoti fino al montaggio (niente differenze server/client). */
-function Orologi() {
-    const [adesso, setAdesso] = useState<Date | null>(null);
-    useEffect(() => {
-        const tick = () => setAdesso(new Date());
-        const primo = setTimeout(tick, 0);
-        const id = setInterval(tick, 1000);
-        return () => { clearTimeout(primo); clearInterval(id); };
-    }, []);
-    const ora = (tz: string) => adesso
-        ? adesso.toLocaleTimeString('it-IT', { timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit' })
-        : '--:--:--';
-    const giorno = (tz: string) => adesso
-        ? adesso.toLocaleDateString('it-IT', { timeZone: tz, weekday: 'short', day: '2-digit', month: '2-digit' })
-        : '';
-    return (
-        <div className="shrink-0 flex flex-col gap-1">
-            {([['ROMA', 'Europe/Rome', 'text-blue-400'], ['NEW YORK', 'America/New_York', 'text-orange-400']] as const)
-                .map(([nome, tz, colore]) => (
-                    <div key={tz} className="flex items-baseline justify-end gap-3">
-                        <span className="flex flex-col items-end text-[11px] leading-tight">
-                            <span className="font-bold tracking-widest text-slate-500">{nome}</span>
-                            <span className="text-slate-600">{giorno(tz)}</span>
-                        </span>
-                        <span className={`text-4xl font-bold leading-tight tabular-nums ${colore}`}>{ora(tz)}</span>
-                    </div>
-                ))}
-        </div>
-    );
-}
 
 const aperturaUsa = () => oraRomaDaNy('09:30');
 const obSnapshot = () => oraRomaDaNy('09:35');
@@ -696,6 +666,7 @@ export default function MarketPage() {
     const zgManuale = zeroGamma.manuale?.valore ?? null;
     const zgCboe = zeroGamma.attuale?.fonte === 'cboe' ? zeroGamma.attuale.valore : null;
     const zgTraccia = zeroGamma.traccia;
+    const zgZona = zeroGamma.zona;
     const [tracciaGamma, setTracciaGamma] = useState<{ time: string; maxPos: number | null; maxNeg: number | null }[]>([]);
     /**
      * Pallini GEX (in prova, 05/11/2026): sullo strike SPX (spostato del
@@ -1384,6 +1355,22 @@ export default function MarketPage() {
             }
             chart.data.datasets[9].data = valori;
         }
+        // Zona dello Zero Gamma (23/11/2026): quando il profilo ha piu' incroci entro 20 punti, la fascia dal
+        // primo all'ultimo (12 = alto, 13 = basso, riempito fino al 12). Vuota dove l'incrocio e' uno solo.
+        if (chart.data.datasets[13]) {
+            const alto: (number | null)[] = [];
+            const basso: (number | null)[] = [];
+            let j = -1;
+            for (const d of dataPoints) {
+                while (j + 1 < zgZona.length && zgZona[j + 1][0] <= d.time) j++;
+                const z = j >= 0 && basisSpx !== null ? zgZona[j] : null;
+                const larga = z !== null && z[2] - z[1] >= 1;
+                alto.push(larga ? suScalaSpx(z![2]) : null);
+                basso.push(larga ? suScalaSpx(z![1]) : null);
+            }
+            chart.data.datasets[12].data = alto;
+            chart.data.datasets[13].data = basso;
+        }
         
         // Ported from logica.zip: Add Cone datasets
         if (chart.data.datasets.length > 3) {
@@ -1727,7 +1714,7 @@ export default function MarketPage() {
         }
 
         chart.update('none');
-    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, picchiGex, mostraPicchiGex, picchiSerie, mostraPicchiSerie]);
+    }, [dataPoints, firstEsfValue, refLines, refLineVisibility, showDivergences, detectDivergences, livelliPerDivergenze, mostraStraddle, mostraSpx, mostraRangeSpxOb, obResults, tracciaGamma, mostraGamma, frecceAi, segnaliIv, zgManuale, zgCboe, zgTraccia, zgZona, picchiGex, mostraPicchiGex, picchiSerie, mostraPicchiSerie]);
 
     // RSI: calcolato sui punti della pagina, disegnato dal plugin rsiPlugin
     // sul canvas sotto il grafico con la stessa scala x.
@@ -2754,6 +2741,30 @@ export default function MarketPage() {
                 yAxisID: 'y-right',
                 fill: false,
             },
+            {
+                // Zona dello Zero Gamma, bordo alto (vedi sopra, datasets[12]/[13]).
+                label: 'Zona Zero Gamma',
+                data: [] as (number | null)[],
+                borderColor: 'rgba(234, 179, 8, 0.35)',
+                borderWidth: 1,
+                pointRadius: 0,
+                pointHoverRadius: 0,
+                spanGaps: false,
+                yAxisID: 'y-right',
+                fill: false,
+            },
+            {
+                label: 'Zona Zero Gamma (basso)',
+                data: [] as (number | null)[],
+                borderColor: 'rgba(234, 179, 8, 0.35)',
+                borderWidth: 1,
+                backgroundColor: 'rgba(234, 179, 8, 0.12)',
+                pointRadius: 0,
+                pointHoverRadius: 0,
+                spanGaps: false,
+                yAxisID: 'y-right',
+                fill: '-1',
+            },
         ],
     }), []);
 
@@ -2823,7 +2834,11 @@ export default function MarketPage() {
                 display: true,
                 position: 'top' as const,
                 align: 'start' as const,
-                labels: { color: '#94a3b8', boxWidth: 12, font: { size: 12 } },
+                labels: {
+                    color: '#94a3b8', boxWidth: 12, font: { size: 12 },
+                    // La zona dello Zero Gamma segue la sua linea: niente voci proprie in legenda.
+                    filter: (item: { text: string }) => !item.text.startsWith('Zona Zero Gamma'),
+                },
             },
             tooltip: { enabled: false },
         },
@@ -2918,52 +2933,25 @@ export default function MarketPage() {
     const sc = statusConfig[status];
 
     return (
-        <div className="h-screen overflow-hidden bg-[#0c0d10] text-slate-300 px-4 md:px-8 pt-3 pb-3 font-sans">
+        <div className="h-[calc(100vh-var(--barra-h))] overflow-hidden bg-[#0c0d10] text-slate-300 px-4 md:px-8 pt-2 pb-3 font-sans">
             <div className="w-full max-w-[1920px] mx-auto">
                 {/* Header (riordinato il 06/11/2026 su richiesta, tolti i riquadri VIX/ES):
                     il logo su due righe a sinistra, gli orologi Roma/New York a destra e,
                     centrate fra i due, una riga con le pagine e una con gli strumenti. */}
-                <div className="flex items-center gap-6 mb-3">
-                    <div className="shrink-0 flex flex-col" title="VIX & S&P 500 Futures — Daily History & Real-Time">
-                        <h1 className="text-4xl font-bold leading-tight bg-gradient-to-r from-blue-400 to-orange-400 bg-clip-text text-transparent">
-                            Market<br />Monitor
-                        </h1>
-                        <span className="text-sm font-light text-slate-500 italic">ODD LOGIC</span>
-                        {/* Stato del polling e ultimo aggiornamento, sotto il logo */}
-                        <div className="flex items-center gap-2 mt-1.5">
-                            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border ${sc.color}`}>
-                                <span className={`w-2 h-2 rounded-full ${sc.dot}`} />
-                                {sc.label}
-                            </span>
-                            {lastUpdate && <span className="text-slate-500 text-[11px] tabular-nums">{lastUpdate}</span>}
-                        </div>
-                    </div>
-
+                {/* Logo, pagine e orologi stanno nella barra fissata in alto di tutte le pagine
+                    (components/BarraSuperiore.tsx, 26/11/2026); qui restano stato, CHART/GEX e strumenti. */}
+                <div className="flex items-center gap-6 mb-2">
                     <div className="flex-1 min-w-0 flex flex-col items-center gap-3">
-                    {/* Pagine */}
-                    <div className="flex flex-wrap items-center justify-center gap-2">
-                        {/* Tab Switcher */}
-                        <div className="flex flex-wrap bg-slate-900 border border-slate-700 rounded-lg p-1">
-                            <button onClick={() => setActiveTab('market')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'market' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>CHART</button>
-                            <button onClick={() => setActiveTab('gex')} className={`px-3 py-1 text-xs font-bold rounded ${activeTab === 'gex' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>GEX</button>
-                            <button onClick={() => router.push('/spx-volumes')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">VOLUMI SPX</button>
-                            <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET MAKER</button>
-                            <button onClick={() => router.push('/spx-scanner')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Singoli trade da almeno 500 contratti sulle opzioni SPX 0-90 DTE, in 3D">SCANNER 3D</button>
-                            <button onClick={() => router.push('/market-tide')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">MARKET TIDE</button>
-                            <button onClick={() => router.push('/bookmap')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">BOOKMAP</button>
-                            <button onClick={() => router.push('/iv-monitor')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">IV MONITOR</button>
-                            <button onClick={() => router.push('/operativita')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">OPERATIVITA&apos;</button>
-                            <button onClick={() => router.push('/sbilanciamento')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Call sopra contro put sotto alla stessa distanza dall'ATM, SPX 0DTE (in prova)">SBILANCIAMENTO</button>
-                            <button onClick={() => router.push('/flusso-greche')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Comp/Vend Lee-Ready per strike con DEX, Gamma, Vanna, Charm e Max Change, SPX 0DTE (in prova)">FLUSSO GRECHE</button>
-                            <button onClick={() => router.push('/linea-alta')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Verifica: la linea piu' alta della serie di MARKET MAKER contro ES">LINEA ALTA</button>
-                            <button onClick={() => router.push('/livelli-azionari')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Straddle e livelli L1/L2/L3 di un'azione sulle 3 scadenze più vicine, da IBKR (solo locale)">LIVELLI AZIONARI</button>
-                            <button onClick={() => router.push('/vendita-opzioni')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white" title="Put e call da vendere a ~45 giorni sui titoli in portafoglio, con la IV rispetto al suo anno (solo locale)">VENDITA OPZIONI</button>
-                            <button onClick={() => router.push('/dax')} className="px-3 py-1 text-xs font-bold rounded text-slate-500 hover:text-white">DAX</button>
-                        </div>
-                    </div>
-
                     {/* Strumenti sul grafico (accendi/spegni) e comandi */}
                     <div className="flex flex-wrap items-center justify-center gap-1.5">
+                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border ${sc.color}`} title={lastUpdate ?? undefined}>
+                            <span className={`w-2 h-2 rounded-full ${sc.dot}`} />
+                            {sc.label}
+                        </span>
+                        <div className="flex bg-slate-900 border border-slate-700 rounded-lg p-0.5">
+                            <button onClick={() => setActiveTab('market')} className={`px-2 py-1 text-[11px] font-bold rounded whitespace-nowrap ${activeTab === 'market' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>CHART</button>
+                            <button onClick={() => setActiveTab('gex')} className={`px-2 py-1 text-[11px] font-bold rounded whitespace-nowrap ${activeTab === 'gex' ? 'bg-slate-700 text-white' : 'text-slate-500'}`}>GEX</button>
+                        </div>
                         {/* Bias su ES da Claude, a titolo di studio */}
                         <button
                             onClick={() => setMostraAi((v) => !v)}
@@ -3173,7 +3161,6 @@ export default function MarketPage() {
                     </div>
                     </div>
 
-                    <Orologi />
                 </div>
 
                 {/* Outside hours banner */}
@@ -3399,7 +3386,7 @@ export default function MarketPage() {
                     <div
                         ref={areaChartRef}
                         style={{ height: altezzaChart ?? undefined }}
-                        className={`${altezzaChart == null ? 'h-[calc(100vh-240px)]' : ''} min-h-[400px] cursor-crosshair`}
+                        className={`${altezzaChart == null ? 'h-[calc(100vh-180px)]' : ''} min-h-[400px] cursor-crosshair`}
                         onDoubleClick={handleResetZoom}
                         onMouseMove={handleMouseMove}
                         onMouseOut={handleMouseOut}
@@ -3433,7 +3420,7 @@ export default function MarketPage() {
                           />
                       </div>
                     ) : (
-                      <div className="w-full h-[calc(100vh-240px)] min-h-[400px] bg-[#0c0d10] border border-slate-800/50 rounded-lg p-4 shadow-2xl">
+                      <div className="w-full h-[calc(100vh-180px)] min-h-[400px] bg-[#0c0d10] border border-slate-800/50 rounded-lg p-4 shadow-2xl">
                         <GexPage />
                       </div>
                     )}

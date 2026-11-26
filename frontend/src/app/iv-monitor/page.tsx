@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Chart as ChartJS, registerables, type Plugin } from 'chart.js';
 import { Line } from 'react-chartjs-2';
-import Link from 'next/link';
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
 import styles from './page.module.css';
 
@@ -406,9 +405,6 @@ export default function IVMonitorPage() {
           <p className={styles.subtitle}>Real-Time Put vs Call IV Change</p>
         </div>
         <div className={styles.headerStatus}>
-          <Link href="/market" className={styles.liveButton}>
-            ← MARKET
-          </Link>
           <div className={styles.liveIndicator}>
             <span className={isLive ? styles.live : styles.paused}>●</span>
             <span className={styles.liveText}>{isLive ? 'LIVE' : 'PAUSED'}</span>

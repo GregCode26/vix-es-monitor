@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useState, useRef, useMemo } from 'react';
-import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 
 const ReactECharts = dynamic(() => import('echarts-for-react'), { ssr: false }) as any;
@@ -164,7 +163,6 @@ const WINDOW_OPTIONS = [
 ];
 
 export default function SpxVolumesPage() {
-    const router = useRouter();
     const [history, setHistory] = useState<VolumeSnapshot[]>([]);
     const [windowSize, setWindowSize] = useState(360);
     const [chartsReady, setChartsReady] = useState(false);
@@ -376,12 +374,6 @@ export default function SpxVolumesPage() {
                             ))}
                         </div>
                     </div>
-                    <button
-                        onClick={() => router.push('/market')}
-                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                    >
-                        CHART
-                    </button>
                 </div>
 
                 {chartsReady && history.length > 0 ? (

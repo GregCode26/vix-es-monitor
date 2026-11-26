@@ -18,7 +18,9 @@ const AZZURRO = '#22d3ee';
 const ARANCIO = '#f97316';
 const BLU = '#3b82f6';
 
-type Candela = { t: string; o: number; h: number; l: number; c: number };
+/** mm = ES che il MM ha comprato (+) / venduto (−) nel minuto: mmFlusso nuovi scambi, mmGreche prezzo/tempo/vol. */
+type Candela = { t: string; o: number; h: number; l: number; c: number; mm?: number; mmFlusso?: number; mmGreche?: number };
+type ColoreCandele = 'totale' | 'greche' | 'flusso' | 'prezzo';
 type Risposta = {
   date: string; time: string; spot: number; T: number; inizioLr: string | null;
   righe: RigaGreche[]; riferimenti: RiferimentoMaxChange[]; candele: Candela[]; error?: string;
@@ -26,9 +28,10 @@ type Risposta = {
 
 type Greca = 'gamma' | 'delta' | 'vanna' | 'charm' | 'none';
 type ModoGexp = 'netto' | 'taglia';
-type Misura = 'dex' | 'gammaNetto' | 'gexp' | 'profileNetto' | 'vex' | 'chex' | 'imbCall' | 'imbPut';
+type Misura = 'azione' | 'dex' | 'gammaNetto' | 'gexp' | 'profileNetto' | 'vex' | 'chex' | 'imbCall' | 'imbPut';
 
 const NOMI: Record<Misura, string> = {
+  azione: 'AZIONE MM (ES)',
   dex: 'DEX $MM',
   gammaNetto: 'GAMMA $MM',
   gexp: 'GEX PROFILE $MM',
@@ -44,6 +47,8 @@ interface Calcolo {
   imbCall: number; imbPut: number;
   gammaNetto: number; deltaNetto: number; gexp: number; profileNetto: number;
   dex: number; vex: number; chex: number;
+  /** ES che il MM compra (+) o vende (−) se SPX arriva a questo strike nello scenario scelto. */
+  azione: number;
   callDominant: boolean;
 }
 
@@ -72,6 +77,7 @@ function calcola(r: Risposta, greca: Greca, modo: ModoGexp): Calcolo[] {
       vex: (ic + ip) * x.vanna * vexK,
       chex: (ic + ip) * x.charm * chexK / (365 * 24),
       callDominant: x.cb + x.cs >= x.pb + x.ps,
+      azione: 0,
     };
   });
 }
@@ -79,6 +85,7 @@ function calcola(r: Risposta, greca: Greca, modo: ModoGexp): Calcolo[] {
 /** Valore disegnato di una misura: DEX in $MM (Delta Netto), VEX/CHEX in $MM come i totali. */
 function valore(c: Calcolo, m: Misura): number {
   switch (m) {
+    case 'azione': return c.azione;
     case 'dex': return c.deltaNetto;
     case 'gammaNetto': return c.gammaNetto;
     case 'gexp': return c.gexp;
@@ -88,6 +95,84 @@ function valore(c: Calcolo, m: Misura): number {
     case 'imbCall': return c.imbCall;
     case 'imbPut': return c.imbPut;
   }
+}
+
+/**
+ * Cosa fa il market maker su ES per la barra di quello strike (controparte dei clienti, segno opposto).
+ *  - Gamma Netto: copertura quando il prezzo VA verso lo strike. MM delta cambia di −gammaNetto·dS, la copertura
+ *    e' +gammaNetto·dS: sopra lo spot (prezzo che sale) BUY se gammaNetto > 0 (MM short gamma), sotto lo spot
+ *    (prezzo che scende) BUY se gammaNetto < 0 (MM long gamma compra i ribassi). Strike ATM: entrambi i versi.
+ *  - DEX: i clienti net long delta -> il MM e' short delta e si copre comprando ES (BUY), e viceversa.
+ *  - Charm: cosa fa il MM nella prossima ora a prezzo fermo, solo per il tempo che passa.
+ * Le altre misure non hanno etichetta.
+ */
+function azioneMm(m: Misura, c: Calcolo, spot: number): { testo: string; buy: boolean } | null {
+  if (m === 'azione') {
+    if (c.azione === 0) return null;
+    return { testo: c.azione > 0 ? 'BUY' : 'SELL', buy: c.azione > 0 };
+  }
+  if (m === 'dex') {
+    if (c.deltaNetto === 0) return null;
+    return { testo: c.deltaNetto > 0 ? 'BUY' : 'SELL', buy: c.deltaNetto > 0 };
+  }
+  if (m === 'chex') {
+    // charm della route = variazione del delta per anno che passa (phi(d1)*d2/2T, call e put uguali): il delta dei
+    // clienti cambia di chex all'ora, quello del MM di -chex, e la copertura e' +chex: positivo = il MM compra ES.
+    if (c.chex === 0) return null;
+    return { testo: c.chex > 0 ? 'BUY' : 'SELL', buy: c.chex > 0 };
+  }
+  if (m === 'gammaNetto') {
+    const g = c.gammaNetto;
+    if (g === 0) return null;
+    if (Math.abs(c.strike - spot) < 2.5) return g > 0 ? { testo: 'BUY↑ SELL↓', buy: true } : { testo: 'SELL↑ BUY↓', buy: false };
+    const buy = g * (c.strike - spot) > 0;
+    return { testo: buy ? 'BUY' : 'SELL', buy };
+  }
+  return null;
+}
+
+/** Normale cumulata (erf di Abramowitz-Stegun 7.1.26, errore ~1e-7). */
+function ncdf(x: number): number {
+  const z = Math.abs(x) / Math.SQRT2, t = 1 / (1 + 0.3275911 * z);
+  const erf = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-z * z);
+  return x >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+}
+
+/**
+ * Terzo profilo "Azione MM": gamma, charm e vanna sommati in un'unica unita', gli ES da comprare/vendere.
+ * Le greche non si sommano direttamente (gamma per punto, charm per ora, vanna per punto di vol), quindi si
+ * rivaluta: per ogni prezzo P, il delta Black-Scholes di ogni strike a (P, T - dt, IV + dVol) meno quello di
+ * adesso (spot, T, IV), per lo sbilancio netto dei clienti (call + put, delta put = delta call - 1). Il delta
+ * dei clienti che sale = il MM che deve comprare ES. Contratti SPX x 100 / 50 = ES (x2), basis ignorata.
+ * IV per strike quella ricavata dalla route (sticky strike); dove manca (delta 0/1) quella dello strike vicino.
+ * dtMin < 0 = scadenza (valore intrinseco). Il DEX non entra: e' la copertura gia' fatta, non da fare.
+ */
+function azioniScenario(r: Risposta, prezzi: number[], dtMin: number, dVol: number): number[] {
+  const righe = r.righe;
+  const sig = righe.map((x, i) => {
+    if (x.iv) return x.iv;
+    let best: number | null = null, d = Infinity;
+    righe.forEach((y, j) => { if (y.iv && Math.abs(j - i) < d) { d = Math.abs(j - i); best = y.iv; } });
+    return best;
+  });
+  const T1 = dtMin < 0 ? 0 : Math.max(0, r.T - dtMin * 60 / (365 * 86400));
+  const dC = (P: number, K: number, s: number | null, T: number) => {
+    if (!s || T <= 0) return P > K ? 1 : P < K ? 0 : 0.5;
+    const sr = s * Math.sqrt(T);
+    return ncdf((Math.log(P / K) + 0.5 * sr * sr) / sr);
+  };
+  const base = righe.map((x, i) => dC(r.spot, x.strike, sig[i], r.T));
+  return prezzi.map((P) => {
+    let es = 0;
+    righe.forEach((x, i) => {
+      const netto = (x.cb - x.cs) + (x.pb - x.ps);
+      if (!netto) return;
+      const s0 = sig[i];
+      const s1 = s0 ? Math.max(0.01, s0 + dVol / 100) : null;
+      es += netto * (dC(P, x.strike, s1, T1) - base[i]);
+    });
+    return es * 2;
+  });
 }
 
 function argEstremo(righe: Calcolo[], f: (c: Calcolo) => number, verso: 1 | -1): number | null {
@@ -104,10 +189,25 @@ const fmt = (v: number, d = 0) => {
   const s = a >= 1000 ? a.toLocaleString('it-IT', { maximumFractionDigits: 0 }) : a.toFixed(d);
   return `${v < 0 ? '−' : v > 0 ? '+' : ''}${s}`;
 };
+/** Didascalia sopra ogni profilo: a cosa si riferisce e come leggere il segno. */
+function didascalia(m: Misura, scenario: string): string {
+  switch (m) {
+    case 'azione': return `ES che il MM compra/vende se SPX arriva qui ${scenario}`;
+    case 'dex': return 'Copertura gia\' fatta dal MM: BUY = ha comprato ES';
+    case 'gammaNetto': return 'MM se il prezzo va verso lo strike: + = MM short gamma';
+    case 'gexp': return 'Flusso clienti x gamma: + call comprate / put vendute';
+    case 'profileNetto': return 'Sbilancio clienti per la greca scelta';
+    case 'vex': return 'Delta dei clienti se la vol sale di 1 punto';
+    case 'chex': return 'MM nella prossima ora a prezzo fermo (tempo che passa)';
+    case 'imbCall': return 'Call comprate − vendute dai clienti';
+    case 'imbPut': return 'Put comprate − vendute dai clienti';
+  }
+}
+
 const sec = (t: string) => { const [h, m, s] = t.split(':').map(Number); return h * 3600 + m * 60 + (s || 0); };
 
-function Grafico({ dati, righe, sinistra, destra, finestra, conCallPut }: {
-  dati: Risposta; righe: Calcolo[]; sinistra: Misura; destra: Misura; finestra: number; conCallPut: boolean;
+function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, conAzioni, scenario, coloreCandele }: {
+  dati: Risposta; righe: Calcolo[]; sinistra: Misura; destra: Misura; terza: Misura | 'none'; finestra: number; conCallPut: boolean; conAzioni: boolean; scenario: string; coloreCandele: ColoreCandele;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [larghezza, setLarghezza] = useState(1200);
@@ -129,7 +229,8 @@ function Grafico({ dati, righe, sinistra, destra, finestra, conCallPut }: {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#0b0f17'; ctx.fillRect(0, 0, W, H);
 
-    const TOP = 26, BOT = 26, DESTRA = 90;
+    // In alto: nome del profilo, didascalia, scala.
+    const TOP = 54, BOT = 26, DESTRA = 90;
     const plotW = W - DESTRA;
     const candele = finestra > 0 ? dati.candele.slice(-finestra) : dati.candele;
     if (righe.length === 0) return;
@@ -148,29 +249,46 @@ function Grafico({ dati, righe, sinistra, destra, finestra, conCallPut }: {
       if (p % 50 === 0) { ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'left'; ctx.fillText(String(p), plotW + 8, y(p) + 4); }
     }
 
-    // Candele lungo tutta la larghezza.
+    // Posizione dei profili: due a 22% e 68% della larghezza con mezza ampiezza 18%; con il terzo 15/47/79% e 12%.
+    const zeri = terza === 'none' ? [0.22, 0.68] : [0.15, 0.47, 0.79];
+    const mezza = plotW * (terza === 'none' ? 0.18 : 0.12);
+    // Ultima candela fissa nello spazio libero fra il profilo centrale e l'ultimo (quello del MM con il terzo
+    // acceso): il prezzo scorre verso sinistra come in Bookmap, le candele piu' vecchie escono dal bordo.
+    const xUltima = (plotW * zeri[zeri.length - 2] + mezza + plotW * zeri[zeri.length - 1] - mezza) / 2;
+
     if (candele.length > 0) {
-      const passo = plotW / Math.max(candele.length, 30);
-      const x0 = plotW - candele.length * passo;
+      const passo = xUltima / Math.max(finestra > 0 ? finestra : candele.length, 30);
+      const xDi = (i: number) => xUltima - (candele.length - 1 - i) * passo;
       candele.forEach((c, i) => {
-        const x = x0 + (i + 0.5) * passo;
+        const x = xDi(i);
+        if (x < 0) return;
         const su = c.c >= c.o;
-        ctx.strokeStyle = su ? '#e5e7eb' : '#6b7280';
-        ctx.fillStyle = su ? '#e5e7eb' : '#6b7280';
+        // Colore = cosa ha fatto il MM in quel minuto (verde compra ES, rosso vende; tenue sotto 100 ES);
+        // corpo pieno = candela in salita, vuoto = in discesa. Senza dato MM: grigio come prima.
+        const mm = coloreCandele === 'totale' ? c.mm : coloreCandele === 'greche' ? c.mmGreche : coloreCandele === 'flusso' ? c.mmFlusso : undefined;
+        let col: string;
+        if (mm == null) col = su ? '#e5e7eb' : '#6b7280';
+        else if (mm === 0) col = '#6b7280';
+        else col = Math.abs(mm) >= 100 ? (mm > 0 ? '#22c55e' : '#ef4444') : (mm > 0 ? 'rgba(34,197,94,0.45)' : 'rgba(239,68,68,0.45)');
+        ctx.strokeStyle = col; ctx.fillStyle = col;
         ctx.beginPath(); ctx.moveTo(x, y(c.h)); ctx.lineTo(x, y(c.l)); ctx.stroke();
         const yo = y(c.o), yc = y(c.c);
-        ctx.fillRect(x - Math.max(1, passo * 0.3), Math.min(yo, yc), Math.max(2, passo * 0.6), Math.max(1, Math.abs(yc - yo)));
+        const bx = x - Math.max(1, passo * 0.3), bw = Math.max(2, passo * 0.6), by = Math.min(yo, yc), bh = Math.max(1, Math.abs(yc - yo));
+        if (mm == null || su) ctx.fillRect(bx, by, bw, bh);
+        else { ctx.fillStyle = '#0b0f17'; ctx.fillRect(bx, by, bw, bh); ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, Math.max(1, bh - 1)); }
       });
       // Orari sotto, uno ogni ~100 px.
       ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'center';
       const ogni = Math.max(1, Math.round(100 / passo));
-      candele.forEach((c, i) => { if (i % ogni === 0) ctx.fillText(c.t, x0 + (i + 0.5) * passo, H - 8); });
+      candele.forEach((c, i) => { const x = xDi(i); if ((candele.length - 1 - i) % ogni === 0 && x > 20) ctx.fillText(c.t, x, H - 8); });
     }
+    // Ultimo prezzo: linea puntinata dall'ultima candela all'asse.
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(xUltima, y(dati.spot)); ctx.lineTo(plotW, y(dati.spot)); ctx.stroke();
+    ctx.setLineDash([]);
 
-    // I due profili: zero a 22% e 68% della larghezza, mezza ampiezza 18%.
     const altezzaBarra = Math.max(3, Math.abs(y(0) - y(5)) * 0.6);
     const profilo = (m: Misura, zeroX: number, colPos: string, colNeg: string) => {
-      const mezza = plotW * 0.18;
       const valori = righe.map((r) => valore(r, m));
       const max = Math.max(1e-9, ...valori.map(Math.abs));
       ctx.strokeStyle = 'rgba(168,85,247,0.6)';
@@ -179,19 +297,34 @@ function Grafico({ dati, righe, sinistra, destra, finestra, conCallPut }: {
         const v = valori[i];
         if (v === 0) return;
         const w = (Math.abs(v) / max) * mezza;
-        ctx.fillStyle = v > 0 ? colPos : colNeg;
+        // Profilo per prezzo (Azione MM): verde = il MM compra ES, rosso = vende, in qualunque pannello stia.
+        ctx.fillStyle = m === 'azione' ? (v > 0 ? '#22c55e' : '#ef4444') : v > 0 ? colPos : colNeg;
         const yy = y(r.strike) - altezzaBarra / 2;
         ctx.beginPath();
         ctx.roundRect(v > 0 ? zeroX : zeroX - w, yy, w, altezzaBarra, altezzaBarra / 2);
         ctx.fill();
+        // Etichetta BUY/SELL del market maker in fondo alla barra (solo barre >= 5% della piu' grande).
+        const az = conAzioni && Math.abs(v) >= 0.05 * max ? azioneMm(m, r, dati.spot) : null;
+        if (az) {
+          ctx.font = 'bold 10px ui-monospace, monospace';
+          ctx.fillStyle = az.buy ? '#22c55e' : '#ef4444';
+          ctx.textAlign = v > 0 ? 'left' : 'right';
+          ctx.fillText(az.testo, v > 0 ? zeroX + w + 4 : zeroX - w - 4, y(r.strike) + 3.5);
+          ctx.font = '11px ui-monospace, monospace';
+        }
       });
-      // Scala in alto: -max, 0, +max; nome in basso.
-      ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'center';
-      ctx.fillText(fmt(-max), zeroX - mezza, 14); ctx.fillText('0.00', zeroX, 14); ctx.fillText(fmt(max), zeroX + mezza, 14);
-      ctx.textAlign = 'left'; ctx.fillText(NOMI[m], zeroX - mezza, H - BOT - 6);
+      // In alto: nome, didascalia, scala -max / 0 / +max.
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 12px ui-monospace, monospace'; ctx.fillStyle = colPos;
+      ctx.fillText(NOMI[m], zeroX, 14, 2 * mezza);
+      ctx.font = '11px ui-monospace, monospace'; ctx.fillStyle = '#cbd5e1';
+      ctx.fillText(didascalia(m, scenario), zeroX, 29, 2 * mezza);
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(fmt(-max), zeroX - mezza, 45); ctx.fillText('0.00', zeroX, 45); ctx.fillText(fmt(max), zeroX + mezza, 45);
     };
-    profilo(sinistra, plotW * 0.22, VERDE, VIOLA);
-    profilo(destra, plotW * 0.68, AZZURRO, VIOLA);
+    profilo(sinistra, plotW * zeri[0], VERDE, VIOLA);
+    profilo(destra, plotW * zeri[1], AZZURRO, VIOLA);
+    if (terza !== 'none') profilo(terza, plotW * zeri[2], '#eab308', VIOLA);
 
     // Livelli.
     const livello = (k: number | null, col: string, nome: string) => {
@@ -217,7 +350,7 @@ function Grafico({ dati, righe, sinistra, destra, finestra, conCallPut }: {
     ctx.fillStyle = '#fff'; ctx.fillRect(plotW + 2, y(dati.spot) - 8, DESTRA - 4, 16);
     ctx.fillStyle = '#000'; ctx.textAlign = 'left'; ctx.font = 'bold 11px ui-monospace, monospace';
     ctx.fillText(dati.spot.toFixed(2), plotW + 6, y(dati.spot) + 4);
-  }, [dati, righe, sinistra, destra, finestra, conCallPut, larghezza]);
+  }, [dati, righe, sinistra, destra, terza, finestra, conCallPut, conAzioni, scenario, coloreCandele, larghezza]);
 
   return <canvas ref={ref} className="block w-full rounded-lg border border-slate-800" />;
 }
@@ -241,8 +374,13 @@ export default function FlussoGreche() {
   const [modo, setModo] = useState<ModoGexp>('netto');
   const [sinistra, setSinistra] = useState<Misura>('dex');
   const [destra, setDestra] = useState<Misura>('gammaNetto');
+  const [terza, setTerza] = useState<Misura | 'none'>('azione');
+  const [scDt, setScDt] = useState(30);
+  const [scVol, setScVol] = useState(0);
   const [finestra, setFinestra] = useState(120);
   const [conCallPut, setConCallPut] = useState(false);
+  const [conAzioni, setConAzioni] = useState(true);
+  const [coloreCandele, setColoreCandele] = useState<ColoreCandele>('totale');
   const [giorno, setGiorno] = useState('');
 
   useEffect(() => {
@@ -265,7 +403,14 @@ export default function FlussoGreche() {
     return () => { vivo = false; if (id) clearInterval(id); };
   }, [giorno]);
 
-  const righe = useMemo(() => (dati ? calcola(dati, greca, modo) : []), [dati, greca, modo]);
+  const righe = useMemo(() => {
+    if (!dati) return [];
+    const base = calcola(dati, greca, modo);
+    const az = azioniScenario(dati, base.map((c) => c.strike), scDt, scVol);
+    return base.map((c, i) => ({ ...c, azione: az[i] }));
+  }, [dati, greca, modo, scDt, scVol]);
+  /** ES del MM se SPX resta allo spot per lo scenario (solo tempo e vol). */
+  const azioneFermo = useMemo(() => (dati ? azioniScenario(dati, [dati.spot], scDt, scVol)[0] : 0), [dati, scDt, scVol]);
 
   const totali = useMemo(() => {
     const somma = (f: (c: Calcolo) => number) => righe.reduce((a, c) => a + f(c), 0);
@@ -310,7 +455,6 @@ export default function FlussoGreche() {
   return (
     <div className="min-h-screen bg-[#05070c] text-slate-200 p-4 space-y-3">
       <div className="flex flex-wrap items-center gap-3">
-        <button onClick={() => router.push('/market')} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET</button>
         <h1 className="text-lg font-bold">Flusso greche SPX 0DTE <span className="text-amber-400 text-xs font-normal">(in prova)</span></h1>
         <span className="text-xs text-slate-400 font-mono">
           {dati ? `${dati.date} ${dati.time} · SPX ${dati.spot.toFixed(2)} · Comp/Vend Lee-Ready dalle ${dati.inizioLr ?? '?'}` : ''}
@@ -322,6 +466,13 @@ export default function FlussoGreche() {
       <div className="flex flex-wrap items-center gap-3 text-xs">
         <label>Sinistra <select className={sel} value={sinistra} onChange={(e) => setSinistra(e.target.value as Misura)}>{misure.map((m) => <option key={m} value={m}>{NOMI[m]}</option>)}</select></label>
         <label>Destra <select className={sel} value={destra} onChange={(e) => setDestra(e.target.value as Misura)}>{misure.map((m) => <option key={m} value={m}>{NOMI[m]}</option>)}</select></label>
+        <label>Terzo <select className={sel} value={terza} onChange={(e) => setTerza(e.target.value as Misura | 'none')}><option value="none">nessuno</option>{misure.map((m) => <option key={m} value={m}>{NOMI[m]}</option>)}</select></label>
+        <label>Scenario fra <select className={sel} value={scDt} onChange={(e) => setScDt(Number(e.target.value))}>
+          <option value={0}>adesso</option><option value={15}>15 min</option><option value={30}>30 min</option><option value={60}>60 min</option><option value={-1}>scadenza</option>
+        </select></label>
+        <label>Vol <select className={sel} value={scVol} onChange={(e) => setScVol(Number(e.target.value))}>
+          {[-5, -2, 0, 2, 5].map((v) => <option key={v} value={v}>{v > 0 ? `+${v}` : v} punti</option>)}
+        </select></label>
         <label>Greca (Profile Netto) <select className={sel} value={greca} onChange={(e) => setGreca(e.target.value as Greca)}>
           <option value="gamma">gamma</option><option value="delta">delta</option><option value="vanna">vanna</option><option value="charm">charm</option><option value="none">none</option>
         </select></label>
@@ -332,6 +483,10 @@ export default function FlussoGreche() {
           <option value={60}>60 min</option><option value={120}>120 min</option><option value={240}>240 min</option><option value={0}>tutta la seduta</option>
         </select></label>
         <label className="flex items-center gap-1"><input type="checkbox" checked={conCallPut} onChange={(e) => setConCallPut(e.target.checked)} /> Major Call/Put Gamma</label>
+        <label className="flex items-center gap-1"><input type="checkbox" checked={conAzioni} onChange={(e) => setConAzioni(e.target.checked)} /> BUY/SELL market maker</label>
+        <label>Colore candele <select className={sel} value={coloreCandele} onChange={(e) => setColoreCandele(e.target.value as ColoreCandele)}>
+          <option value="totale">MM totale</option><option value="greche">MM solo prezzo/tempo</option><option value="flusso">MM solo nuovi scambi</option><option value="prezzo">prezzo (su/giù)</option>
+        </select></label>
       </div>
 
       {errore && <div className="text-amber-400 text-sm">{errore}</div>}
@@ -342,7 +497,13 @@ export default function FlussoGreche() {
             <Scheda titolo="Aggregate DEX" valore={`${fmt(totali.dexMM, 1)} M$`} sotto={`${fmt(totali.dex)} Δ contratti`} colore={col(totali.dexMM)} />
             <Scheda titolo="Net GEX" valore={`${fmt(totali.gex, 1)} M$`} sotto={`GEX Profile ${modo}, per 1%`} colore={col(totali.gex)} />
             <Scheda titolo="Net −Vanna" valore={`${fmt(totali.vanna, 1)} M$`} sotto="per punto di vol" colore={col(totali.vanna)} />
-            <Scheda titolo="Net Charm" valore={`${fmt(totali.charm, 1)} M$/h`} colore={col(totali.charm)} />
+            <Scheda titolo="Azione MM a prezzo fermo"
+              valore={`${azioneFermo >= 0 ? 'BUY' : 'SELL'} ${Math.round(Math.abs(azioneFermo))} ES`}
+              sotto={`SPX ${dati.spot.toFixed(0)} ${scDt < 0 ? 'fino alla scadenza' : scDt === 0 ? 'adesso' : `fra ${scDt} min`}${scVol ? `, vol ${scVol > 0 ? '+' : ''}${scVol}` : ''}`}
+              colore={azioneFermo > 0 ? VERDE : azioneFermo < 0 ? '#ef4444' : undefined} />
+            <Scheda titolo="Net Charm" valore={`${fmt(totali.charm, 1)} M$/h`}
+              sotto={totali.charm === 0 ? undefined : `MM ${totali.charm > 0 ? 'BUY' : 'SELL'} ~${Math.round(Math.abs(totali.charm) * 1e6 / (50 * dati.spot))} ES/h a prezzo fermo`}
+              colore={col(totali.charm)} />
             <Scheda titolo="Major Long / Short Gamma" valore={`${totali.longGamma ?? '—'} / ${totali.shortGamma ?? '—'}`} sotto="Gamma Netto" />
             <Scheda titolo="Major Call / Put Gamma" valore={`${totali.callGamma ?? '—'} / ${totali.putGamma ?? '—'}`} sotto="GEX Profile" />
             {maxChange.map((m) => (
@@ -353,7 +514,9 @@ export default function FlussoGreche() {
             ))}
           </div>
 
-          <Grafico dati={dati} righe={righe} sinistra={sinistra} destra={destra} finestra={finestra} conCallPut={conCallPut} />
+          <Grafico dati={dati} righe={righe} sinistra={sinistra} destra={destra} finestra={finestra} terza={terza} conCallPut={conCallPut} conAzioni={conAzioni}
+            scenario={`${scDt < 0 ? 'a scadenza' : scDt === 0 ? 'adesso' : `fra ${scDt} min`}${scVol ? `, vol ${scVol > 0 ? '+' : ''}${scVol}` : ''}`}
+            coloreCandele={coloreCandele} />
 
           <details className="text-xs">
             <summary className="cursor-pointer text-slate-400">Tabella per strike</summary>
@@ -388,6 +551,23 @@ export default function FlussoGreche() {
               </table>
             </div>
           </details>
+
+          {conAzioni && (
+            <p className="text-[11px] text-slate-400 max-w-4xl">
+              Candele: <b className="text-green-500">verdi</b> = in quel minuto il MM ha dovuto comprare ES, <b className="text-red-500">rosse</b> = vendere
+              (tenui sotto 100 ES; corpo pieno = minuto in salita, vuoto = in discesa). MM totale = variazione del delta dei clienti:
+              nuovi scambi (clienti che comprano call → MM compra ES) + prezzo/tempo/vol sulle posizioni già aperte (gamma e charm, il ragionamento del profilo).
+              <br />
+              <b className="text-green-500">BUY</b> / <b className="text-red-500">SELL</b> = cosa fa il market maker su ES (controparte dei clienti).
+              Su GAMMA: cosa fa se il prezzo va verso quello strike (sopra lo spot salendo, sotto scendendo; ATM in entrambi i versi):
+              MM short gamma insegue il prezzo, MM long gamma va contro. Su DEX: la copertura che tiene già (clienti long delta → MM compra ES).
+              Su CHARM: cosa deve fare nella prossima ora a prezzo fermo, solo per il tempo che passa verso la scadenza
+              (opzioni fuori dal denaro che perdono delta, dentro che ne guadagnano).
+              Su AZIONE MM: gli ES che il MM compra/vende in totale se SPX arriva a quel prezzo nello scenario scelto (fra N minuti,
+              vol ±): gamma + charm + vanna sommati rivalutando le opzioni, non sommando le greche, che hanno unità diverse.
+              Solo barre ≥ 5% della più grande. Copertura teorica, non verificata su Bookmap.
+            </p>
+          )}
 
           <p className="text-[11px] text-slate-500 max-w-4xl">
             Comp/Vend = conti Lee-Ready del poller dei volumi (trade per trade, quote prima del trade), non la stima a rapporto

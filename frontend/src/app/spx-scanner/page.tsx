@@ -274,8 +274,6 @@ export default function SpxScannerPage() {
                 <div className="ml-auto flex gap-2">
                     <button onClick={() => setMattina(true)} className="px-3 py-1.5 bg-blue-900 hover:bg-blue-800 border border-blue-700 rounded-lg text-xs"
                         title="Vertical 5/10 punti della sessione notturna e della mattina (prima dell'apertura cash)">VERTICAL MATTINA</button>
-                    <a href="/hedging-pressure" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET MAKER</a>
-                    <a href="/market" className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">CHART</a>
                 </div>
             </div>
             {errore && <div className="text-red-400 mb-2">{errore}</div>}

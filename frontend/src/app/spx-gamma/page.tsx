@@ -16,7 +16,6 @@
 'use client';
 
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import { majorGamma } from '@/lib/majorGamma';
 
@@ -86,7 +85,6 @@ function timeStringToDate(timeStr: string): number {
 }
 
 export default function SpxGammaPage() {
-    const router = useRouter();
     const [profile, setProfile] = useState<ProfileRow[]>([]);
     const [spot, setSpot] = useState<SpotPoint[]>([]);
     const [storico, setStorico] = useState<VoceStorico[]>([]);
@@ -476,30 +474,6 @@ export default function SpxGammaPage() {
                                 </button>
                             ))}
                         </div>
-                        <button
-                            onClick={() => router.push('/gex')}
-                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                        >
-                            GEX Flow
-                        </button>
-                        <button
-                            onClick={() => router.push('/spx-volumes')}
-                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                        >
-                            SPX Volumes
-                        </button>
-                        <button
-                            onClick={() => router.push('/hedging-pressure')}
-                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                        >
-                            MARKET MAKER
-                        </button>
-                        <button
-                            onClick={() => router.push('/market')}
-                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs transition-colors"
-                        >
-                            Market Monitor
-                        </button>
                     </div>
                 </div>
 

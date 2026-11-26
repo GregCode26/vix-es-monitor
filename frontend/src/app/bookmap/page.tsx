@@ -2337,12 +2337,6 @@ export default function BookmapPage() {
               CVD e liquidita&apos; del book da Bookmap (add-on <code>execution/bookmap_addon.py</code>) · solo locale, a titolo di studio
             </p>
           </div>
-          <button
-            onClick={() => router.push('/market')}
-            className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300"
-          >
-            ← CHART
-          </button>
         </div>
 
         <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">

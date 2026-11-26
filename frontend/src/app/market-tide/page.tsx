@@ -76,6 +76,36 @@ function compatto(v: number | null | undefined, decimaliM = 0): string {
   return `${Math.round(v)}`;
 }
 
+/** Finestra su cui si guarda come si muove la distanza Call − Put. */
+const FINESTRA_DIFF_SEC = 300;
+const COL_DIVERGONO = '#facc15';
+const COL_CONVERGONO = '#38bdf8';
+const COL_PARALLELE = 'rgba(148, 163, 184, 0.7)';
+type StatoDiff = 'divergono' | 'convergono' | 'parallele' | null;
+
+/**
+ * Distanza fra le linee: NCP − NPP (positiva = comandano le call, negativa = le put). Per ogni punto lo stato
+ * sugli ultimi 5 minuti: |distanza| cresciuta = le linee divergono, calata = convergono, ferma = parallele.
+ * "Ferma" = variazione sotto il 3% della distanza massima della giornata fin li' (almeno 250K $).
+ */
+function statiDistanza(points: TidePoint[]): { diff: number[]; stato: StatoDiff[]; variazione: (number | null)[] } {
+  const diff = points.map((p) => p.ncp - p.npp);
+  const stato: StatoDiff[] = [];
+  const variazione: (number | null)[] = [];
+  let j = 0, maxAss = 0;
+  for (let i = 0; i < points.length; i++) {
+    maxAss = Math.max(maxAss, Math.abs(diff[i]));
+    const t = secondi(points[i].time);
+    while (j < i && secondi(points[j + 1].time) <= t - FINESTRA_DIFF_SEC) j++;
+    if (t - secondi(points[j].time) < FINESTRA_DIFF_SEC * 0.8) { stato.push(null); variazione.push(null); continue; }
+    const dAss = Math.abs(diff[i]) - Math.abs(diff[j]);
+    const soglia = Math.max(250_000, maxAss * 0.03);
+    stato.push(Math.abs(dAss) < soglia ? 'parallele' : dAss > 0 ? 'divergono' : 'convergono');
+    variazione.push(diff[i] - diff[j]);
+  }
+  return { diff, stato, variazione };
+}
+
 const fissaLarghezza = (s: Scale) => { s.width = LARGHEZZA_ASSE; };
 /** Anche in altezza: profilo e premi devono avere l'area del grafico alla stessa quota. */
 const ALTEZZA_ASSE_X = 24;
@@ -224,6 +254,9 @@ export default function MarketTidePage() {
 
   const premiRef = useRef<HTMLCanvasElement | null>(null);
   const volumeRef = useRef<HTMLCanvasElement | null>(null);
+  const diffRef = useRef<HTMLCanvasElement | null>(null);
+  const chartDiff = useRef<ChartJS | null>(null);
+  const statiRef = useRef<StatoDiff[]>([]);
   const chartPremi = useRef<ChartJS | null>(null);
   const chartVolume = useRef<ChartJS | null>(null);
   const profiloRef = useRef<HTMLCanvasElement | null>(null);
@@ -354,7 +387,7 @@ export default function MarketTidePage() {
 
   // I grafici si creano una volta; i dati si aggiornano in modo imperativo.
   useEffect(() => {
-    if (!autorizzato || !premiRef.current || !volumeRef.current || !profiloRef.current) return;
+    if (!autorizzato || !premiRef.current || !volumeRef.current || !profiloRef.current || !diffRef.current) return;
 
     const asseX = {
       grid: { color: 'rgba(255, 255, 255, 0.04)' },
@@ -391,6 +424,48 @@ export default function MarketTidePage() {
             ticks: { color: '#94a3b8' },
           },
           yPremi: {
+            position: 'right',
+            afterFit: fissaLarghezza,
+            grid: { color: lineaZero },
+            ticks: { color: '#94a3b8', callback: (v) => compatto(Number(v)) },
+          },
+        },
+      },
+      plugins: [mirino],
+    });
+
+    // Distanza Call − Put: area verde sopra zero (comandano le call), rossa sotto (le put); la linea e'
+    // gialla dove le due linee divergono, azzurra dove convergono, grigia dove vanno parallele.
+    chartDiff.current = new ChartJS(diffRef.current, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Call − Put',
+          data: [],
+          yAxisID: 'yDiff',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.2,
+          fill: { target: 'origin', above: 'rgba(52, 211, 153, 0.18)', below: 'rgba(244, 63, 94, 0.22)' },
+          segment: {
+            borderColor: (ctx) => {
+              const st = statiRef.current[ctx.p1DataIndex];
+              return st === 'divergono' ? COL_DIVERGONO : st === 'convergono' ? COL_CONVERGONO : COL_PARALLELE;
+            },
+          },
+        }],
+      },
+      options: {
+        animation: false,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        elements: { point: { hoverRadius: 0 } },
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: {
+          x: { ...asseX, afterFit: fissaAltezza, ticks: { ...asseX.ticks, display: false } },
+          ySx: { position: 'left', afterFit: fissaLarghezza, grid: { display: false }, ticks: { display: false } },
+          yDiff: {
             position: 'right',
             afterFit: fissaLarghezza,
             grid: { color: lineaZero },
@@ -486,8 +561,8 @@ export default function MarketTidePage() {
 
     // Il cursore su uno dei due grafici guida l'intestazione e la linea
     // verticale su entrambi, come nell'originale.
-    const canvases = [premiRef.current, volumeRef.current];
-    const charts = [chartPremi.current, chartVolume.current];
+    const canvases = [premiRef.current, volumeRef.current, diffRef.current];
+    const charts = [chartPremi.current, chartVolume.current, chartDiff.current];
     const muovi = (i: number) => (evt: MouseEvent) => {
       const el = charts[i].getElementsAtEventForMode(evt, 'index', { intersect: false }, false)[0];
       const r = canvases[i].getBoundingClientRect();
@@ -568,6 +643,8 @@ export default function MarketTidePage() {
       });
       chartPremi.current?.destroy();
       chartVolume.current?.destroy();
+      chartDiff.current?.destroy();
+      chartDiff.current = null;
       chartProfilo.current?.destroy();
       chartPremi.current = null;
       chartVolume.current = null;
@@ -613,6 +690,14 @@ export default function MarketTidePage() {
     cv.data.labels = labels;
     (cv.data.datasets[0] as ChartDataset<'line'>).data = points.map((p) => p.netVol);
     (cv.data.datasets[1] as ChartDataset<'line'>).data = points.map((p) => p.spx);
+    const cd = chartDiff.current;
+    if (cd) {
+      const { diff, stato } = statiDistanza(points);
+      statiRef.current = stato;
+      cd.data.labels = labels;
+      (cd.data.datasets[0] as ChartDataset<'line'>).data = diff;
+      cd.update('none');
+    }
 
     // Straddle: il cono parte dal prezzo delle 15:35 e arriva ai breakeven
     // alla chiusura; i breakeven sono le stesse due quote, piatte.
@@ -683,7 +768,7 @@ export default function MarketTidePage() {
   // mouse e, dai premi, anche sul profilo allo stesso prezzo.
   useEffect(() => {
     const cp = chartPremi.current;
-    const charts = [cp, chartVolume.current];
+    const charts = [cp, chartVolume.current, chartDiff.current];
     let prezzo: number | null = null;
     if (cursore?.grafico === 0 && cp?.scales.ySpx) prezzo = cp.scales.ySpx.getValueForPixel(cursore.y) ?? null;
     charts.forEach((c, i) => {
@@ -704,7 +789,12 @@ export default function MarketTidePage() {
 
   if (!autorizzato) return null;
 
-  const corrente = indiceHover != null ? points[indiceHover] : points[points.length - 1];
+  const iCorrente = indiceHover ?? points.length - 1;
+  const corrente = points[iCorrente];
+  const distanza = statiDistanza(points);
+  const diffCorr = iCorrente >= 0 ? distanza.diff[iCorrente] : null;
+  const statoCorr = iCorrente >= 0 ? distanza.stato[iCorrente] : null;
+  const varCorr = iCorrente >= 0 ? distanza.variazione[iCorrente] : null;
 
   return (
     <div className="min-h-screen bg-[#0c0d10] text-slate-300 p-3 md:p-5 font-sans">
@@ -714,12 +804,6 @@ export default function MarketTidePage() {
             <h1 className="text-2xl font-bold text-white">Market Tide</h1>
             <p className="text-xs text-slate-500">SPX 0DTE · premio e volume netti trade per trade, vertical contati una volta · solo locale</p>
           </div>
-          <button
-            onClick={() => router.push('/market')}
-            className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 text-slate-300"
-          >
-            ← CHART
-          </button>
         </div>
 
         <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">
@@ -729,6 +813,11 @@ export default function MarketTidePage() {
             <span className="text-slate-400">Vol: <span className="text-white">{compatto(corrente?.netVol, 1)}</span> <span style={{ color: (corrente?.netVol ?? 0) >= 0 ? VERDE : ROSSO }}>●</span></span>
             <span className="text-slate-400">NPP: <span className="text-white">{compatto(corrente?.npp)}</span> <span style={{ color: ROSSO }}>●</span></span>
             <span className="text-slate-400">NCP: <span className="text-white">{compatto(corrente?.ncp)}</span> <span style={{ color: VERDE }}>●</span></span>
+            <span className="text-slate-400">Call − Put: <span style={{ color: (diffCorr ?? 0) >= 0 ? VERDE : ROSSO }}>{compatto(diffCorr)}</span>
+              {diffCorr != null && <span className="text-slate-400"> · comandano le <span style={{ color: diffCorr >= 0 ? VERDE : ROSSO }}>{diffCorr >= 0 ? 'call' : 'put'}</span></span>}
+              {statoCorr && <span> · <span style={{ color: statoCorr === 'divergono' ? COL_DIVERGONO : statoCorr === 'convergono' ? COL_CONVERGONO : '#94a3b8' }}>{statoCorr}</span>
+                <span className="text-slate-500"> ({varCorr != null && varCorr >= 0 ? '+' : ''}{compatto(varCorr)} in 5 min)</span></span>}
+            </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-2 text-xs">
@@ -784,6 +873,20 @@ export default function MarketTidePage() {
                 su Vercel non c&apos;è, perché il dato resta nel file locale.
               </div>
             )}
+            </div>
+          </div>
+          <div className="flex text-xs font-semibold text-slate-300 mt-2">
+            <div className="w-[240px] md:w-[300px] shrink-0" />
+            <div>
+              Distanza Call − Put (NCP − NPP)
+              <span className="font-normal text-slate-500"> · sopra zero <span style={{ color: VERDE }}>comandano le call</span>, sotto <span style={{ color: ROSSO }}>le put</span> ·
+                linea <span style={{ color: COL_DIVERGONO }}>gialla divergono</span>, <span style={{ color: COL_CONVERGONO }}>azzurra convergono</span>, <span className="text-slate-400">grigia parallele</span> (ultimi 5 min)</span>
+            </div>
+          </div>
+          <div className="flex h-[130px] md:h-[160px]">
+            <div className="w-[240px] md:w-[300px] shrink-0" />
+            <div className="relative flex-1 min-w-0">
+              <canvas ref={diffRef} style={{ cursor: 'none' }} />
             </div>
           </div>
           <div className="flex text-xs font-semibold text-slate-300 mt-2">

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { calcolaZeroGamma, URL_CBOE, type ZeroGammaCboe } from '@/lib/zeroGammaCboe';
-import { serieZeroGammaPoller } from '@/lib/zeroGammaPoller';
+import { serieZeroGammaPoller, zonaZeroGammaPoller } from '@/lib/zeroGammaPoller';
 
 export const dynamic = 'force-dynamic';
 
@@ -125,7 +125,7 @@ export async function GET(request: NextRequest) {
   const passato = request.nextUrl.searchParams.get('date');
   if (passato && /^\d{4}-\d{2}-\d{2}$/.test(passato) && passato < oggiRoma()) {
     const serie = serieZeroGammaPoller(passato);
-    return NextResponse.json({ date: passato, poller: serie.length > 0 ? { serie, ultimo: serie[serie.length - 1] } : null });
+    return NextResponse.json({ date: passato, poller: serie.length > 0 ? { serie, ultimo: serie[serie.length - 1], zona: zonaZeroGammaPoller(passato) } : null });
   }
   const giorno = oggiRoma();
   const lista = manuale(giorno);
@@ -143,7 +143,8 @@ export async function GET(request: NextRequest) {
     date: giorno,
     manuale: ultimo && ultimo.valore !== null ? ultimo : null,
     storiaManuale: lista,
-    poller: serie.length > 0 ? { serie, ultimo: serie[serie.length - 1] } : null,
+    // `zona`: [ora, min, max] degli incroci a catena entro 20 punti da quello scelto (lib/zeroGammaPoller.ts).
+    poller: serie.length > 0 ? { serie, ultimo: serie[serie.length - 1], zona: zonaZeroGammaPoller(giorno) } : null,
     cboe: cache?.giorno === giorno ? cache.dato : null,
     erroreCboe: cache?.giorno === giorno ? cache.errore : null,
   });

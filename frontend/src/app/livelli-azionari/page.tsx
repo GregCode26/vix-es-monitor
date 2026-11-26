@@ -187,12 +187,6 @@ export default function LivelliAzionariPage() {
         <main className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-6">
             <div className="flex items-center justify-between gap-4">
                 <h1 className="text-xl font-bold tracking-wide">LIVELLI AZIONARI</h1>
-                <Link
-                    href="/market"
-                    className="px-3 py-1.5 text-xs font-bold rounded border border-slate-600 text-slate-200 hover:bg-slate-800 hover:border-slate-400"
-                >
-                    ← MARKET
-                </Link>
             </div>
             <p className="text-sm text-slate-400 mt-1">Straddle ATM sulle 3 scadenze più vicine, da IBKR (mid di call + put).</p>
 

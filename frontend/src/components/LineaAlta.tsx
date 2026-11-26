@@ -397,8 +397,6 @@ export default function LineaAlta({ incorporata = false }: { incorporata?: boole
           Linea verde/rossa: {lineaOn ? 'ON' : 'OFF'}
         </button>
         <button onClick={() => grafico.current?.resetZoom()} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">Reset zoom</button>
-        {!incorporata && <button onClick={() => router.push('/hedging-pressure')} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">MARKET MAKER</button>}
-        {!incorporata && <button onClick={() => router.push('/market')} className="px-3 py-1 text-xs bg-slate-800 border border-slate-700 rounded">MARKET</button>}
         {errore && <span className="text-xs text-rose-400">{errore}</span>}
       </div>
 

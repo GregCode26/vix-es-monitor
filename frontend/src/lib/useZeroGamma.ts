@@ -16,6 +16,8 @@ export interface ZeroGammaStato {
   cboe: { ora: string; principale: number | null; spot: number; gexOiB: number | null; gexVolB: number | null } | null;
   /** [ora di Roma 'HH:MM:SS', Zero Gamma SPX], una al minuto dall'apertura cash. */
   traccia: [string, number][];
+  /** [ora, min, max] degli incroci entro 20 punti da quello della traccia: min = max con un solo incrocio. */
+  zona: [string, number, number][];
   /** L'ultimo della traccia, o il Cboe se la traccia non c'e' (poller fermo, Vercel). */
   attuale: { valore: number; fonte: 'poller' | 'cboe' } | null;
 }
@@ -33,7 +35,7 @@ const REFRESH_MS = 60_000;
 const EVENTO = 'zero-gamma-cambiato';
 
 export function useZeroGamma(): ZeroGammaStato & { imposta: (v: number | null) => Promise<boolean> } {
-  const [stato, setStato] = useState<ZeroGammaStato>({ manuale: null, cboe: null, traccia: [], attuale: null });
+  const [stato, setStato] = useState<ZeroGammaStato>({ manuale: null, cboe: null, traccia: [], zona: [], attuale: null });
 
   const leggi = useCallback(async () => {
     try {
@@ -50,6 +52,7 @@ export function useZeroGamma(): ZeroGammaStato & { imposta: (v: number | null) =
         manuale: j.manuale ?? null,
         cboe,
         traccia,
+        zona: j.poller?.zona ?? [],
         attuale: ultimo ? { valore: ultimo[1], fonte: 'poller' }
           : cboe?.principale != null ? { valore: cboe.principale, fonte: 'cboe' } : null,
       });

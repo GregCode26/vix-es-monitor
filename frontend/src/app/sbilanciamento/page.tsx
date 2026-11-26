@@ -135,7 +135,6 @@ export default function SbilanciamentoPage() {
               {l && <> · dati delle {l.time} · SPX {fmt(l.spot)} · forward {fmt(l.fwd)} · centro {l.centro}</>}
             </div>
           </div>
-          <button onClick={() => router.push('/market')} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs">MARKET</button>
         </div>
 
         {errore && <div className="p-3 rounded bg-amber-900/40 border border-amber-700 text-amber-200 text-sm">{errore}</div>}

@@ -1,7 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
-import Link from 'next/link';
 import { Chart as ChartJS, LinearScale, PointElement, LineElement, Tooltip, Filler, LineController, ScatterController, type Plugin } from 'chart.js';
 import annotationPlugin from 'chartjs-plugin-annotation';
 import { Line } from 'react-chartjs-2';
@@ -701,7 +700,6 @@ export default function DaxPage() {
                         <label className="flex items-center gap-1 text-[10px] text-slate-400" title="A ogni lettura IBKR la IV di ogni gamba si ricalcola dal mid: grafico e P&L seguono i prezzi di mercato. Spento = IV scritte a mano">
                             <input type="checkbox" checked={ivMercato} onChange={(e) => setIvMercato(e.target.checked)} /> IV dal mercato
                         </label>
-                        <Link href="/market" className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-[10px] transition-colors">← MARKET</Link>
                     </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
