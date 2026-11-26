@@ -334,6 +334,8 @@ export default function SpxGammaPage() {
         return {
             backgroundColor: '#0c0d10',
             tooltip: {
+                // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+                showContent: false,
                 trigger: 'axis',
                 axisPointer: { type: 'cross' },
             },

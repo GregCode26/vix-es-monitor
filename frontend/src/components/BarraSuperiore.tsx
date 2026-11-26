@@ -68,7 +68,7 @@ export default function BarraSuperiore() {
       </Link>
       {/* Tutti su una riga: se lo spazio non basta scorre in orizzontale (mx-auto centra
           senza tagliare il bordo sinistro, che justify-center renderebbe irraggiungibile) */}
-      <nav className="flex-1 min-w-0 overflow-x-auto flex">
+      <nav className="flex-1 min-w-0 overflow-x-auto flex [scrollbar-width:thin] [scrollbar-color:#334155_transparent]">
         <div className="mx-auto flex flex-nowrap shrink-0 bg-slate-900 border border-slate-700 rounded-lg p-0.5">
           {PAGINE.map((p) => (
             <Link key={p.href} href={p.href} title={p.titolo}

@@ -130,12 +130,12 @@ def costruisci(g):
         if r.get('bid') and r.get('ask'):
             mid[i] = m = (r['bid'] + r['ask']) / 2
             libro = r.get('book') or {}
-            vicini = [s for p, s in (libro.get('b') or []) + (libro.get('a') or []) if abs(p - m) <= MURO_MAX]
+            vicini = [s for p, s, *_ in (libro.get('b') or []) + (libro.get('a') or []) if abs(p - m) <= MURO_MAX]
             if vicini:
                 soglie_muro = {'muro 100': 100, 'muro 2x mediana': 2 * float(np.median(vicini))}
                 for k, th in soglie_muro.items():
-                    sotto = [p for p, s in (libro.get('b') or []) if s >= th and MURO_MIN <= m - p <= MURO_MAX]
-                    sopra = [p for p, s in (libro.get('a') or []) if s >= th and MURO_MIN <= p - m <= MURO_MAX]
+                    sotto = [p for p, s, *_ in (libro.get('b') or []) if s >= th and MURO_MIN <= m - p <= MURO_MAX]
+                    sopra = [p for p, s, *_ in (libro.get('a') or []) if s >= th and MURO_MIN <= p - m <= MURO_MAX]
                     if sotto: muri[k][0][i] = max(sotto)
                     if sopra: muri[k][1][i] = min(sopra)
         b, s = r.get('buy') or 0, r.get('sell') or 0

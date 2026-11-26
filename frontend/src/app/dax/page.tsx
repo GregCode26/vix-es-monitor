@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction 
 import { Chart as ChartJS, LinearScale, PointElement, LineElement, Tooltip, Filler, LineController, ScatterController, type Plugin } from 'chart.js';
 import annotationPlugin from 'chartjs-plugin-annotation';
 import { Line } from 'react-chartjs-2';
+import { mirinoChartJs } from '@/lib/mirinoChartJs';
+
+/** Mirino fino sulle scale, con i valori (26/11/2026). */
+const MIRINO = mirinoChartJs();
 import type { Candidato } from '@/lib/daxOttimizza';
 import {
     type Gamba, type Impostazioni, type Mercato, type Scenario, type TipoGamba,
@@ -664,6 +668,8 @@ export default function DaxPage() {
                 legend: { display: false },
                 annotation: { annotations: annotazioni },
                 tooltip: {
+                    // Niente riquadro dei valori sul puntatore.
+                    enabled: false,
                     filter: (it: { dataset: { label?: string } }) => it.dataset.label !== 'passi',
                     callbacks: {
                         title: (it: { parsed: { x: number } }[]) => `DAX ${fmt(it[0]?.parsed.x, 0)} (${fmt(((it[0]?.parsed.x ?? 0) / indiceLive - 1) * 100, 1)}%)`,
@@ -857,7 +863,7 @@ export default function DaxPage() {
                             </div>
                         </div>
                         <div className="relative flex-1 min-h-[300px]">
-                            <Line data={datiGrafico as never} options={opzioniGrafico as never} plugins={[etichettePassi as never]} />
+                            <Line data={datiGrafico as never} options={opzioniGrafico as never} plugins={[etichettePassi as never, MIRINO as never]} style={{ cursor: 'crosshair' }} />
                         </div>
                         <div className="flex flex-wrap items-center justify-center gap-2 mt-3">
                             <Bottone tono="rosso" onClick={() => setShiftIv(s => s + 1)} titolo="Tutte le IV +1 punto">IV +1 (what if)</Bottone>

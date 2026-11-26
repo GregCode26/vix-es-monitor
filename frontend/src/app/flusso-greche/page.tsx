@@ -17,6 +17,11 @@ const VIOLA = '#a855f7';
 const AZZURRO = '#22d3ee';
 const ARANCIO = '#f97316';
 const BLU = '#3b82f6';
+/** Lato dei clienti (26/11/2026, su richiesta): call comprata verde, venduta rossa; put comprata blu, venduta viola. */
+const CALL_COMP = '#22c55e';
+const CALL_VEND = '#ef4444';
+const PUT_COMP = '#3b82f6';
+const PUT_VEND = '#a855f7';
 
 /** mm = ES che il MM ha comprato (+) / venduto (−) nel minuto: mmFlusso nuovi scambi, mmGreche prezzo/tempo/vol. */
 type Candela = { t: string; o: number; h: number; l: number; c: number; mm?: number; mmFlusso?: number; mmGreche?: number };
@@ -204,6 +209,11 @@ function didascalia(m: Misura, scenario: string): string {
   }
 }
 
+/** Colori delle testate Comp/Vend/Imb della tabella per strike. */
+const COLORE_TESTATA: Record<string, string> = {
+  'Comp C': CALL_COMP, 'Vend C': CALL_VEND, 'Imb C': CALL_COMP, 'Comp P': PUT_COMP, 'Vend P': PUT_VEND, 'Imb P': PUT_COMP,
+};
+
 const sec = (t: string) => { const [h, m, s] = t.split(':').map(Number); return h * 3600 + m * 60 + (s || 0); };
 
 function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, conAzioni, scenario, coloreCandele }: {
@@ -211,6 +221,46 @@ function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, c
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [larghezza, setLarghezza] = useState(1200);
+  /** Mirino (26/11/2026): canvas sopra il grafico, ridisegnato solo lui a ogni movimento del mouse. */
+  const sopraRef = useRef<HTMLCanvasElement>(null);
+  const geoRef = useRef<{
+    W: number; H: number; TOP: number; BOT: number; plotW: number; lo: number; hi: number;
+    xUltima: number; passo: number; candele: Candela[]; profili: { m: Misura; zeroX: number }[];
+  } | null>(null);
+  const disegnaMirino = (pos: { x: number; y: number } | null) => {
+    const cv = sopraRef.current, g = geoRef.current;
+    if (!cv || !g) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== g.W * dpr || cv.height !== g.H * dpr) {
+      cv.width = g.W * dpr; cv.height = g.H * dpr; cv.style.width = `${g.W}px`; cv.style.height = `${g.H}px`;
+    }
+    const ctx = cv.getContext('2d')!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, g.W, g.H);
+    if (!pos || pos.y < g.TOP || pos.y > g.H - g.BOT || pos.x > g.plotW) return;
+    // Linee fin dentro le scale: a destra quella dei prezzi, sotto la fascia degli orari.
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = 'rgba(148,163,184,0.75)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pos.x, g.TOP); ctx.lineTo(pos.x, g.H); ctx.moveTo(0, pos.y); ctx.lineTo(g.W, pos.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = 'bold 10px ui-monospace, monospace'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    const etichetta = (testo: string, cx: number, cy: number, colore = '#f8fafc') => {
+      const w = ctx.measureText(testo).width + 8;
+      ctx.fillStyle = '#1e293b'; ctx.fillRect(cx - w / 2, cy - 8, w, 16);
+      ctx.fillStyle = colore; ctx.fillText(testo, cx, cy);
+    };
+    const prezzo = g.hi - ((pos.y - g.TOP) / (g.H - g.TOP - g.BOT)) * (g.hi - g.lo);
+    etichetta(prezzo.toFixed(2), g.plotW + (g.W - g.plotW) / 2, pos.y);
+    // Orario della candela sotto il puntatore.
+    const i = g.candele.length - 1 - Math.round((g.xUltima - pos.x) / g.passo);
+    if (i >= 0 && i < g.candele.length) etichetta(g.candele[i].t.slice(0, 5), pos.x, g.H - g.BOT / 2);
+    // I profili allo strike piu' vicino: il loro valore sulla linea di zero di ciascuno.
+    let vicina: Calcolo | null = null;
+    for (const r of righe) if (!vicina || Math.abs(r.strike - prezzo) < Math.abs(vicina.strike - prezzo)) vicina = r;
+    if (vicina) for (const { m, zeroX } of g.profili) {
+      const v = valore(vicina, m);
+      etichetta(`${vicina.strike} ${fmt(v, Math.abs(v) < 10 ? 2 : 0)}`, zeroX, pos.y - 12, v > 0 ? '#86efac' : v < 0 ? '#fca5a5' : '#e2e8f0');
+    }
+  };
   useEffect(() => {
     const el = ref.current?.parentElement;
     if (!el) return;
@@ -298,7 +348,11 @@ function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, c
         if (v === 0) return;
         const w = (Math.abs(v) / max) * mezza;
         // Profilo per prezzo (Azione MM): verde = il MM compra ES, rosso = vende, in qualunque pannello stia.
-        ctx.fillStyle = m === 'azione' ? (v > 0 ? '#22c55e' : '#ef4444') : v > 0 ? colPos : colNeg;
+        // IMB CALL / IMB PUT: i colori del lato (comprate a destra, vendute a sinistra).
+        ctx.fillStyle = m === 'azione' ? (v > 0 ? '#22c55e' : '#ef4444')
+          : m === 'imbCall' ? (v > 0 ? CALL_COMP : CALL_VEND)
+          : m === 'imbPut' ? (v > 0 ? PUT_COMP : PUT_VEND)
+          : v > 0 ? colPos : colNeg;
         const yy = y(r.strike) - altezzaBarra / 2;
         ctx.beginPath();
         ctx.roundRect(v > 0 ? zeroX : zeroX - w, yy, w, altezzaBarra, altezzaBarra / 2);
@@ -315,7 +369,7 @@ function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, c
       });
       // In alto: nome, didascalia, scala -max / 0 / +max.
       ctx.textAlign = 'center';
-      ctx.font = 'bold 12px ui-monospace, monospace'; ctx.fillStyle = colPos;
+      ctx.font = 'bold 12px ui-monospace, monospace'; ctx.fillStyle = m === 'imbCall' ? CALL_COMP : m === 'imbPut' ? PUT_COMP : colPos;
       ctx.fillText(NOMI[m], zeroX, 14, 2 * mezza);
       ctx.font = '11px ui-monospace, monospace'; ctx.fillStyle = '#cbd5e1';
       ctx.fillText(didascalia(m, scenario), zeroX, 29, 2 * mezza);
@@ -350,9 +404,24 @@ function Grafico({ dati, righe, sinistra, destra, terza, finestra, conCallPut, c
     ctx.fillStyle = '#fff'; ctx.fillRect(plotW + 2, y(dati.spot) - 8, DESTRA - 4, 16);
     ctx.fillStyle = '#000'; ctx.textAlign = 'left'; ctx.font = 'bold 11px ui-monospace, monospace';
     ctx.fillText(dati.spot.toFixed(2), plotW + 6, y(dati.spot) + 4);
+
+    geoRef.current = {
+      W, H, TOP, BOT, plotW, lo, hi, xUltima, passo: xUltima / Math.max(finestra > 0 ? finestra : candele.length, 30), candele,
+      profili: [{ m: sinistra, zeroX: plotW * zeri[0] }, { m: destra, zeroX: plotW * zeri[1] },
+        ...(terza !== 'none' ? [{ m: terza, zeroX: plotW * zeri[2] }] : [])],
+    };
+    disegnaMirino(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dati, righe, sinistra, destra, terza, finestra, conCallPut, conAzioni, scenario, coloreCandele, larghezza]);
 
-  return <canvas ref={ref} className="block w-full rounded-lg border border-slate-800" />;
+  return (
+    <div className="relative">
+      <canvas ref={ref} className="block w-full rounded-lg border border-slate-800" />
+      <canvas ref={sopraRef} className="absolute left-0 top-0" style={{ cursor: 'crosshair' }}
+        onMouseMove={(e) => { const r = e.currentTarget.getBoundingClientRect(); disegnaMirino({ x: e.clientX - r.left, y: e.clientY - r.top }); }}
+        onMouseLeave={() => disegnaMirino(null)} />
+    </div>
+  );
 }
 
 function Scheda({ titolo, valore, sotto, colore }: { titolo: string; valore: string; sotto?: string; colore?: string }) {
@@ -519,11 +588,12 @@ export default function FlussoGreche() {
             coloreCandele={coloreCandele} />
 
           <details className="text-xs">
-            <summary className="cursor-pointer text-slate-400">Tabella per strike</summary>
+            <summary className="cursor-pointer text-slate-400">Tabella per strike
+              <span className="ml-3">call <span style={{ color: CALL_COMP }}>comprate</span> / <span style={{ color: CALL_VEND }}>vendute</span> · put <span style={{ color: PUT_COMP }}>comprate</span> / <span style={{ color: PUT_VEND }}>vendute</span></span></summary>
             <div className="overflow-x-auto mt-2">
               <table className="font-mono w-full">
                 <thead className="text-slate-400">
-                  <tr>{['Strike', 'Comp C', 'Vend C', 'Imb C', 'Comp P', 'Vend P', 'Imb P', 'Gamma Netto', 'Delta Netto', 'GEXP', 'Profile Netto', 'DEX Δ', '−Vanna $MM', 'Charm $MM/h', 'IV', 'Lato'].map((h) => <th key={h} className="px-2 py-1 text-right">{h}</th>)}</tr>
+                  <tr>{['Strike', 'Comp C', 'Vend C', 'Imb C', 'Comp P', 'Vend P', 'Imb P', 'Gamma Netto', 'Delta Netto', 'GEXP', 'Profile Netto', 'DEX Δ', '−Vanna $MM', 'Charm $MM/h', 'IV', 'Lato'].map((h) => <th key={h} className="px-2 py-1 text-right" style={{ color: COLORE_TESTATA[h] }}>{h}</th>)}</tr>
                 </thead>
                 <tbody>
                   {[...righe].reverse().map((c) => {
@@ -531,10 +601,10 @@ export default function FlussoGreche() {
                     return (
                       <tr key={c.strike} className={Math.abs(c.strike - dati.spot) < 2.5 ? 'bg-yellow-500/10' : ''}>
                         <td className="px-2 text-right">{c.strike}</td>
-                        <td className="px-2 text-right">{x.cb}</td><td className="px-2 text-right">{x.cs}</td>
-                        <td className="px-2 text-right" style={{ color: col(c.imbCall) }}>{fmt(c.imbCall)}</td>
-                        <td className="px-2 text-right">{x.pb}</td><td className="px-2 text-right">{x.ps}</td>
-                        <td className="px-2 text-right" style={{ color: col(c.imbPut) }}>{fmt(c.imbPut)}</td>
+                        <td className="px-2 text-right" style={{ color: CALL_COMP }}>{x.cb}</td><td className="px-2 text-right" style={{ color: CALL_VEND }}>{x.cs}</td>
+                        <td className="px-2 text-right" style={{ color: c.imbCall > 0 ? CALL_COMP : c.imbCall < 0 ? CALL_VEND : '#94a3b8' }}>{fmt(c.imbCall)}</td>
+                        <td className="px-2 text-right" style={{ color: PUT_COMP }}>{x.pb}</td><td className="px-2 text-right" style={{ color: PUT_VEND }}>{x.ps}</td>
+                        <td className="px-2 text-right" style={{ color: c.imbPut > 0 ? PUT_COMP : c.imbPut < 0 ? PUT_VEND : '#94a3b8' }}>{fmt(c.imbPut)}</td>
                         <td className="px-2 text-right" style={{ color: col(c.gammaNetto) }}>{fmt(c.gammaNetto, 1)}</td>
                         <td className="px-2 text-right" style={{ color: col(c.deltaNetto) }}>{fmt(c.deltaNetto, 1)}</td>
                         <td className="px-2 text-right" style={{ color: col(c.gexp) }}>{fmt(c.gexp, 1)}</td>
@@ -568,6 +638,49 @@ export default function FlussoGreche() {
               Solo barre ≥ 5% della più grande. Copertura teorica, non verificata su Bookmap.
             </p>
           )}
+
+          {/* Chi mostra ogni misura: la barra e' dal lato del cliente, BUY/SELL dal lato del market maker. */}
+          <div className="max-w-4xl text-[11px] text-slate-400">
+            <div className="mb-1 text-slate-300">
+              Le barre sono dal lato del <b>cliente</b> (Lee-Ready: chi compra all&apos;ask ha comprato, chi vende al bid ha venduto);
+              le etichette <b className="text-green-500">BUY</b>/<b className="text-red-500">SELL</b> sono il <b>market maker</b> su ES,
+              controparte con segno opposto.
+            </div>
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="text-slate-300">
+                  <th className="border border-slate-700 px-2 py-1 text-left">Misura</th>
+                  <th className="border border-slate-700 px-2 py-1 text-left">La barra mostra</th>
+                  <th className="border border-slate-700 px-2 py-1 text-left">BUY / SELL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  ['DEX', 'Delta netto dei clienti in $MM. Positivo = clienti long delta, quindi market maker short delta.',
+                    'Copertura già fatta dal market maker. BUY = ha già comprato ES per coprirsi; non è un ordine ancora da fare.'],
+                  ['Net GEX / GEXP', 'Flusso dei clienti × gamma, col segno dei vendor: + = call comprate o put vendute.',
+                    'Nessuna etichetta. Non è il GEX del market maker col suo segno, è la convenzione classica dei profili GEX.'],
+                  ['Gamma Netto', 'Gamma netta dei clienti. Positivo = clienti long gamma, quindi market maker short gamma.',
+                    'Cosa farebbe il market maker se il prezzo va verso quello strike. Sopra lo spot: BUY se è short gamma (insegue il prezzo che sale). Sotto lo spot: BUY se è long gamma (compra i ribassi). Sullo strike ATM entrambe, es. "BUY↑ SELL↓".'],
+                  ['Charm', 'Variazione del delta dei clienti nell\'ora che passa.',
+                    'Cosa fa il market maker nella prossima ora a prezzo fermo, solo perché passa il tempo.'],
+                  ['Azione MM', 'Contratti ES che il market maker compra o vende se SPX arriva a quel livello (gamma + charm + vanna nello scenario scelto).',
+                    'BUY/SELL del market maker a quel prezzo.'],
+                ].map(([misura, barra, etichetta]) => (
+                  <tr key={misura}>
+                    <td className="border border-slate-700 px-2 py-1 align-top font-semibold text-slate-300 whitespace-nowrap">{misura}</td>
+                    <td className="border border-slate-700 px-2 py-1 align-top">{barra}</td>
+                    <td className="border border-slate-700 px-2 py-1 align-top">{etichetta}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="mt-1 text-slate-500">
+              Solo da oggi: conta i trade da quando è partito il poller, le posizioni dei giorni prima (open interest) non ci sono.
+              &quot;Il market maker è sempre dall&apos;altra parte&quot; è un&apos;assunzione, non un dato. Su 11 sedute (27/10-12/11)
+              le coperture teoriche non si sono viste nel flusso aggressivo di ES su Bookmap: i BUY/SELL sono una stima, non un&apos;osservazione.
+            </div>
+          </div>
 
           <p className="text-[11px] text-slate-500 max-w-4xl">
             Comp/Vend = conti Lee-Ready del poller dei volumi (trade per trade, quote prima del trade), non la stima a rapporto

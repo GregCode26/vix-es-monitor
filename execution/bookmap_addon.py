@@ -64,13 +64,32 @@ acquisti (sull'ask). La soglia e' bassa apposta: la pagina filtra per
 dimensione, cosi' la si regola guardando il grafico senza ricostruire
 l'add-on.
 
-Gli stop non ci sono piu' (05/10/2026). Si cercavano come aggressori diversi
-nello stesso evento di matching (is_execution_start..is_execution_end), ma su
-Rithmic ogni evento ha un solo aggressore: in 126 mila eventi nessuno ne
-aveva due. Il ripiego -- raffiche di eventi nello stesso verso a pochi
-millisecondi l'uno dall'altro -- confrontato con Stops & Icebergs di Bookmap
-mescolava stop, riempimenti di iceberg e ordini grossi spezzati: quell'add-on
-vede il book ordine per ordine, dai soli trade non si separano.
+Dal 26/11/2026 l'add-on legge anche il book ordine per ordine (MBO: il feed
+Rithmic di ES lo da', ~58 eventi/s a meta' mattina) e il campione ha in piu':
+
+  - `canc`: [bid, ask], 10 numeri ciascuno come le `fasce`, i contratti
+    CANCELLATI davvero (o spostati ad altro prezzo) per gruppi di 5 livelli dal
+    migliore. Un calo di un ordine si classifica MBO_RITARDO_SEC dopo: se nel
+    frattempo un trade ha quell'ordine come passivo, quella parte e' eseguita,
+    il resto cancellato. Senza MBO la pagina stima i cancellati come tolti meno
+    eseguiti sull'intera finestra.
+  - `fug`: [bid, ask], contratti di ordini nei primi 5 livelli cancellati entro
+    FUGACE_SEC da quando erano stati messi.
+  - `ice`: [[prezzo, contratti nascosti, verso, "HH:MM:SS"], ...], iceberg: un
+    ordine passivo eseguito per piu' di quanto ne mostrava al massimo (si
+    ricarica con lo stesso codice). Verso +1 = compratore nascosto sul bid.
+  - `stop`: [[prezzo, contratti, verso, "HH:MM:SS", ordini], ...], raffiche di
+    almeno STOP_MIN_ORDINI ordini aggressori DIVERSI (codice dell'aggressore),
+    nello stesso verso, ciascuno entro STOP_PAUSA_SEC dal trade prima. Il
+    prezzo e' l'ultimo della raffica, verso +1 = stop in acquisto. Gli stop
+    erano stati tolti il 05/10/2026 perche' dai soli trade non si separavano
+    da iceberg e ordini spezzati: col codice dell'aggressore un ordine
+    spezzato conta una volta sola e gli iceberg stanno dal lato passivo. Resta
+    una stima in prova, da confrontare con Stops & Icebergs di Bookmap.
+  - nel `book` ogni livello ha un terzo numero, quanti ordini lo compongono:
+    un muro di un ordine solo o di cento piccoli.
+
+Senza MBO (feed che non lo da') questi campi mancano e tutto il resto va come prima.
 
 Attenzione nel modificare questo file: l'editor di Bookmap va in crash su
 un'intestazione di blocco (for/if/def...) spezzata su piu' righe.
@@ -83,6 +102,7 @@ coda (fino a un'ora) e partono quando torna su.
 
 import json
 import queue
+from collections import deque
 import threading
 import time
 import urllib.request
@@ -96,7 +116,7 @@ PREFISSO_ALIAS = "ES"
 LIVELLI_DEFAULT = 10
 MAX_IN_CODA = 3600
 LIVELLI_BOOK = 30
-MIN_CONTRATTI_BOOK = 20
+MIN_CONTRATTI_BOOK = 10  # 20 fino al 26/11/2026: la soglia di /bookmap ora parte da 10
 LIVELLI_BOOK_LONTANI = 120
 MIN_CONTRATTI_LONTANI = 50
 LIVELLI_FLUSSO = 5
@@ -112,6 +132,20 @@ ASS_MIN_CONTRATTI = 30
 ASS_MULTIPLO_CODA = 2.0
 # ...e il livello ancora li' dopo tanto dall'ultimo trade.
 ASS_TENUTA_SEC = 1.0
+# MBO: un calo di un ordine si classifica (eseguito o cancellato) dopo tanto,
+# perche' il trade che lo spiega puo' arrivare prima o dopo l'evento del book.
+MBO_RITARDO_SEC = 0.5
+# Ordine cancellato entro tanto da quando era stato messo: fugace.
+FUGACE_SEC = 1.0
+# Un ordine tolto si ricorda tanto: un iceberg puo' ricaricare con lo stesso codice.
+MORTI_SEC = 2.0
+# Eseguiti in attesa del calo dell'ordine che li spiega.
+RIEMPITI_SEC = 5.0
+# Stop: aggressori diversi nello stesso verso, ognuno entro tanto dal trade prima...
+STOP_PAUSA_SEC = 0.003
+# ...almeno tanti, e la raffica si chiude dopo tanto senza trade.
+STOP_MIN_ORDINI = 3
+STOP_CHIUSURA_SEC = 0.05
 
 libri = {}          # alias -> order book di Bookmap
 strumenti = {}      # alias -> {"pips", "granularita"}
@@ -123,11 +157,12 @@ foto_prima = {}     # alias -> ultima fotografia dei primi LIVELLI_OFI livelli, 
 statistiche = {}    # alias -> OFI per livello e medie del secondo in corso
 finestre_ass = {}   # alias -> {(compra, livello): finestra di volume aggressivo a quel prezzo}
 eventi = {}         # alias -> {"abs": [...]} del secondo in corso
+mbo = {}            # alias -> stato del book ordine per ordine (stato_mbo)
 # Tutti i dizionari per alias, da svuotare quando uno strumento si stacca. In
 # una costante e non nella riga del `for`: un'intestazione di blocco spezzata
 # su due righe manda in crash l'editor di Bookmap (NullPointerException in
 # PythonFoldParser, 05/10/2026), che non apre piu' il file.
-STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, finestre_ass, eventi)
+STATO_PER_ALIAS = (libri, strumenti, livelli, flusso, conta_da, ultimo_secondo, foto_prima, statistiche, finestre_ass, eventi, mbo)
 
 coda = queue.Queue()
 req_id = 0
@@ -150,11 +185,15 @@ def handle_subscribe_instrument(addon, alias, full_name, is_crypto, pips, size_g
     statistiche[alias] = statistiche_azzerate()
     finestre_ass[alias] = {}
     eventi[alias] = {"abs": []}
+    mbo[alias] = stato_mbo()
 
     req_id += 1
     bm.subscribe_to_depth(addon, alias, req_id)
     req_id += 1
     bm.subscribe_to_trades(addon, alias, req_id)
+    # Se il feed non da' l'MBO non arriva nessun evento e il campione resta quello di prima.
+    req_id += 1
+    bm.subscribe_to_mbo(addon, alias, req_id)
     bm.add_number_settings_parameter(addon, alias, "Livelli liquidita'", LIVELLI_DEFAULT, 1, 50, 1)
     print(f"Seguo {alias} (pips={pips}), invio a {URL}", flush=True)
 
@@ -342,12 +381,200 @@ def handle_trades(addon, alias, price, size, is_otc, is_bid, is_execution_start,
         registra_assorbimento(alias, livello_trade(alias, price), is_bid, contratti, time.time())
     except Exception as e:
         print(f"Assorbimenti: {e}", flush=True)
+    m = mbo.get(alias)
+    if m is not None and m["attivo"]:
+        try:
+            trade_mbo(alias, m, livello_trade(alias, price), contratti, is_bid, aggressor_order_id, passive_order_id, time.time())
+        except Exception as e:
+            print(f"MBO trade: {e}", flush=True)
 
 
+# ---------------------------------------------------------------- MBO
+
+def stato_mbo():
+    return {"attivo": False, "ordini": {}, "conta": ({}, {}), "sospesi": deque(), "morti": deque(),
+            "riempiti": {}, "raffica": None, **secondo_mbo_azzerato()}
 
 
-def livelli_book(lato, migliore, verso, info):
-    """[[prezzo, contratti], ...] dal migliore verso l'esterno; `verso` -1 per i bid, +1 per gli ask."""
+def secondo_mbo_azzerato():
+    return {"canc": [[0.0] * FASCE_FLUSSO, [0.0] * FASCE_FLUSSO], "fug": [0.0, 0.0], "ice": {}, "stop": []}
+
+
+def codice_valido(c):
+    return bool(c) and c not in ("null", "None", "0")
+
+
+def conta_ordine(m, is_bid, prezzo, d):
+    conta = m["conta"][0 if is_bid else 1]
+    n = conta.get(prezzo, 0) + d
+    if n > 0:
+        conta[prezzo] = n
+    else:
+        conta.pop(prezzo, None)
+
+
+def calo(alias, m, o, contratti, completo, adesso):
+    """Un ordine perde contratti: si mette da parte, e dopo MBO_RITARDO_SEC si vede se era eseguito o cancellato."""
+    if contratti <= 0 or adesso < conta_da[alias]:
+        return
+    migliori = bm.get_bbo(libri[alias])
+    migliore = migliori[0 if o["b"] else 1] if migliori else None
+    if migliore is None:
+        return
+    distanza = migliore[0] - o["p"] if o["b"] else o["p"] - migliore[0]
+    if distanza >= LIVELLI_FLUSSO * FASCE_FLUSSO:
+        return
+    banda = int(max(distanza, 0) // LIVELLI_FLUSSO)
+    fugace = completo and adesso - o["nato"] < FUGACE_SEC
+    m["sospesi"].append((adesso, o["id"], o["b"], banda, contratti, fugace))
+
+
+def handle_mbo_event(addon, alias, event_type, order_id, price, size):
+    m = mbo.get(alias)
+    if m is None:
+        return
+    try:
+        evento_mbo(alias, m, event_type, order_id, price, size / strumenti[alias]["granularita"], time.time())
+    except Exception as e:
+        print(f"MBO: {e}", flush=True)
+
+
+def evento_mbo(alias, m, tipo, codice, prezzo, q, adesso):
+    m["attivo"] = True
+    ordini = m["ordini"]
+    o = ordini.get(codice)
+    if tipo == "BID_NEW" or tipo == "ASK_NEW":
+        is_bid = tipo == "BID_NEW"
+        if o is not None and o["morto"] is None:
+            conta_ordine(m, o["b"], o["p"], -1)
+        if o is None or o["p"] != prezzo or o["b"] != is_bid:
+            # Ordine nuovo (o un codice riusato altrove): si riparte da zero.
+            o = {"id": codice, "b": is_bid, "p": prezzo, "q": q, "nato": adesso, "max": q, "ese": 0.0, "nasc": 0.0, "morto": None}
+            ordini[codice] = o
+        else:
+            # Stesso codice allo stesso prezzo: la ricarica di un iceberg. Eseguito e massimo restano.
+            o["q"] = q
+            o["max"] = max(o["max"], q)
+            o["morto"] = None
+        conta_ordine(m, is_bid, prezzo, 1)
+    elif tipo == "REPLACE":
+        if o is None or o["morto"] is not None:
+            return
+        if prezzo != o["p"]:
+            # Spostato: al prezzo di prima e' un ordine tolto, al nuovo uno messo adesso.
+            calo(alias, m, o, o["q"], True, adesso)
+            conta_ordine(m, o["b"], o["p"], -1)
+            conta_ordine(m, o["b"], prezzo, 1)
+            o.update({"p": prezzo, "q": q, "nato": adesso, "max": q, "ese": 0.0, "nasc": 0.0})
+        else:
+            if q < o["q"]:
+                calo(alias, m, o, o["q"] - q, False, adesso)
+            o["q"] = q
+            o["max"] = max(o["max"], q)
+    elif tipo == "CANCEL":
+        if o is None or o["morto"] is not None:
+            return
+        calo(alias, m, o, o["q"], True, adesso)
+        conta_ordine(m, o["b"], o["p"], -1)
+        o["q"] = 0.0
+        o["morto"] = adesso
+        m["morti"].append((adesso, codice))
+
+
+def trade_mbo(alias, m, livello, contratti, compra, aggressore, passivo, adesso):
+    """Eseguiti per ordine (cancellati vs eseguiti, iceberg) e raffiche di aggressori (stop)."""
+    if codice_valido(passivo):
+        r = m["riempiti"].get(passivo)
+        if r is None:
+            m["riempiti"][passivo] = [contratti, adesso]
+        else:
+            r[0] += contratti
+            r[1] = adesso
+        o = m["ordini"].get(passivo)
+        if o is not None:
+            o["ese"] += contratti
+            oltre = o["ese"] - o["max"] - o["nasc"]
+            if oltre > 0:
+                o["nasc"] += oltre
+                chiave = (o["b"], o["p"])
+                m["ice"][chiave] = m["ice"].get(chiave, 0.0) + oltre
+
+    verso = 1 if compra else -1
+    raffica = m["raffica"]
+    if raffica is not None and (raffica["verso"] != verso or adesso - raffica["ultimo"] > STOP_PAUSA_SEC):
+        chiudi_raffica(alias, m)
+        raffica = None
+    if raffica is None:
+        if not codice_valido(aggressore):
+            return
+        raffica = {"verso": verso, "codici": set(), "ct": 0.0, "inizio": adesso, "ultimo": adesso, "p": livello}
+        m["raffica"] = raffica
+    if codice_valido(aggressore):
+        raffica["codici"].add(aggressore)
+    raffica["ct"] += contratti
+    raffica["ultimo"] = adesso
+    raffica["p"] = livello
+
+
+def chiudi_raffica(alias, m):
+    raffica = m["raffica"]
+    m["raffica"] = None
+    if raffica is None or len(raffica["codici"]) < STOP_MIN_ORDINI or raffica["inizio"] < conta_da[alias]:
+        return
+    m["stop"].append([round(raffica["p"] * strumenti[alias]["pips"], 2), round(raffica["ct"]), raffica["verso"],
+                      orario(raffica["inizio"]), len(raffica["codici"])])
+
+
+def manutenzione_mbo(alias, m, adesso):
+    """Ogni 0,1 s: classifica i cali maturi, chiude le raffiche finite, dimentica il vecchio."""
+    sospesi = m["sospesi"]
+    riempiti = m["riempiti"]
+    while sospesi and adesso - sospesi[0][0] >= MBO_RITARDO_SEC:
+        _, codice, is_bid, banda, contratti, fugace = sospesi.popleft()
+        r = riempiti.get(codice)
+        eseguito = min(contratti, r[0]) if r is not None else 0.0
+        if r is not None:
+            r[0] -= eseguito
+        cancellato = contratti - eseguito
+        if cancellato > 1e-9:
+            lato = 0 if is_bid else 1
+            m["canc"][lato][banda] += cancellato
+            if fugace and banda == 0:
+                m["fug"][lato] += cancellato
+    vecchi = [c for c, r in riempiti.items() if adesso - r[1] > RIEMPITI_SEC]
+    for codice in vecchi:
+        riempiti.pop(codice, None)
+    morti = m["morti"]
+    while morti and adesso - morti[0][0] > MORTI_SEC:
+        t, codice = morti.popleft()
+        o = m["ordini"].get(codice)
+        if o is not None and o["morto"] == t:
+            m["ordini"].pop(codice, None)
+    if m["raffica"] is not None and adesso - m["raffica"]["ultimo"] > STOP_CHIUSURA_SEC:
+        chiudi_raffica(alias, m)
+
+
+def campi_mbo(alias, m, secondo):
+    """I campi MBO del campione; vuoto se il feed non da' l'MBO."""
+    if not m["attivo"]:
+        return {}
+    pips = strumenti[alias]["pips"]
+    t = orario(secondo)
+    ice = [[round(p * pips, 2), round(ct), 1 if is_bid else -1, t] for (is_bid, p), ct in m["ice"].items() if ct >= 0.5]
+    out = {
+        "canc": [[round(v) for v in riga] for riga in m["canc"]],
+        "fug": [round(v) for v in m["fug"]],
+        "ice": ice,
+        "stop": m["stop"],
+    }
+    m.update(secondo_mbo_azzerato())
+    return out
+
+
+def livelli_book(lato, migliore, verso, info, conta):
+    """[[prezzo, contratti], ...] dal migliore verso l'esterno; `verso` -1 per i bid, +1 per gli ask.
+
+    Con l'MBO (`conta` = ordini per prezzo) ogni livello ha un terzo numero: quanti ordini."""
     if migliore is None:
         return []
     righe = []
@@ -358,7 +585,10 @@ def livelli_book(lato, migliore, verso, info):
             continue
         contratti = size / info["granularita"]
         if contratti >= (MIN_CONTRATTI_BOOK if i < LIVELLI_BOOK else MIN_CONTRATTI_LONTANI):
-            righe.append([round(livello * info["pips"], 2), round(contratti)])
+            riga = [round(livello * info["pips"], 2), round(contratti)]
+            if conta is not None:
+                riga.append(conta.get(livello, 0))
+            righe.append(riga)
     return righe
 
 
@@ -373,6 +603,12 @@ def on_interval(addon, alias):
         valuta_assorbimenti(alias, time.time())
     except Exception as e:
         print(f"Assorbimenti: {e}", flush=True)
+    m = mbo[alias]
+    try:
+        manutenzione_mbo(alias, m, time.time())
+    except Exception as e:
+        print(f"MBO: {e}", flush=True)
+    conte = m["conta"] if m["attivo"] else (None, None)
     adesso = int(time.time())
     if adesso == ultimo_secondo[alias]:
         return
@@ -399,8 +635,8 @@ def on_interval(addon, alias):
         "askLiq": round(liq_ask / info["granularita"], 2),
         "levels": livelli[alias],
         "book": {
-            "b": livelli_book(libro["bids"], migliori_bid[0] if migliori_bid else None, -1, info),
-            "a": livelli_book(libro["asks"], migliori_ask[0] if migliori_ask else None, 1, info),
+            "b": livelli_book(libro["bids"], migliori_bid[0] if migliori_bid else None, -1, info, conte[0]),
+            "a": livelli_book(libro["asks"], migliori_ask[0] if migliori_ask else None, 1, info, conte[1]),
         },
         "addB": round(f["fasce"][0][0]),
         "remB": round(f["fasce"][1][0]),
@@ -409,6 +645,7 @@ def on_interval(addon, alias):
         "fasce": [[round(v) for v in riga] for riga in f["fasce"]],
         **riassunto_statistiche(statistiche[alias]),
         "abs": eventi[alias]["abs"],
+        **campi_mbo(alias, m, adesso),
     }
     flusso[alias] = azzerato()
     statistiche[alias] = statistiche_azzerate()
@@ -458,6 +695,7 @@ if __name__ == "__main__":
     addon = bm.create_addon()
     bm.add_depth_handler(addon, handle_depth_info)
     bm.add_trades_handler(addon, handle_trades)
+    bm.add_mbo_handler(addon, handle_mbo_event)
     bm.add_on_interval_handler(addon, on_interval)
     bm.add_on_setting_change_handler(addon, on_settings_change)
     bm.start_addon(addon, handle_subscribe_instrument, handle_unsubscribe_instrument)

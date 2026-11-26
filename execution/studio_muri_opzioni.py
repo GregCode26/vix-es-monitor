@@ -205,7 +205,7 @@ def eventi_muri(G):
         mid, book, _ = G.sec[t]
         presenti = {}
         for lato in ('b', 'a'):
-            for p, q in book.get(lato, []):
+            for p, q, *_ in book.get(lato, []):
                 presenti[(lato, p)] = q
         # chiusura degli attivi
         for key, ev in list(attivi.items()):
@@ -331,7 +331,7 @@ def main():
             liq = 0
             mid = mids[-1]
             for lato in ('b', 'a'):
-                for p, q in secs[-1][1].get(lato, []):
+                for p, q, *_ in secs[-1][1].get(lato, []):
                     if q >= SOGLIA and abs(p - mid) <= 10:
                         liq += q
             zg = b[3]

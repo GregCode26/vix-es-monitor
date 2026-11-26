@@ -61,7 +61,10 @@ function CurvaVol({ ticker }: { ticker: string }) {
             animation: false,
             legend: { top: 4, textStyle: { color: '#cbd5e1', fontSize: 11 } },
             tooltip: {
+                // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+                showContent: false,
                 trigger: 'axis',
+                axisPointer: { type: 'cross', label: { backgroundColor: '#1e293b' } },
                 formatter: (p: { seriesName: string; data: [number, number, string] }[]) =>
                     `<b>Strike ${p[0]?.data?.[0]}</b> (${(((p[0]?.data?.[0] ?? 0) / dati.spot - 1) * 100).toFixed(1)}% dallo spot)<br/>` +
                     p.map((x) => `${x.seriesName}: <b>${x.data[1].toFixed(1)}%</b> <span style="color:#94a3b8">${x.data[2]}</span>`).join('<br/>'),

@@ -216,6 +216,8 @@ export default function SpxScannerPage() {
             backgroundColor: '#0b0f17',
             legend: { data: ['CALL', 'PUT', 'ATM', ...(grigie.length ? [nomeGrigie] : [])], textStyle: { color: '#ccc' }, top: 8 },
             tooltip: {
+                // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+                showContent: false,
                 formatter: (x: any) => {
                     const g = x.data?.g;
                     if (g) {

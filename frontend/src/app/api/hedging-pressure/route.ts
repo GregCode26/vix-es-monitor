@@ -562,10 +562,26 @@ export async function GET(request: Request) {
             storia = pressioneDi(campioni.filter((snap) => inizioRecenti == null || snap.time < inizioRecenti));
         }
 
+        /**
+         * SPX di ogni snapshot ([ora, prezzo]), per le candele a 10 s della vista Profilo (26/11/2026):
+         * la serie `spot` e' a 30 s. Con `storia=1` gli ultimi PREZZI_STORIA_MIN minuti, poi gli
+         * ultimi 2: la pagina li accumula.
+         */
+        const PREZZI_STORIA_MIN = 35;
+        const finoA = latestSnapshotTime ? toSeconds(latestSnapshotTime) : 0;
+        const daSec = finoA - (conStoria ? PREZZI_STORIA_MIN : 2) * 60;
+        const prezzi: [string, number][] = [];
+        for (const snap of local) {
+            const p = snap.undPrice ?? snap.spxPrice ?? null;
+            if (!p || !Number.isFinite(p) || !snap.time || toSeconds(snap.time) < daSec) continue;
+            prezzi.push([snap.time, p]);
+        }
+
         return NextResponse.json(
             {
                 date: targetDate,
                 time: latestSnapshotTime,
+                prezzi,
                 spot: latestSpot,
                 atmStrike: latestIV?.atmStrike ?? null,
                 atmIv: Math.round(atmIv * 10000) / 100, // as percentage

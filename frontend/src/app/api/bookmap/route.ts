@@ -56,21 +56,35 @@ interface Campione {
     qm?: number | null;
     sp1?: number | null;
     abs?: unknown;
+    canc?: unknown;
+    fug?: unknown;
+    ice?: unknown;
+    stop?: unknown;
 }
 
 /**
  * Un assorbimento rilevato dall'add-on: [prezzo, contratti, verso, 'HH:MM:SS'].
  * Verso +1 = compratori passivi che assorbono le vendite, -1 il contrario.
- * Gli stop non ci sono piu' (05/10/2026): dai soli trade non si separano da
- * iceberg e ordini spezzati. Le righe salvate prima li hanno ancora nel file,
- * e qui si ignorano.
+ * Gli stop di prima del 05/10/2026 (solo dai trade, inaffidabili) stanno
+ * ancora in `stop` nelle righe vecchie con 4 elementi, e si ignorano: quelli
+ * dall'MBO (dal 26/11/2026) ne hanno 5.
  */
 export type Evento = [number, number, number, string];
 
-/** Ordini limit per livello: [prezzo, contratti], solo i livelli sopra la soglia dell'add-on. */
+/**
+ * Uno stop (dal 26/11/2026, dall'MBO): [prezzo, contratti, verso, 'HH:MM:SS', ordini].
+ * Raffica di ordini aggressori diversi nello stesso verso, a pochi ms l'uno
+ * dall'altro; verso +1 = stop in acquisto. Stima in prova.
+ */
+export type Stop = [number, number, number, string, number];
+
+/**
+ * Ordini limit per livello: [prezzo, contratti], solo i livelli sopra la soglia
+ * dell'add-on; dal 26/11/2026 (MBO) [prezzo, contratti, ordini].
+ */
 export interface Book {
-    b: [number, number][];
-    a: [number, number][];
+    b: number[][];
+    a: number[][];
 }
 
 export interface BookmapPoint {
@@ -120,6 +134,17 @@ export interface BookmapPoint {
     sp1: number | null;
     /** Assorbimenti rilevati in quel secondo; null prima dell'add-on che li cerca. */
     abs: Evento[] | null;
+    /**
+     * Dal book ordine per ordine (MBO, dal 26/11/2026), null prima o se il feed non lo da':
+     * `canc` [bid, ask] = contratti cancellati davvero per fasce di 5 livelli (10 numeri,
+     * come `fasce`), `fug` [bid, ask] = cancellati entro 1 s da quando erano stati messi,
+     * primi 5 livelli; `ice` iceberg [prezzo, contratti nascosti eseguiti, verso, ora],
+     * verso +1 = compratore nascosto; `stop` vedi Stop.
+     */
+    canc: number[][] | null;
+    fug: number[] | null;
+    ice: Evento[] | null;
+    stop: Stop[] | null;
 }
 
 interface Giornata {
@@ -140,6 +165,8 @@ function assorbimentiPrima(g: Giornata) {
         bid: p.bid,
         ask: p.ask,
         abs: p.abs && p.abs.length > 0 ? p.abs : null,
+        ice: p.ice && p.ice.length > 0 ? p.ice : null,
+        stop: p.stop && p.stop.length > 0 ? p.stop : null,
     }));
 }
 
@@ -201,6 +228,10 @@ function aggiungi(g: Giornata, c: Campione): BookmapPoint | null {
         qm: numeroONull(c.qm),
         sp1: numeroONull(c.sp1),
         abs: eventi(c.abs),
+        canc: righeNumeri(c.canc, 2, 10),
+        fug: Array.isArray(c.fug) && c.fug.length === 2 && c.fug.every((n) => typeof n === 'number' && Number.isFinite(n)) ? c.fug : null,
+        ice: eventi(c.ice),
+        stop: stopValidi(c.stop),
     };
 
     g.points.push(p);
@@ -223,9 +254,29 @@ function eventi(v: unknown): Evento[] | null {
 }
 
 function fasceValide(v: unknown): number[][] | null {
-    if (!Array.isArray(v) || v.length !== 4) return null;
-    const ok = v.every((r) => Array.isArray(r) && r.length === 10 && r.every((n) => typeof n === 'number' && Number.isFinite(n)));
+    return righeNumeri(v, 4, 10);
+}
+
+/** `righe` righe di `colonne` numeri finiti, altrimenti null. */
+function righeNumeri(v: unknown, righe: number, colonne: number): number[][] | null {
+    if (!Array.isArray(v) || v.length !== righe) return null;
+    const ok = v.every((r) => Array.isArray(r) && r.length === colonne && r.every((n) => typeof n === 'number' && Number.isFinite(n)));
     return ok ? (v as number[][]) : null;
+}
+
+function stopValidi(v: unknown): Stop[] | null {
+    if (!Array.isArray(v)) return null;
+    return v.filter(
+        (e): e is Stop =>
+            Array.isArray(e) &&
+            e.length === 5 &&
+            typeof e[0] === 'number' &&
+            typeof e[1] === 'number' &&
+            typeof e[2] === 'number' &&
+            typeof e[3] === 'string' &&
+            /^\d{2}:\d{2}:\d{2}$/.test(e[3]) &&
+            typeof e[4] === 'number',
+    );
 }
 
 function numeroONull(v: unknown): number | null {

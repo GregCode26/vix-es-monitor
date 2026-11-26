@@ -401,7 +401,7 @@ export default function IVMonitorPage() {
       {/* HEADER */}
       <header className={styles.header}>
         <div className={styles.headerTitle}>
-          <h1>ES 0DTE ATM IMPLIED VOLATILITY</h1>
+          <h1>IV MONITOR · SPX 0DTE</h1>
           <p className={styles.subtitle}>Real-Time Put vs Call IV Change</p>
         </div>
         <div className={styles.headerStatus}>
@@ -522,7 +522,8 @@ export default function IVMonitorPage() {
                     position: 'top',
                     labels: {
                       padding: 15,
-                      font: { size: 12, weight: 600 },
+                      font: { size: 11, weight: 600 },
+                      color: '#94a3b8',
                       usePointStyle: true,
                     },
                   },
@@ -532,25 +533,25 @@ export default function IVMonitorPage() {
                   x: {
                     display: true,
                     grid: { display: false },
-                    ticks: { maxRotation: 0, font: { size: 10 } },
+                    ticks: { maxRotation: 0, font: { size: 10 }, color: '#64748b' },
                     min: scale.x?.min,
                     max: scale.x?.max,
                   },
                   y: {
                     display: true,
                     position: 'left',
-                    title: { display: true, text: 'IV Change %' },
-                    grid: { color: 'rgba(0,0,0,0.05)' },
-                    ticks: { font: { size: 10 } },
+                    title: { display: true, text: 'IV Change %', color: '#94a3b8' },
+                    grid: { color: 'rgba(51, 65, 85, 0.3)' },
+                    ticks: { font: { size: 10 }, color: '#94a3b8' },
                     min: scale['main.y']?.min,
                     max: scale['main.y']?.max,
                   },
                   yEs: {
                     display: true,
                     position: 'right',
-                    title: { display: true, text: 'ES', color: '#ca8a04' },
+                    title: { display: true, text: 'ES', color: '#eab308' },
                     grid: { display: false },
-                    ticks: { font: { size: 10 }, color: '#ca8a04' },
+                    ticks: { font: { size: 10 }, color: '#eab308' },
                     min: scale['main.yEs']?.min,
                     max: scale['main.yEs']?.max,
                   },
@@ -601,15 +602,15 @@ export default function IVMonitorPage() {
                   x: {
                     display: true,
                     grid: { display: false },
-                    ticks: { maxRotation: 0, font: { size: 9 } },
+                    ticks: { maxRotation: 0, font: { size: 9 }, color: '#64748b' },
                     min: scale.x?.min,
                     max: scale.x?.max,
                   },
                   y: {
                     display: true,
-                    title: { display: true, text: 'Differential %' },
-                    grid: { color: 'rgba(0,0,0,0.05)' },
-                    ticks: { font: { size: 9 } },
+                    title: { display: true, text: 'Differential %', color: '#94a3b8' },
+                    grid: { color: 'rgba(51, 65, 85, 0.3)' },
+                    ticks: { font: { size: 9 }, color: '#94a3b8' },
                     min: scale['diff.y']?.min,
                     max: scale['diff.y']?.max,
                   },

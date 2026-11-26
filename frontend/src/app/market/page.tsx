@@ -2933,7 +2933,7 @@ export default function MarketPage() {
     const sc = statusConfig[status];
 
     return (
-        <div className="h-[calc(100vh-var(--barra-h))] overflow-hidden bg-[#0c0d10] text-slate-300 px-4 md:px-8 pt-2 pb-3 font-sans">
+        <div className="min-h-[calc(100vh-var(--barra-h))] bg-[#0c0d10] text-slate-300 px-4 md:px-8 pt-2 pb-3 font-sans">
             <div className="w-full max-w-[1920px] mx-auto">
                 {/* Header (riordinato il 06/11/2026 su richiesta, tolti i riquadri VIX/ES):
                     il logo su due righe a sinistra, gli orologi Roma/New York a destra e,

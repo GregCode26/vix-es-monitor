@@ -248,7 +248,6 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
   }, [attiva]);
 
   const profiloBase = useMemo(() => profilo.map((r) => ({ strike: r.strike, gex: r[base] ?? 0 })), [profilo, base]);
-  const conti = useMemo(() => new Map(profilo.flatMap((r) => (r.lr ? [[r.strike, r.lr] as [number, ContiLr]] : []))), [profilo]);
 
   /**
    * La storia piu' la colonna di adesso: le fotografie si fissano ogni due
@@ -325,7 +324,6 @@ export default function GammaHeatmapLive({ attiva = true }: { attiva?: boolean }
           spx={spx}
           finestraMin={finestra}
           inizioLr={inizioLr}
-          conti={conti}
           coperture={coperture}
         />
       </div>

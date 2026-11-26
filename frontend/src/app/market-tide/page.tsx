@@ -405,8 +405,6 @@ export default function MarketTidePage() {
         datasets: [
           { label: 'Net Put Premium', data: [], yAxisID: 'yPremi', borderColor: ROSSO, borderWidth: 2.2, pointRadius: 0, tension: 0.2 },
           { label: 'Net Call Premium', data: [], yAxisID: 'yPremi', borderColor: VERDE, borderWidth: 2.2, pointRadius: 0, tension: 0.2 },
-          { label: 'Straddle up', data: [], yAxisID: 'ySpx', borderColor: 'rgba(203, 213, 225, 0.6)', borderWidth: 1.2, borderDash: [6, 4], pointRadius: 0 },
-          { label: 'Straddle down', data: [], yAxisID: 'ySpx', borderColor: 'rgba(203, 213, 225, 0.6)', borderWidth: 1.2, borderDash: [6, 4], pointRadius: 0 },
         ],
       },
       options: {
@@ -492,7 +490,10 @@ export default function MarketTidePage() {
         },
         // L'SPX sovrapposto al net volume (29/10/2026, prima stava sui premi):
         // scala propria a sinistra, sopra l'area.
-        { label: 'SPX', data: [], yAxisID: 'ySpx', borderColor: GIALLO, borderWidth: 1.4, pointRadius: 0, tension: 0.2 }],
+        { label: 'SPX', data: [], yAxisID: 'ySpx', borderColor: GIALLO, borderWidth: 1.4, pointRadius: 0, tension: 0.2 },
+        // Le linee dello straddle stanno qui, sulla scala dell'SPX (26/11/2026, prima erano sui premi).
+        { label: 'Straddle up', data: [], yAxisID: 'ySpx', borderColor: 'rgba(203, 213, 225, 0.7)', borderWidth: 1.2, borderDash: [6, 4], pointRadius: 0 },
+        { label: 'Straddle down', data: [], yAxisID: 'ySpx', borderColor: 'rgba(203, 213, 225, 0.7)', borderWidth: 1.2, borderDash: [6, 4], pointRadius: 0 }],
       },
       options: {
         animation: false,
@@ -534,6 +535,8 @@ export default function MarketTidePage() {
         plugins: {
           legend: { display: false },
           tooltip: {
+            // Niente riquadro dei valori sul puntatore.
+            enabled: false,
             callbacks: {
               title: (items) => `Strike ${items[0]?.parsed.y ?? ''}`,
               label: (item) => `${item.dataset.label}: ${compatto(item.parsed.x)} $M`,
@@ -708,8 +711,8 @@ export default function MarketTidePage() {
       const quota = (secondi(p.time) - secondi(oraStraddle())) / (secondi(chiusura()) - secondi(oraStraddle()));
       return breakeven.spot + (arrivo - breakeven.spot) * Math.min(1, quota);
     });
-    (cp.data.datasets[2] as ChartDataset<'line'>).data = livello('up');
-    (cp.data.datasets[3] as ChartDataset<'line'>).data = livello('down');
+    (cv.data.datasets[2] as ChartDataset<'line'>).data = livello('up');
+    (cv.data.datasets[3] as ChartDataset<'line'>).data = livello('down');
 
     const ySpx = cp.options.scales?.ySpx;
     if (ySpx && scalaPrezzi) {
@@ -799,14 +802,9 @@ export default function MarketTidePage() {
   return (
     <div className="min-h-screen bg-[#0c0d10] text-slate-300 p-3 md:p-5 font-sans">
       <div className="w-full max-w-[1600px] mx-auto">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-          <div>
-            <h1 className="text-2xl font-bold text-white">Market Tide</h1>
-            <p className="text-xs text-slate-500">SPX 0DTE · premio e volume netti trade per trade, vertical contati una volta · solo locale</p>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">
+        {/* Niente titolo (26/11/2026, su richiesta): il riquadro degli indicatori riempie lo schermo
+            sotto la barra in alto, e la guida si raggiunge scorrendo. */}
+        <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4 flex flex-col h-[calc(100vh-var(--barra-h)-24px)] md:h-[calc(100vh-var(--barra-h)-40px)] min-h-[560px]">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm font-semibold mb-2 tabular-nums">
             <span className="text-white">{corrente?.time.slice(0, 5) ?? '--:--'}</span>
             <span className="text-slate-400">SPX: <span className="text-white">{corrente?.spx?.toFixed(2) ?? '—'}</span> <span style={{ color: GIALLO }}>●</span></span>
@@ -861,7 +859,7 @@ export default function MarketTidePage() {
             <div className="w-[240px] md:w-[300px] shrink-0">Gamma per strike ($M)</div>
             <div>Net Premiums</div>
           </div>
-          <div className="flex h-[380px] md:h-[480px]">
+          <div className="flex flex-[3] min-h-0">
             <div className="relative w-[240px] md:w-[300px] shrink-0">
               <canvas ref={profiloRef} />
             </div>
@@ -883,7 +881,7 @@ export default function MarketTidePage() {
                 linea <span style={{ color: COL_DIVERGONO }}>gialla divergono</span>, <span style={{ color: COL_CONVERGONO }}>azzurra convergono</span>, <span className="text-slate-400">grigia parallele</span> (ultimi 5 min)</span>
             </div>
           </div>
-          <div className="flex h-[130px] md:h-[160px]">
+          <div className="flex flex-1 min-h-0">
             <div className="w-[240px] md:w-[300px] shrink-0" />
             <div className="relative flex-1 min-w-0">
               <canvas ref={diffRef} style={{ cursor: 'none' }} />
@@ -893,7 +891,7 @@ export default function MarketTidePage() {
             <div className="w-[240px] md:w-[300px] shrink-0" />
             <div>Net Volume</div>
           </div>
-          <div className="flex h-[150px] md:h-[180px]">
+          <div className="flex flex-1 min-h-0">
             <div className="w-[240px] md:w-[300px] shrink-0" />
             <div className="relative flex-1 min-w-0">
               <canvas ref={volumeRef} style={{ cursor: 'none' }} />
@@ -906,7 +904,8 @@ export default function MarketTidePage() {
             onClick={() => setGuidaAperta((v) => !v)}
             className="w-full flex items-center justify-between px-4 py-3 text-left text-sm font-bold text-white"
           >
-            Guida al Market Tide giornaliero
+            <span>Guida al Market Tide giornaliero
+              <span className="block text-xs font-normal text-slate-500">SPX 0DTE · premio e volume netti trade per trade, vertical contati una volta · solo locale</span></span>
             <span className="text-slate-500">{guidaAperta ? '−' : '+'}</span>
           </button>
           {guidaAperta && (

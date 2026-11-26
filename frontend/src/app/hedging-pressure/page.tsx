@@ -80,12 +80,52 @@ const GRANDI_TRADE_MS = 60_000;
 /** Pentagono regolare, punta in alto. */
 const PENTAGONO = 'path://M50 0 L97.6 34.5 L79.4 90.5 L20.6 90.5 L2.4 34.5 Z';
 
-const oraTrade = (ts: number) => new Date(ts * 1000).toLocaleTimeString('it-IT',
-    { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
 /** Quello che la legenda usa dell'istanza di echarts. */
 interface GraficoEcharts {
     dispatchAction: (a: { type: string; [k: string]: unknown }) => void;
+    convertFromPixel: (finder: { yAxisIndex: number }, valore: number) => number;
+    setOption: (opzione: Record<string, unknown>) => void;
+    getZr: () => { on: (evento: string, cb: (e: EventoZr) => void) => void; setCursorStyle: (stile: string) => void };
+}
+
+interface EventoZr {
+    offsetX: number;
+    offsetY: number;
+    wheelDelta: number;
+    event: Event;
+}
+
+/** Margine sinistro del grafico Profilo: la colonna degli strike, dove la rotella cambia scala. */
+const MARGINE_STRIKE = 60;
+/** Minimo di strike visibili zoomando con la rotella. */
+const MIN_STRIKE_VISIBILI = 4;
+/** Ogni quanti strike un'etichetta, con `ampiezza` strike visibili: tutti quando c'e' posto. */
+function passoEtichette(ampiezza: number): number {
+    return Math.max(1, Math.ceil(ampiezza / 24));
+}
+
+/**
+ * Asse degli strike fra `min` e `max` (in indici): tacche ed etichette sugli strike interi, non
+ * dove le metterebbe echarts partendo da un bordo frazionario (-0.5, 3.27...).
+ */
+function assiStrike(min: number, max: number) {
+    const passo = passoEtichette(max - min);
+    const valori: number[] = [];
+    for (let i = Math.ceil(Math.max(0, min) / passo) * passo; i <= max; i += passo) valori.push(i);
+    return { min, max, axisTick: { customValues: valori }, axisLabel: { customValues: valori } };
+}
+
+type DatoCandela = { value: number[]; itemStyle: Record<string, unknown> };
+
+/**
+ * Candele tagliate al bordo dell'asse: echarts nasconde quelle tutte fuori ma lascia sbordare
+ * sopra/sotto il grafico quelle a meta'.
+ */
+function candeleDentro(dati: DatoCandela[], min: number, max: number): DatoCandela[] {
+    const dentro = (v: number) => Math.max(min, Math.min(max, v));
+    return dati
+        .filter((d) => d.value[4] >= min && d.value[3] <= max)
+        .map((d) => ({ ...d, value: [d.value[0], ...d.value.slice(1).map(dentro)] }));
 }
 
 interface PressureHistoryPoint {
@@ -100,6 +140,42 @@ interface HedgingPressureResponseWithHistory extends HedgingPressureResponse {
     pressureHistory?: PressureHistoryPoint[];
     /** Il resto della sessione, uno snapshot al minuto: arriva solo con `?storia=1`. */
     storia?: PressureHistoryPoint[];
+    /** SPX di ogni snapshot ([ora, prezzo]), per le candele a 10 s del Profilo. */
+    prezzi?: [string, number][];
+}
+
+/** Candele SPX della vista Profilo (al posto delle linee Spot/ATM, 26/11/2026). */
+const CANDELA_SEC = 10;
+/** Quanti minuti di candele si vedono sull'asse del tempo in alto. */
+const CANDELE_MIN = 30;
+
+/** Ora 'HH:MM:SS' -> secondi del giorno. */
+function secDi(ora: string): number {
+    const [h, m, s] = ora.split(':').map(Number);
+    return (h || 0) * 3600 + (m || 0) * 60 + (s || 0);
+}
+
+/**
+ * Prezzo -> posizione sull'asse degli strike (che e' a categorie: lo strike i sta in i),
+ * interpolando fra strike vicini, cosi' la candela cade alla sua altezza anche fra due strike.
+ */
+/** Inverso di indiceStrike: posizione sull'asse -> prezzo. */
+function prezzoDaIndice(indice: number, strikes: number[]): number {
+    const n = strikes.length;
+    if (n === 0) return 0;
+    if (n === 1) return strikes[0];
+    const i = Math.max(0, Math.min(n - 2, Math.floor(indice)));
+    return strikes[i] + (indice - i) * (strikes[i + 1] - strikes[i]);
+}
+
+function indiceStrike(prezzo: number, strikes: number[]): number {
+    const n = strikes.length;
+    if (n === 0) return 0;
+    if (n === 1 || prezzo <= strikes[0]) return n === 1 ? 0 : (prezzo - strikes[0]) / (strikes[1] - strikes[0]);
+    if (prezzo >= strikes[n - 1]) return n - 1 + (prezzo - strikes[n - 1]) / (strikes[n - 1] - strikes[n - 2]);
+    let i = 0;
+    while (strikes[i + 1] < prezzo) i++;
+    return i + (prezzo - strikes[i]) / (strikes[i + 1] - strikes[i]);
 }
 
 /** 'HH:MM:SS' del giorno `data` -> millisecondi, per l'asse del tempo. */
@@ -137,6 +213,8 @@ export default function HedgingPressurePage() {
      * sovrappongono e lo stesso punto arriva piu' volte.
      */
     const [storico, setStorico] = useState<PressureHistoryPoint[]>([]);
+    /** SPX per ora dello snapshot, accumulato dai giri (la route manda solo gli ultimi minuti). */
+    const [prezzi, setPrezzi] = useState<Map<string, number>>(new Map());
     /** La storia della sessione si chiede una volta: finche' non arriva, e di nuovo a ogni giorno nuovo. */
     const serveStoria = useRef(true);
     /**
@@ -152,6 +230,83 @@ export default function HedgingPressurePage() {
     const [lineeSpente, setLineeSpente] = useState<Record<string, boolean>>({});
     /** Il grafico, per comandarlo dalla legenda: e' fuori dal canvas perche' un canvas ridisegnato per lampeggiare costerebbe tutte le linee. */
     const graficoRef = useRef<GraficoEcharts | null>(null);
+    /**
+     * Scala degli strike del Profilo: rotella sulla colonna degli strike = allarga/stringe attorno
+     * al puntatore, trascinare col mouse = sposta su/giu', doppio clic = tutti gli strike.
+     * `da`/`a` sono i bordi dell'asse in prezzi (non indici, cosi' regge il ricentrare della catena).
+     * Sta in un ref e si applica con setOption sui soli assi: con uno stato React ogni scatto di
+     * rotella o pixel di trascinamento ricostruiva tutte le serie, e il grafico andava a scatti.
+     */
+    const zoomStrikeRef = useRef<{ da: number; a: number } | null>(null);
+    const strikesRef = useRef<number[]>([]);
+    strikesRef.current = data?.strikes ?? [];
+    const viewModeRef = useRef(viewMode);
+    viewModeRef.current = viewMode;
+    /** Le candele del Profilo non tagliate, per ritagliarle a ogni zoom senza ricostruire il grafico. */
+    const candeleRef = useRef<DatoCandela[]>([]);
+    const collegaZoomStrike = useCallback((c: GraficoEcharts) => {
+        const zr = c.getZr();
+        /** Bordi attuali dell'asse in indici (tutti gli strike = -0.5 .. n-0.5). */
+        const bordi = (strikes: number[]): [number, number] => {
+            const z = zoomStrikeRef.current;
+            const n = strikes.length;
+            return z ? [indiceStrike(z.da, strikes), indiceStrike(z.a, strikes)] : [-0.5, n - 0.5];
+        };
+        let inAttesa = false;
+        /** Nuovi bordi in indici: limitati alla catena, applicati al prossimo frame. */
+        const applica = (da: number, ampiezza: number) => {
+            const strikes = strikesRef.current;
+            const n = strikes.length;
+            if (ampiezza >= n - 1e-6) zoomStrikeRef.current = null;
+            else {
+                const lo = Math.max(-0.5, Math.min(n - 0.5 - ampiezza, da));
+                zoomStrikeRef.current = { da: prezzoDaIndice(lo, strikes), a: prezzoDaIndice(lo + ampiezza, strikes) };
+            }
+            if (inAttesa) return;
+            inAttesa = true;
+            requestAnimationFrame(() => {
+                inAttesa = false;
+                if (viewModeRef.current !== 'profile') return;
+                const [min, max] = bordi(strikesRef.current);
+                c.setOption({
+                    yAxis: [assiStrike(min, max)],
+                    series: [{ id: 'candele', data: candeleDentro(candeleRef.current, min, max) }],
+                });
+            });
+        };
+        zr.on('mousewheel', (e) => {
+            if (viewModeRef.current !== 'profile' || e.offsetX > MARGINE_STRIKE) return;
+            const strikes = strikesRef.current;
+            if (strikes.length < 2) return;
+            e.event.preventDefault();
+            const [lo, hi] = bordi(strikes);
+            const m = Math.max(lo, Math.min(hi, c.convertFromPixel({ yAxisIndex: 0 }, e.offsetY)));
+            const f = e.wheelDelta > 0 ? 0.85 : 1 / 0.85;
+            const ampiezza = Math.max(MIN_STRIKE_VISIBILI, (hi - lo) * f);
+            // Lo strike sotto il puntatore resta sotto il puntatore.
+            applica(m - (m - lo) * (ampiezza / (hi - lo)), ampiezza);
+        });
+        // Trascinando col mouse (tasto sinistro, ovunque sul grafico) si sposta tutto in su/giu'.
+        let trascina: { y0: number; lo: number; ampiezza: number; perPixel: number } | null = null;
+        zr.on('mousedown', (e) => {
+            if (viewModeRef.current !== 'profile' || !zoomStrikeRef.current) return; // tutto visibile: niente da spostare
+            const [lo, hi] = bordi(strikesRef.current);
+            const perPixel = (c.convertFromPixel({ yAxisIndex: 0 }, e.offsetY + 100) - c.convertFromPixel({ yAxisIndex: 0 }, e.offsetY)) / 100;
+            trascina = { y0: e.offsetY, lo, ampiezza: hi - lo, perPixel };
+        });
+        zr.on('mousemove', (e) => {
+            if (!trascina) return;
+            zr.setCursorStyle('grabbing');
+            // Il contenuto segue il mouse: trascinare in giu' mostra gli strike piu' alti.
+            applica(trascina.lo - (e.offsetY - trascina.y0) * trascina.perPixel, trascina.ampiezza);
+        });
+        const fine = () => { trascina = null; };
+        zr.on('mouseup', fine);
+        zr.on('globalout', fine);
+        zr.on('dblclick', () => {
+            if (viewModeRef.current === 'profile' && zoomStrikeRef.current) applica(0, Infinity);
+        });
+    }, []);
     // La linea della serie temporale sotto il puntatore: il suo strike si evidenzia in legenda.
     const [lineaSotto, setLineaSotto] = useState<string | null>(null);
 
@@ -172,6 +327,7 @@ export default function HedgingPressurePage() {
                 serveStoria.current = true;
                 zoomSerie.current = null;
                 setStorico([]);
+                setPrezzi(new Map());
                 setData(null);
                 setError(null);
                 return;
@@ -180,6 +336,16 @@ export default function HedgingPressurePage() {
 
             setData(json);
             if (conStoria) serveStoria.current = false;
+            if (json.prezzi && json.prezzi.length > 0) {
+                setPrezzi((prec) => {
+                    const m = new Map(prec);
+                    for (const [t, p] of json.prezzi!) m.set(t, p);
+                    // Solo quanto serve alle candele visibili, con margine.
+                    const ultimo = Math.max(...[...m.keys()].map(secDi));
+                    for (const t of m.keys()) if (secDi(t) < ultimo - (CANDELE_MIN + 10) * 60) m.delete(t);
+                    return m;
+                });
+            }
             setStorico((prec) => {
                 const visti = new Set(prec.map((p) => `${p.time}|${p.strike}`));
                 const arrivati = [...(json.storia ?? []), ...(json.pressureHistory ?? [])];
@@ -476,51 +642,119 @@ export default function HedgingPressurePage() {
     // mappa. Ora e' il gamma dei market maker su tutta la catena nel tempo,
     // sul modello di SpotGamma (GammaHeatmapLive).
 
+    /**
+     * Candele SPX a CANDELA_SEC dagli snapshot del poller volumi (uno ogni ~10 s, quindi di solito
+     * un prezzo per candela: l'apertura e' la chiusura della candela prima, cosi' il corpo mostra
+     * il movimento). Conferma dal profilo: la pressione netta (somma dei top strike) dell'ultimo
+     * snapshot non oltre la fine della candela ha lo stesso segno della candela -> piena,
+     * altrimenti vuota. Candela piatta = mai confermata.
+     */
+    const candele = useMemo(() => {
+        if (!data || prezzi.size === 0) return [];
+        const netta = new Map<string, number>();
+        for (const p of storico) netta.set(p.time, (netta.get(p.time) ?? 0) + p.totalPressure);
+        const tempiNetta = [...netta.keys()].sort();
+        const nettaA = (sec: number): number | null => {
+            let lo = 0, hi = tempiNetta.length - 1, trovato = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (secDi(tempiNetta[mid]) <= sec) { trovato = mid; lo = mid + 1; } else hi = mid - 1;
+            }
+            return trovato < 0 ? null : netta.get(tempiNetta[trovato])!;
+        };
+        const punti = [...prezzi.entries()].map(([t, p]) => [secDi(t), p] as const).sort((a, b) => a[0] - b[0]);
+        const out: { inizio: number; o: number; c: number; l: number; h: number; conferma: boolean; netta: number | null }[] = [];
+        let corrente: (typeof out)[number] | null = null;
+        let chiusuraPrima: number | null = null;
+        for (const [sec, p] of punti) {
+            const inizio = Math.floor(sec / CANDELA_SEC) * CANDELA_SEC;
+            if (!corrente || corrente.inizio !== inizio) {
+                if (corrente) { out.push(corrente); chiusuraPrima = corrente.c; }
+                const o: number = chiusuraPrima ?? p;
+                corrente = { inizio, o, c: p, l: Math.min(o, p), h: Math.max(o, p), conferma: false, netta: null };
+            } else {
+                corrente.c = p; corrente.l = Math.min(corrente.l, p); corrente.h = Math.max(corrente.h, p);
+            }
+        }
+        if (corrente) out.push(corrente);
+        for (const k of out) {
+            k.netta = nettaA(k.inizio + CANDELA_SEC - 1);
+            const verso = Math.sign(k.c - k.o);
+            k.conferma = verso !== 0 && k.netta != null && Math.sign(k.netta) === verso;
+        }
+        return out;
+    }, [prezzi, storico, data]);
+
     // Opzione echarts per il grafico profile (barre)
     const option = useMemo(() => {
         if (!chartData || !scale || !data) return {};
 
-        const markLines: Record<string, unknown>[] = [];
-
-        // Trova lo strike più vicino allo spot per disegnare la linea
-        let closestStrike: string | null = null;
-        if (data.spot != null && chartData.profile.length > 0) {
-            let minDistance = Math.abs(chartData.profile[0].strike - data.spot);
-            closestStrike = chartData.profile[0].strike.toString();
-
-            for (let i = 1; i < chartData.profile.length; i++) {
-                const distance = Math.abs(chartData.profile[i].strike - data.spot);
-                if (distance < minDistance) {
-                    minDistance = distance;
-                    closestStrike = chartData.profile[i].strike.toString();
-                }
-            }
-
-            if (closestStrike) {
-                markLines.push({
-                    yAxis: closestStrike,
-                    lineStyle: { color: '#06b6d4', type: 'dotted', width: 2.5 },
-                    label: {
-                        formatter: `Spot ${data.spot.toFixed(2)}`,
-                        position: 'end',
-                        color: '#06b6d4',
-                    },
-                });
-            }
-        }
-
-        // ATM
-        if (data.atmStrike != null) {
-            markLines.push({
-                yAxis: data.atmStrike.toString(),
-                lineStyle: { color: '#8b5cf6', type: 'dashed', width: 1.5 },
-                label: {
-                    formatter: `ATM ${data.atmStrike}`,
-                    position: 'start',
-                    color: '#8b5cf6',
-                },
-            });
-        }
+        // Al posto delle linee Spot e ATM (26/11/2026): le candele SPX a 10 s, sull'asse del tempo
+        // in alto e alla loro altezza sull'asse degli strike (asse y nascosto in "indice di strike").
+        const VERDE = '#22c55e', ROSSO = '#ef4444', GRIGIO = '#94a3b8';
+        const ultimaCandela = candele[candele.length - 1];
+        const baseMs = inMs(data.date, '00:00:00');
+        // Asse degli strike continuo, in indici (lo strike i sta in i): zoom e spostamento fluidi,
+        // non a scatti di uno strike come con l'asse a categorie. Bordi dalla rotella/trascinamento.
+        const nStrike = data.strikes.length;
+        const zs = zoomStrikeRef.current;
+        const yMin = zs ? indiceStrike(zs.da, data.strikes) : -0.5;
+        const yMax = zs ? indiceStrike(zs.a, data.strikes) : nStrike - 0.5;
+        const etichettaStrike = (v: number) => {
+            const i = Math.round(v);
+            return Math.abs(v - i) < 1e-6 && i >= 0 && i < nStrike ? String(data.strikes[i]) : '';
+        };
+        // Barre orizzontali disegnate a mano: 'bar' su due assi numerici le farebbe verticali.
+        // Alte il 60% di uno strike, tagliate al bordo del grafico quando si zooma.
+        const serieBarre = {
+            type: 'custom',
+            encode: { x: 0, y: 1 },
+            clip: true,
+            renderItem: (params: any, api: any) => {
+                const x = api.value(0);
+                const i = api.value(1);
+                if (!x) return null;
+                const a = api.coord([0, i]);
+                const b = api.coord([x, i]);
+                const h = api.size([0, 1])[1] * 0.6;
+                const cs = params.coordSys;
+                const y0 = Math.max(a[1] - h / 2, cs.y);
+                const y1 = Math.min(a[1] + h / 2, cs.y + cs.height);
+                if (y1 <= y0) return null;
+                return {
+                    type: 'rect',
+                    shape: { x: Math.min(a[0], b[0]), y: y0, width: Math.abs(b[0] - a[0]), height: y1 - y0 },
+                    style: api.style(),
+                };
+            },
+        };
+        const indiceDi = new Map(data.strikes.map((s, i) => [String(s), i]));
+        const barre = (valori: number[]) => valori.map((x, j) => {
+            const strike = chartData.profile[j]?.strike;
+            return { value: [x, indiceDi.get(String(strike)) ?? j], strike };
+        });
+        const datiCandele: DatoCandela[] = candele.map((k) => {
+            const colore = k.c > k.o ? VERDE : k.c < k.o ? ROSSO : GRIGIO;
+            const riempi = k.conferma ? colore : 'rgba(0,0,0,0)';
+            return {
+                value: [baseMs + k.inizio * 1000, indiceStrike(k.o, data.strikes), indiceStrike(k.c, data.strikes),
+                    indiceStrike(k.l, data.strikes), indiceStrike(k.h, data.strikes)],
+                itemStyle: { color: riempi, color0: riempi, borderColor: colore, borderColor0: colore, borderWidth: 1 },
+            };
+        });
+        candeleRef.current = datiCandele;
+        const serieCandele = {
+            id: 'candele',
+            name: 'SPX 10s',
+            type: 'candlestick',
+            xAxisIndex: 1,
+            yAxisIndex: 0,
+            z: 10,
+            clip: true,
+            barMaxWidth: 8,
+            data: candeleDentro(datiCandele, yMin, yMax),
+            tooltip: { show: false },
+        };
 
         // Large trade: un pentagono per strike, lato e scadenza (mai sommate fra loro), CALL verde a
         // destra, PUT rosso a sinistra; pieno = 0DTE, solo bordo = scadenze successive (piu' all'interno).
@@ -550,7 +784,7 @@ export default function HedgingPressurePage() {
             data: [...gruppi.values()].filter((g) => g.right === right).map((g) => {
                 const colore = right === 'C' ? '#22c55e' : '#ef4444';
                 return {
-                    value: [(right === 'C' ? 1 : -1) * scale.xMax * (g.zero ? 0.9 : 0.75), g.k],
+                    value: [(right === 'C' ? 1 : -1) * scale.xMax * (g.zero ? 0.9 : 0.75), indiceDi.get(g.k)],
                     symbolSize: 12 + 22 * Math.sqrt(g.somma / maxSomma),
                     itemStyle: g.zero
                         ? { color: colore, borderColor: '#0c0d10', borderWidth: 1 }
@@ -568,39 +802,12 @@ export default function HedgingPressurePage() {
             backgroundColor: '#0c0d10',
             tooltip: {
                 trigger: 'axis',
+                // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+                showContent: false,
                 axisPointer: { type: 'cross' },
-                formatter: (params: any) => {
-                    if (!Array.isArray(params) || params.length === 0) return '';
-                    const grandi = params.filter((p: any) => p.data?.gruppo).map((p: any) => {
-                        const g: Gruppo = p.data.gruppo;
-                        const colore = g.right === 'C' ? '#22c55e' : '#ef4444';
-                        const righe = [...g.trade].sort((a, b) => a.ts - b.ts).map((t) =>
-                            `${oraTrade(t.ts)} · <b>${t.size.toLocaleString('it-IT')}</b> @ ${t.price ?? 'n.d.'}`).join('<br/>');
-                        return `<div style="margin-top:4px;color:${colore}"><b>⬟ ${g.right === 'C' ? 'CALL' : 'PUT'} ${g.k} ${g.scad}</b>` +
-                            ` · ${g.trade.length} trade ≥ ${MIN_GRANDE_TRADE}, ${g.somma.toLocaleString('it-IT')} contratti</div>` +
-                            `<div style="color:#cbd5e1">${righe}</div>`;
-                    }).join('');
-                    const param = params.find((p: any) => !p.data?.gruppo);
-                    if (!param) return `<div style="font-size:11px">${grandi}</div>`;
-                    const strike = param.value[1];
-                    const row = chartData.profile.find((r) => r.strike === strike);
-                    if (!row) return '';
-
-                    return `
-<div style="color: #e2e8f0; font-size: 11px;">
-  <div><strong>Strike:</strong> ${row.strike}</div>
-  <div><strong>Pressure:</strong> ${row.normalizedPressure}</div>
-  <div><strong>Gamma:</strong> ${row.gammaPressure.toFixed(2)}</div>
-  <div><strong>Vanna Proxy:</strong> ${row.vannaPressure ? row.vannaPressure.toFixed(2) : 'N/A'}</div>
-  <div><strong>GEX:</strong> ${row.gex.toFixed(2)}</div>
-  <div><strong>Proximity:</strong> ${(row.proximity * 100).toFixed(0)}%</div>
-  ${grandi}
-</div>
-`.trim();
-                },
             },
             legend: {
-                data: ['Bullish Pressure', 'Bearish Pressure', 'Large CALL trades', 'Large PUT trades'],
+                data: ['Bullish Pressure', 'Bearish Pressure', 'Large CALL trades', 'Large PUT trades', 'SPX 10s'],
                 textStyle: { color: '#94a3b8', fontSize: 10 },
                 top: 10,
                 right: 10,
@@ -612,12 +819,12 @@ export default function HedgingPressurePage() {
                 borderWidth: 1,
             },
             grid: {
-                left: 60,
+                left: MARGINE_STRIKE,
                 right: 40,
                 top: 50,
                 bottom: 40,
             },
-            xAxis: {
+            xAxis: [{
                 type: 'value',
                 min: -scale.xMax,
                 max: scale.xMax,
@@ -629,46 +836,52 @@ export default function HedgingPressurePage() {
                 splitLine: { lineStyle: { color: 'rgba(51, 65, 85, 0.2)' } },
                 axisLine: { lineStyle: { color: '#334155' } },
                 axisPointer: { type: 'line' },
-            },
-            yAxis: {
-                type: 'category',
-                data: data.strikes.map((s) => s.toString()),
+            }, {
+                type: 'time',
+                position: 'top',
+                // Asse simmetrico attorno all'ultima candela: cade al centro del profilo (x = 0),
+                // fra pressione ribassista e rialzista; la meta' destra resta vuota.
+                min: ultimaCandela ? baseMs + (ultimaCandela.inizio - CANDELE_MIN * 60) * 1000 : undefined,
+                max: ultimaCandela ? baseMs + (ultimaCandela.inizio + CANDELE_MIN * 60) * 1000 : undefined,
+                axisLabel: { color: '#64748b', fontSize: 9, formatter: (val: number) => hhmm(val) },
+                splitLine: { show: false },
+                axisLine: { lineStyle: { color: '#334155' } },
+                axisPointer: { show: false },
+            }],
+            yAxis: [{
+                type: 'value',
+                ...assiStrike(yMin, yMax),
+                axisLabel: { ...assiStrike(yMin, yMax).axisLabel, color: '#94a3b8', formatter: etichettaStrike },
+                axisPointer: { snap: true, label: { formatter: ({ value }: { value: number }) => etichettaStrike(Math.round(value)) } },
                 name: 'Strike',
                 nameLocation: 'center',
                 nameGap: 40,
                 nameTextStyle: { color: '#e2e8f0', fontSize: 12, fontWeight: 'bold' },
-                axisLabel: { color: '#94a3b8' },
                 splitLine: { lineStyle: { color: 'rgba(51, 65, 85, 0.2)' } },
                 axisLine: { lineStyle: { color: '#334155' } },
-            },
+            }],
             series: [
                 {
                     name: 'Bullish Pressure',
-                    type: 'bar',
-                    data: chartData.posData,
+                    ...serieBarre,
+                    data: barre(chartData.posData),
                     itemStyle: { color: '#3b82f6', opacity: 0.85 },
-                    barWidth: '60%',
-                    markLine: {
-                        symbol: 'none',
-                        data: markLines,
-                        lineStyle: { width: 2 },
-                    },
                 },
                 {
                     name: 'Bearish Pressure',
-                    type: 'bar',
-                    data: chartData.negData,
+                    ...serieBarre,
+                    data: barre(chartData.negData),
                     itemStyle: { color: '#ef4444', opacity: 0.85 },
-                    barWidth: '60%',
                 },
                 ...pentagoni,
+                serieCandele,
             ],
             graphic: fuoriAsse > 0 ? [{
                 type: 'text', left: 70, bottom: 8,
                 style: { text: `${fuoriAsse} large trade su strike fuori dal grafico`, fill: '#64748b', fontSize: 10 },
             }] : [],
         };
-    }, [chartData, scale, data, grandiTrade]);
+    }, [chartData, scale, data, grandiTrade, candele]);
 
     const pronto = data !== null && !loading;
 
@@ -824,7 +1037,7 @@ export default function HedgingPressurePage() {
                                 option={viewMode === 'profile' ? option : timeseriesOption}
                                 style={{ height: '100%', width: '100%' }}
                                 notMerge={true}
-                                onChartReady={(c: GraficoEcharts) => { graficoRef.current = c; }}
+                                onChartReady={(c: GraficoEcharts) => { graficoRef.current = c; collegaZoomStrike(c); }}
                                 onEvents={viewMode === 'timeseries' ? {
                                     datazoom: suZoomSerie,
                                     legendselectchanged: suLegendaSerie,

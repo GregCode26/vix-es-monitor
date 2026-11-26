@@ -76,6 +76,8 @@ function Grafico() {
             backgroundColor: '#020617',
             animation: false,
             tooltip: {
+                // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+                showContent: false,
                 trigger: 'axis', axisPointer: { type: 'cross' },
                 formatter: (p: { dataIndex: number }[]) => {
                     const b = barre[p[0]?.dataIndex ?? 0];

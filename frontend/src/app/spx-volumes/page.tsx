@@ -89,6 +89,8 @@ function build3DOption(
 
     return {
         tooltip: {
+            // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+            showContent: false,
             formatter: (params: any) => {
                 if (params.seriesType === 'line3D') {
                     const timeIdx = params.value[1];

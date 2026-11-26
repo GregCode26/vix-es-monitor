@@ -6,8 +6,8 @@
  * un muro che cresceva o si assottigliava restava dello stesso colore per
  * tutto il segmento, e compariva o spariva di colpo alla soglia. Qui invece
  * ogni colonna di pixel e' la media dei contratti di quel livello nei secondi
- * che copre, colorata sulla scala termica (blu poco, giallo-arancio tanto,
- * bianco il massimo): un muro che si costruisce si vede "scaldare", uno che
+ * che copre, colorata sulla scala di Bookmap (blu poco, poi bianco, giallo,
+ * arancio, rosso il massimo): un muro che si costruisce si vede "scaldare", uno che
  * si scioglie raffreddarsi, e una leggera sfumatura fra colonne vicine toglie
  * gli scalini. Come in Bookmap la mappa non distingue bid e ask (il prezzo
  * li separa da solo); il lato lo dice la colonna del book a destra.
@@ -17,10 +17,41 @@
  * movimento del mouse.
  */
 
-import { coloreTermico } from './gexHeatmap';
+/**
+ * La scala di Bookmap, campionata pixel per pixel dalla barra del gradiente della sua finestra
+ * (26/11/2026): dal colore del fondo al blu, celeste, bianco, giallo, arancio e rosso in cima.
+ * Prima usava la scala termica della GEX, che mette il bianco sopra il rosso.
+ */
+const SCALA_BOOKMAP: [number, number, number, number][] = [
+  [0.0, 26, 34, 38], [0.09, 20, 56, 72], [0.26, 10, 95, 134], [0.43, 1, 134, 195], [0.52, 86, 175, 215],
+  [0.61, 198, 221, 231], [0.65, 238, 238, 213], [0.78, 254, 254, 6], [0.87, 255, 183, 0], [0.95, 255, 56, 0],
+  [1.0, 220, 0, 0],
+];
+/** Fondo dell'area del grafico di Bookmap: i livelli piccoli ci sfumano dentro. */
+const FONDO_BOOKMAP: [number, number, number] = [26, 34, 38];
+
+function coloreBookmap(q: number): [number, number, number] {
+  const sc = SCALA_BOOKMAP;
+  if (q <= 0) return [sc[0][1], sc[0][2], sc[0][3]];
+  for (let i = 1; i < sc.length; i++) {
+    if (q <= sc[i][0]) {
+      const a = sc[i - 1], b = sc[i];
+      const f = (q - a[0]) / (b[0] - a[0]);
+      return [a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f];
+    }
+  }
+  const u = sc[sc.length - 1];
+  return [u[1], u[2], u[3]];
+}
+
+/** Gradiente CSS della scala, per la legenda accanto al Contrasto. */
+export function gradienteBookmap(): string {
+  return `linear-gradient(to right, ${SCALA_BOOKMAP.map(([q, r, g, b]) => `rgb(${r}, ${g}, ${b}) ${q * 100}%`).join(', ')})`;
+}
 
 export interface CampioneBook {
-  book: { b: [number, number][]; a: [number, number][] } | null;
+  /** [prezzo, contratti] o, con l'MBO (dal 26/11/2026), [prezzo, contratti, ordini]. */
+  book: { b: number[][]; a: number[][] } | null;
 }
 
 export interface VistaMappa {
@@ -145,12 +176,15 @@ export function mappaBook(
     }
   }
 
-  // Fondo scala sui livelli visibili, come l'auto-regolazione di Bookmap: il
-  // 99esimo percentile, cosi' un solo muro enorme non spegne tutto il resto.
+  // Fondo scala sui livelli visibili, tarato sulla finestra di Bookmap (26/11/2026: book di
+  // 17-48 contratti, muro da 77 arancio-rosso, 20 blu scuro): il doppio del 99esimo percentile,
+  // ma non oltre il livello piu' grande in vista, che cosi' arriva al rosso. Col solo 99esimo
+  // percentile gia' 35 contratti erano gialli. Il doppio tiene lontano dal blu un muro enorme isolato.
   const campioni: number[] = [];
   for (let k = 0; k < somma.length; k += 3) if (somma[k] > 0) campioni.push(somma[k]);
   campioni.sort((a, b) => a - b);
-  let fondo = campioni.length > 0 ? campioni[Math.floor(0.99 * (campioni.length - 1))] : 1;
+  let fondo = campioni.length > 0
+    ? Math.min(campioni[campioni.length - 1], 2 * campioni[Math.floor(0.99 * (campioni.length - 1))]) : 1;
   fondo = Math.max(soglia, fondo) / Math.max(0.05, contrasto);
 
   const immagine = cache?.immagine ?? document.createElement('canvas');
@@ -160,21 +194,25 @@ export function mappaBook(
   if (!ctx) return null;
   const img = ctx.createImageData(C, R);
   const mezza = soglia / 2;
+  const [fr, fg, fb] = FONDO_BOOKMAP;
   for (let r = 0; r < R; r++) {
     for (let c = 0; c < C; c++) {
       const v = somma[r * C + c];
-      if (!(v > mezza)) continue;
-      // Lineare, non radice: nel book quasi tutti i livelli stanno fra la
-      // soglia e il fondo scala, e con la radice diventavano tutti gialli;
-      // cosi' il book normale resta blu-ciano e i muri escono in arancio.
-      const [cr, cg, cb, ca] = coloreTermico(Math.min(1, v / fondo));
-      // Da meta' soglia a soglia l'opacita' sale: niente accensioni di colpo.
-      const rampa = Math.min(1, (v - mezza) / Math.max(1, soglia - mezza));
       const p = (r * C + c) * 4;
-      img.data[p] = cr;
-      img.data[p + 1] = cg;
-      img.data[p + 2] = cb;
-      img.data[p + 3] = Math.round(ca * rampa);
+      // Area tutta opaca col fondo di Bookmap, come nella sua finestra.
+      img.data[p] = fr;
+      img.data[p + 1] = fg;
+      img.data[p + 2] = fb;
+      img.data[p + 3] = 255;
+      if (!(v > mezza)) continue;
+      // Lineare come Bookmap: 20 contratti blu scuro, ~35 blu, ~50 giallo-bianco,
+      // i muri vicini al fondo scala arancio-rosso.
+      const [cr, cg, cb] = coloreBookmap(Math.min(1, v / fondo));
+      // Da meta' soglia a soglia il colore esce dal fondo: niente accensioni di colpo.
+      const rampa = Math.min(1, (v - mezza) / Math.max(1, soglia - mezza));
+      img.data[p] = Math.round(fr + (cr - fr) * rampa);
+      img.data[p + 1] = Math.round(fg + (cg - fg) * rampa);
+      img.data[p + 2] = Math.round(fb + (cb - fb) * rampa);
     }
   }
   ctx.putImageData(img, 0, 0);
@@ -219,7 +257,7 @@ export function disegnaCob(
   ctx.stroke();
 
   if (book) {
-    const tutti = [...book.b.map(([p, c]) => ({ p, c, bid: true })), ...book.a.map(([p, c]) => ({ p, c, bid: false }))];
+    const tutti = [...book.b.map(([p, c, n]) => ({ p, c, n, bid: true })), ...book.a.map(([p, c, n]) => ({ p, c, n, bid: false }))];
     const massimo = tutti.reduce((m, l) => Math.max(m, l.c), 0);
     const h = Math.max(1, Math.abs(yPixel(0) - yPixel(tick)) - 1);
     ctx.font = '10px ui-monospace, Consolas, monospace';
@@ -232,7 +270,8 @@ export function disegnaCob(
       ctx.fillRect(x0 + 3, y - h / 2, lungo, h);
       if (h >= 10) {
         ctx.fillStyle = '#e2e8f0';
-        ctx.fillText(String(Math.round(l.c)), x0 + 6, y);
+        // Con l'MBO, tra parentesi quanti ordini fanno il livello: un muro di uno solo o di tanti piccoli.
+        ctx.fillText(l.n != null ? `${Math.round(l.c)} (${l.n})` : String(Math.round(l.c)), x0 + 6, y);
       }
     }
   }

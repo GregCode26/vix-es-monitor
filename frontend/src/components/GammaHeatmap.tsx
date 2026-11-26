@@ -54,8 +54,6 @@ interface Props {
    * non misurato, non perche' lo sia.
    */
   inizioLr?: string | null;
-  /** I conti Lee-Ready di oggi per strike, per il riquadro sotto il mouse. */
-  conti?: Map<number, ContiLr>;
   /** Il profilo di adesso sulla base scelta, in M$: il pannello di sinistra. */
   profilo: { strike: number; gex: number }[];
   /** Lo spot SPX a cui IBKR ha valutato il gamma, 'HH:MM:SS' in ora italiana. */
@@ -195,7 +193,7 @@ interface Geometria {
   foto: number[][];
 }
 
-export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx = NESSUN_PREZZO, finestraMin, inizioLr = null, conti, coperture = false }: Props) {
+export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx = NESSUN_PREZZO, finestraMin, inizioLr = null, coperture = false }: Props) {
   const contenitore = useRef<HTMLDivElement | null>(null);
   const tela = useRef<HTMLCanvasElement | null>(null);
   const [dimensioni, setDimensioni] = useState<{ w: number; h: number } | null>(null);
@@ -227,7 +225,7 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
     return () => ro.disconnect();
   }, []);
 
-  /** Lo strato fisso piu' il mirino e il riquadro dei valori sotto il mouse. */
+  /** Lo strato fisso piu' il mirino (il riquadro dei valori sotto il mouse e' stato tolto, 26/11/2026). */
   const dipingi = useCallback(() => {
     const c = tela.current;
     const s = strato.current;
@@ -244,63 +242,38 @@ export default function GammaHeatmap({ strikes, serie, base, profilo, spot, spx 
     const dpr = c.width / (dimensioni?.w || c.width);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const t = g.t0 + ((m.x - area.x) / area.w) * (g.t1 - g.t0);
-    const prezzo = g.yMax - ((m.y - area.y) / area.h) * (g.yMax - g.yMin);
-    const col = Math.min(g.colonne - 1, Math.max(0, Math.floor(((m.x - area.x) / area.w) * g.colonne)));
-    const riga = Math.min(g.righe - 1, Math.max(0, Math.floor(((m.y - area.y) / area.h) * g.righe)));
-    const campo = g.griglia[riga * g.colonne + col];
-    const valori = valoriA(t, g.secFoto, g.foto);
-    let vicino: { strike: number; v: number } | null = null;
-    if (valori) {
-      let migliore = Infinity;
-      strikes.forEach((k, i) => {
-        if (Math.abs(k - prezzo) < migliore) {
-          migliore = Math.abs(k - prezzo);
-          vicino = { strike: k, v: valori[i] };
-        }
-      });
-    }
-
     ctx.save();
     ctx.setLineDash([4, 4]);
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
     ctx.lineWidth = 1;
+    // Fin dentro le scale (26/11/2026): profilo e asse dei prezzi a sinistra, orari sotto.
     ctx.beginPath();
     ctx.moveTo(m.x, area.y);
-    ctx.lineTo(m.x, area.y + area.h);
-    ctx.moveTo(area.x, m.y);
+    ctx.lineTo(m.x, area.y + area.h + 26);
+    ctx.moveTo(8, m.y); // anche attraverso il profilo GEX by Strike a sinistra
     ctx.lineTo(area.x + area.w, m.y);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const righeTesto = [
-      `${orario(t)}  ·  ${prezzo.toFixed(0)}`,
-      Number.isFinite(campo) ? `Gamma qui: ${dollari(campo)}` : 'Nessun dato a quest\'ora',
-    ];
-    const v = vicino as { strike: number; v: number } | null;
-    if (v) righeTesto.push(`Strike ${v.strike}: ${dollari(v.v)}`);
-    const conto = v ? conti?.get(v.strike) : undefined;
-    if (conto) {
-      // Totali di oggi fino ad adesso, non all'ora sotto il mouse: la serie storica non li porta.
-      righeTesto.push(`Oggi call: ${conto[0]} comprate / ${conto[1]} vendute`);
-      righeTesto.push(`Oggi put: ${conto[2]} comprate / ${conto[3]} vendute`);
-    }
-    ctx.font = '11px Arial';
-    const larghezza = Math.max(...righeTesto.map((r) => ctx.measureText(r).width)) + 16;
-    const altezza = righeTesto.length * 16 + 8;
-    let bx = m.x + 12;
-    let by = m.y + 12;
-    if (bx + larghezza > area.x + area.w) bx = m.x - 12 - larghezza;
-    if (by + altezza > area.y + area.h) by = m.y - 12 - altezza;
-    ctx.fillStyle = 'rgba(15, 17, 26, 0.92)';
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
-    ctx.fillRect(bx, by, larghezza, altezza);
-    ctx.strokeRect(bx + 0.5, by + 0.5, larghezza - 1, altezza - 1);
-    ctx.fillStyle = '#e2e8f0';
-    ctx.textBaseline = 'top';
-    righeTesto.forEach((r, i) => ctx.fillText(r, bx + 8, by + 6 + i * 16));
+    // I valori sotto il puntatore sulle due scale.
+    const prezzo = g.yMax - ((m.y - area.y) / area.h) * (g.yMax - g.yMin);
+    const sec = g.t0 + ((m.x - area.x) / area.w) * (g.t1 - g.t0);
+    ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    const etichetta = (testo: string, cx: number, cy: number) => {
+      const w = ctx.measureText(testo).width + 8;
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(cx - w / 2, cy - 8, w, 16);
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillText(testo, cx, cy);
+    };
+    etichetta(prezzo.toFixed(2), area.x - 30, m.y);
+    const secTondi = Math.round(sec);
+    etichetta(`${orario(secTondi)}:${String(((secTondi % 60) + 60) % 60).padStart(2, '0')}`, m.x, area.y + area.h + 15);
+
     ctx.restore();
-  }, [dimensioni, strikes, conti]);
+  }, [dimensioni]);
 
   // Lo strato fisso: si rifa' quando cambiano i dati, la dimensione o la scala dei prezzi.
   useEffect(() => {

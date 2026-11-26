@@ -6,8 +6,7 @@ import { Chart as ChartJS, registerables, type Scale, type ScriptableContext } f
 import type { ZoomPluginOptions } from 'chartjs-plugin-zoom/types/options';
 import { leggiRefLines, leggiVisibilita, REF_LINES_KEY, REF_LINES_VIS_KEY } from '@/lib/refLines';
 import { oraRomaDaNy } from '@/lib/orarioNy';
-import { disegnaCob, LARGHEZZA_COB, mappaBook, type MappaBook } from '@/lib/bookHeatmap';
-import { gradienteCss } from '@/lib/gexHeatmap';
+import { disegnaCob, gradienteBookmap, LARGHEZZA_COB, mappaBook, type MappaBook } from '@/lib/bookHeatmap';
 import { COLORE_ZERO_GAMMA, COLORE_ZERO_GAMMA_CBOE, COLORE_ZERO_GAMMA_TRACCIA, TRATTO_ZERO_GAMMA_TRACCIA, useZeroGamma } from '@/lib/useZeroGamma';
 
 ChartJS.register(...registerables);
@@ -32,8 +31,11 @@ interface BookmapPoint {
   remA: number | null;
   /** Lo stesso a fasce di 5 livelli dal migliore: [addB, remB, addA, remA], 10 numeri non cumulati; null prima del 09/11/2026. */
   fasce: number[][] | null;
-  /** Ordini limit per livello, [prezzo, contratti]; null nei campioni di prima che l'add-on li mandasse. */
-  book: { b: [number, number][]; a: [number, number][] } | null;
+  /**
+   * Ordini limit per livello, [prezzo, contratti] o, con l'MBO (dal 26/11/2026),
+   * [prezzo, contratti, ordini]; null nei campioni di prima che l'add-on li mandasse.
+   */
+  book: { b: number[][]; a: number[][] } | null;
   /** OFI del secondo per livello dal migliore (contratti, + = acquisto); null prima dell'add-on che lo calcola. */
   ofi: number[] | null;
   /** Baricentro della liquidita' bid e ask, in tick dal mid. */
@@ -46,36 +48,92 @@ interface BookmapPoint {
   sp1: number | null;
   /** Assorbimenti del secondo, [prezzo, contratti, verso, 'HH:MM:SS']; null prima dell'add-on che li cerca. */
   abs: [number, number, number, string][] | null;
+  /**
+   * Dal book ordine per ordine (MBO, dal 26/11/2026; null prima o senza MBO):
+   * cancellati veri per fasce di 5 livelli [bid, ask], cancellati entro 1 s
+   * nei primi 5 livelli [bid, ask], iceberg [prezzo, nascosti, verso, ora] e
+   * stop [prezzo, contratti, verso, ora, ordini].
+   */
+  canc: number[][] | null;
+  fug: number[] | null;
+  ice: [number, number, number, string][] | null;
+  stop: [number, number, number, string, number][] | null;
 }
 
 /**
- * Un assorbimento, sull'asse del tempo del grafico.
+ * Un evento sull'asse del tempo del grafico: assorbimento (palla), iceberg
+ * (rombo) o stop (triangolo).
  *
- * Gli stop non ci sono piu' (05/10/2026): l'add-on li cercava come aggressori
- * diversi nello stesso evento di matching, cosa che su Rithmic non succede
- * mai, e il ripiego sulle raffiche di aggressori, confrontato con Stops &
- * Icebergs di Bookmap, mescolava stop, iceberg e ordini spezzati. Quell'add-on
- * vede il book ordine per ordine; dai soli trade gli stop non si separano.
+ * Iceberg e stop vengono dal book ordine per ordine (MBO, dal 26/11/2026).
+ * Gli stop di prima (tolti il 05/10/2026) si cercavano dai soli trade e,
+ * confrontati con Stops & Icebergs di Bookmap, mescolavano stop, iceberg e
+ * ordini spezzati; col codice dell'ordine aggressore un ordine spezzato conta
+ * una volta sola. Restano in prova.
  */
 interface Evento {
+  tipo: 'abs' | 'ice' | 'stop';
   x: number;
   prezzo: number;
   contratti: number;
-  /** +1 compratori passivi che assorbono le vendite, -1 venditori che assorbono gli acquisti. */
+  /**
+   * Assorbimento e iceberg: +1 compratori passivi (sul bid), -1 venditori passivi.
+   * Stop: +1 stop in acquisto (spingono su), -1 in vendita.
+   */
   verso: number;
+  /** Stop: quanti ordini aggressori diversi nella raffica. */
+  ordini?: number;
 }
 
 type MinAss = '30' | '60' | '100' | '200';
+type MinMbo = '10' | '30' | '60' | '100';
+const OPZIONI_MIN_MBO: [MinMbo, string][] = [['10', '10'], ['30', '30'], ['60', '60'], ['100', '100']];
 
-/** Tutti gli eventi della sessione in memoria, sopra la dimensione scelta. */
-function eventiDi(pts: BookmapPoint[], minimo: number): Evento[] {
+/** Tutti gli eventi della sessione in memoria, sopra la dimensione scelta; null = quel tipo spento. */
+function eventiDi(pts: BookmapPoint[], minAss: number | null, minIce: number | null, minStop: number | null): Evento[] {
   const out: Evento[] = [];
   for (const p of pts) {
-    for (const [prezzo, contratti, verso, t] of p.abs ?? []) {
-      if (contratti >= minimo) out.push({ x: secondi(t), prezzo, contratti, verso });
+    if (minAss != null) {
+      for (const [prezzo, contratti, verso, t] of p.abs ?? []) {
+        if (contratti >= minAss) out.push({ tipo: 'abs', x: secondi(t), prezzo, contratti, verso });
+      }
+    }
+    if (minIce != null) {
+      for (const [prezzo, contratti, verso, t] of p.ice ?? []) {
+        if (contratti >= minIce) out.push({ tipo: 'ice', x: secondi(t), prezzo, contratti, verso });
+      }
+    }
+    if (minStop != null) {
+      for (const [prezzo, contratti, verso, t, ordini] of p.stop ?? []) {
+        if (contratti >= minStop) out.push({ tipo: 'stop', x: secondi(t), prezzo, contratti, verso, ordini });
+      }
     }
   }
   return out;
+}
+
+/** Il livello del book a quel prezzo nel campione di quel secondo (o subito prima): [contratti, ordini?]. */
+function livelloBookAl(pts: BookmapPoint[], sec: number, prezzo: number): { contratti: number; ordini: number | null; bid: boolean } | null {
+  let lo = 0;
+  let hi = pts.length - 1;
+  let i = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (secondi(pts[mid].time) <= sec) {
+      i = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  for (let k = i; k >= 0 && k > i - 5; k--) {
+    const book = pts[k].book;
+    if (!book) continue;
+    for (const [bid, righe] of [[true, book.b], [false, book.a]] as const) {
+      for (const r of righe) {
+        if (Math.abs(r[0] - prezzo) < TICK / 2) return { contratti: r[1], ordini: r.length > 2 ? r[2] : null, bid };
+      }
+    }
+    return null;
+  }
+  return null;
 }
 
 /** Un ordine limit rimasto allo stesso prezzo per un tratto di tempo: una linea orizzontale. */
@@ -140,9 +198,14 @@ const RANGE_ES = ([
 /** Ogni quanto richiedere i range al server finche' quelli delle 15:35 non ci sono. */
 const RANGE_RETRY_MS = 60_000;
 
-/** Da quanti contratti in su un livello del book diventa una linea: il cursore va da SOGLIA_MIN a SOGLIA_MAX. */
-const SOGLIA_MIN = 50;
+/**
+ * Da quanti contratti in su un livello del book diventa una linea: il cursore va da SOGLIA_MIN a SOGLIA_MAX.
+ * Minimo 10 dal 26/11/2026 (era 50); l'add-on manda i livelli da 10 entro 30 tick dal migliore, oltre solo da 50.
+ */
+const SOGLIA_MIN = 10;
 const SOGLIA_MAX = 200;
+/** Soglia di partenza senza una salvata: quella di prima, non il nuovo minimo. */
+const SOGLIA_DEFAULT = 50;
 /** Tick di ES: lo spessore di una linea e' un livello di prezzo. */
 const TICK = 0.25;
 /** Due campioni del book piu' distanti di cosi' (secondi) spezzano la linea. */
@@ -301,6 +364,10 @@ interface Lettura {
   persistenza: number | null;
   /** Quota degli ordini aggiunti nei primi 5 livelli poi cancellati (non eseguiti). */
   fugaci: number | null;
+  /** Con l'MBO: quota degli aggiunti cancellata entro 1 s da quando era stata messa. */
+  fugaciRapidi: number | null;
+  /** True se i cancellati sono quelli veri dell'MBO e non tolti meno eseguiti. */
+  fugaciMbo: boolean;
   /** OFI di ciascun livello nella finestra, in code medie. */
   livelli: (number | null)[];
   finestraSec: number;
@@ -342,12 +409,21 @@ function lettura(pts: BookmapPoint[], finestraSec: number, n: number, qmMediana:
 
   const conFlusso = fin.filter((p) => p.addB != null && p.remB != null && p.addA != null && p.remA != null);
   let fugaci: number | null = null;
+  let fugaciRapidi: number | null = null;
+  const fugaciMbo = conFlusso.length > 0 && conFlusso.every((p) => p.canc != null);
   if (conFlusso.length > 0) {
     const s = (f: (p: BookmapPoint) => number) => conFlusso.reduce((a, p) => a + f(p), 0);
     const aggiunti = s((p) => p.addB! + p.addA!);
-    // Tolti meno eseguiti: i venditori aggressivi consumano i bid, i compratori gli ask.
-    const cancellati = Math.max(0, s((p) => p.remB!) - s((p) => p.sell)) + Math.max(0, s((p) => p.remA!) - s((p) => p.buy));
+    // Con l'MBO i cancellati veri; senza, tolti meno eseguiti (i venditori
+    // aggressivi consumano i bid, i compratori gli ask), sui soli campioni senza.
+    const senza = conFlusso.filter((p) => p.canc == null);
+    const t = (f: (p: BookmapPoint) => number) => senza.reduce((a, p) => a + f(p), 0);
+    const cancellati =
+      s((p) => (p.canc ? p.canc[0][0] + p.canc[1][0] : 0)) +
+      Math.max(0, t((p) => p.remB!) - t((p) => p.sell)) +
+      Math.max(0, t((p) => p.remA!) - t((p) => p.buy));
     fugaci = aggiunti > 0 ? cancellati / aggiunti : null;
+    if (fugaciMbo && aggiunti > 0) fugaciRapidi = s((p) => (p.fug ? p.fug[0] + p.fug[1] : 0)) / aggiunti;
   }
 
   return {
@@ -361,6 +437,8 @@ function lettura(pts: BookmapPoint[], finestraSec: number, n: number, qmMediana:
     mlofi,
     persistenza,
     fugaci,
+    fugaciRapidi,
+    fugaciMbo,
     livelli,
     finestraSec,
     forza,
@@ -395,20 +473,28 @@ function mediaMobile(xs: number[], valori: number[], finestraSec: number): numbe
 type LivelliFlusso = '5' | '10' | '15' | '20' | '25' | '30' | '35' | '40' | '45' | '50';
 const OPZIONI_LIVELLI_FLUSSO: [LivelliFlusso, string][] = (['5', '10', '15', '20', '25', '30', '35', '40', '45', '50'] as const).map((v) => [v, v]);
 
-/** Aggiunti e tolti del secondo nei primi `livelli` livelli; null se il campione non li ha. */
+/**
+ * Aggiunti e tolti del secondo nei primi `livelli` livelli; null se il campione
+ * non li ha. `esatti`: con l'MBO i tolti sono gia' i soli cancellati; senza,
+ * comprendono l'eseguito, da togliere sulla finestra.
+ */
 function flussoAiLivelli(p: BookmapPoint, livelli: number) {
-  if (livelli === 5) {
-    if (p.addB == null || p.remB == null || p.addA == null || p.remA == null) return null;
-    return { aB: p.addB, rB: p.remB, aA: p.addA, rA: p.remA };
-  }
-  if (!p.fasce) return null;
   const prime = livelli / 5;
   const somma = (r: number[]) => {
     let t = 0;
     for (let i = 0; i < prime; i++) t += r[i];
     return t;
   };
-  return { aB: somma(p.fasce[0]), rB: somma(p.fasce[1]), aA: somma(p.fasce[2]), rA: somma(p.fasce[3]) };
+  let base: { aB: number; rB: number; aA: number; rA: number };
+  if (livelli === 5) {
+    if (p.addB == null || p.remB == null || p.addA == null || p.remA == null) return null;
+    base = { aB: p.addB, rB: p.remB, aA: p.addA, rA: p.remA };
+  } else {
+    if (!p.fasce) return null;
+    base = { aB: somma(p.fasce[0]), rB: somma(p.fasce[1]), aA: somma(p.fasce[2]), rA: somma(p.fasce[3]) };
+  }
+  if (p.canc) return { ...base, rB: somma(p.canc[0]), rA: somma(p.canc[1]), esatti: true };
+  return { ...base, esatti: false };
 }
 
 /** Su quanti secondi si sommano aggiunte e rimozioni: secondo per secondo e' solo rumore. */
@@ -449,22 +535,32 @@ interface SerieFlusso {
 
 /**
  * Somme mobili sugli ultimi `finestraSec` secondi dei contratti limit aggiunti
- * e cancellati nei primi livelli. Il book dice solo cosa e' sparito, quindi ai
- * tolti si sottrae l'eseguito: un venditore aggressivo consuma i bid (`sell`), un compratore
- * gli ask (`buy`). Si sottrae sulla finestra e non secondo per secondo, perche'
- * trade e aggiornamento del book possono cadere in due secondi diversi.
+ * e cancellati nei primi livelli. Dal 26/11/2026 l'add-on manda i cancellati
+ * veri (MBO, `canc`). Nei campioni senza, il book dice solo cosa e' sparito,
+ * quindi ai tolti si sottrae l'eseguito: un venditore aggressivo consuma i bid
+ * (`sell`), un compratore gli ask (`buy`). Si sottrae sulla finestra e non
+ * secondo per secondo, perche' trade e aggiornamento del book possono cadere
+ * in due secondi diversi.
  */
 function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, livelli: number): SerieFlusso {
   const out: SerieFlusso = { addB: [], remB: [], addA: [], remA: [], deltaEseguiti: [] };
   const ok = (p: BookmapPoint) => flussoAiLivelli(p, livelli) != null;
   let j = 0;
-  let aB = 0, rB = 0, aA = 0, rA = 0, compra = 0, vende = 0, n = 0;
+  // rB/rA e compra/vende senza MBO (da sottrarre), rBx/rAx i cancellati veri.
+  let aB = 0, rB = 0, aA = 0, rA = 0, rBx = 0, rAx = 0, compra = 0, vende = 0, compraV = 0, vendeV = 0, n = 0;
   const somma = (p: BookmapPoint, segno: 1 | -1) => {
     const f = flussoAiLivelli(p, livelli)!;
     aB += segno * f.aB;
-    rB += segno * f.rB;
     aA += segno * f.aA;
-    rA += segno * f.rA;
+    if (f.esatti) {
+      rBx += segno * f.rB;
+      rAx += segno * f.rA;
+    } else {
+      rB += segno * f.rB;
+      rA += segno * f.rA;
+      compraV += segno * p.buy;
+      vendeV += segno * p.sell;
+    }
     compra += segno * p.buy;
     vende += segno * p.sell;
     n += segno;
@@ -485,8 +581,8 @@ function flussoMobile(pts: BookmapPoint[], xs: number[], finestraSec: number, li
     }
     out.addB.push(aB);
     out.addA.push(aA);
-    out.remB.push(Math.max(0, rB - vende));
-    out.remA.push(Math.max(0, rA - compra));
+    out.remB.push(rBx + Math.max(0, rB - vendeV));
+    out.remA.push(rAx + Math.max(0, rA - compraV));
     out.deltaEseguiti.push(compra - vende);
   }
   return out;
@@ -765,7 +861,7 @@ export default function BookmapPage() {
   const [pronti, setPronti] = useState(false);
   const [blocco, setBlocco] = useState<Blocco>(LIBERO);
   const [mostraCvd, setMostraCvd] = useState(true);
-  const [soglia, setSoglia] = useState(SOGLIA_MIN);
+  const [soglia, setSoglia] = useState(SOGLIA_DEFAULT);
   const [mostraOrdini, setMostraOrdini] = useState(true);  const [mostraRange, setMostraRange] = useState(true);
   const [quantiRange, setQuantiRange] = useState(0);
   const [spessore, setSpessore] = useState(1);
@@ -784,6 +880,10 @@ export default function BookmapPage() {
   const [fondoHeatmap, setFondoHeatmap] = useState(0);
   const [mostraAss, setMostraAss] = useState(true);
   const [minAss, setMinAss] = useState<MinAss>('60');
+  const [mostraIce, setMostraIce] = useState(true);
+  const [minIce, setMinIce] = useState<MinMbo>('30');
+  const [mostraStop, setMostraStop] = useState(true);
+  const [minStop, setMinStop] = useState<MinMbo>('30');
 
   /** L'ultimo OFI %, calcolato in `applica` insieme alla linea. */
   const [ofiPctOra, setOfiPctOra] = useState<number | null>(null);
@@ -801,7 +901,7 @@ export default function BookmapPage() {
   const finestraRef = useRef<Finestra>('60');
   const bloccoRef = useRef<Blocco>(LIBERO);
   const mostraCvdRef = useRef(true);
-  const sogliaRef = useRef(SOGLIA_MIN);  const mostraOrdiniRef = useRef(true);
+  const sogliaRef = useRef(SOGLIA_DEFAULT);  const mostraOrdiniRef = useRef(true);
   const mostraRangeRef = useRef(true);
   /** Livelli R1/R2/R3 da disegnare, gia' filtrati per la visibilita' scelta in /market. */
   const rangeRef = useRef<{ valore: number; colore: string; etichetta: string; tratteggio: number[] }[]>([]);
@@ -859,6 +959,10 @@ export default function BookmapPage() {
   }, [zgManuale, zgCboe]);
   const mostraAssRef = useRef(true);
   const minAssRef = useRef<MinAss>('60');
+  const mostraIceRef = useRef(true);
+  const minIceRef = useRef<MinMbo>('30');
+  const mostraStopRef = useRef(true);
+  const minStopRef = useRef<MinMbo>('30');
   /** Assorbimenti da disegnare, gia' filtrati per dimensione. */
   const eventiRef = useRef<Evento[]>([]);
   const segmentiRef = useRef<Segmento[]>([]);
@@ -1044,7 +1148,12 @@ export default function BookmapPage() {
     segmentiRef.current = mostraOrdiniRef.current && stileOrdiniRef.current === 'linee'
       ? segmentiBook(pts, xs, sogliaRef.current, Number(durataMinRef.current))
       : [];
-    eventiRef.current = mostraAssRef.current ? eventiDi(pts, Number(minAssRef.current)) : [];
+    eventiRef.current = eventiDi(
+      pts,
+      mostraAssRef.current ? Number(minAssRef.current) : null,
+      mostraIceRef.current ? Number(minIceRef.current) : null,
+      mostraStopRef.current ? Number(minStopRef.current) : null,
+    );
 
     const cvdAcceso = mostraCvdRef.current;
     cp.data.datasets[1].hidden = !cvdAcceso;
@@ -1396,10 +1505,14 @@ export default function BookmapPage() {
       };
 
       /**
-       * Assorbimenti, sopra la linea del prezzo: una palla, verde se i
-       * compratori passivi hanno assorbito le vendite, rossa se i venditori
-       * hanno assorbito gli acquisti; l'area e' proporzionale ai contratti.
-       * Col mouse sopra, il riquadro con prezzo, contratti e ora.
+       * Eventi sopra la linea del prezzo, area proporzionale ai contratti, col
+       * mouse sopra il riquadro con prezzo, contratti e ora:
+       * - assorbimenti: palla verde se i compratori passivi hanno assorbito le
+       *   vendite, rossa se i venditori hanno assorbito gli acquisti;
+       * - iceberg (MBO): rombo verde se il compratore nascosto sta sul bid,
+       *   rosso se il venditore nascosto sta sull'ask;
+       * - stop (MBO, in prova): triangolo azzurro in su per gli stop in
+       *   acquisto, arancio in giu' per quelli in vendita.
        */
       const eventiPlugin = {
         id: 'eventi',
@@ -1423,20 +1536,38 @@ export default function BookmapPage() {
             if (x < a.left - 20 || x > a.right + 20 || y < a.top - 20 || y > a.bottom + 20) continue;
             const r = Math.min(20, Math.max(4, Math.sqrt(e.contratti) * 0.9));
             ctx.beginPath();
-            ctx.arc(x, y, r, 0, Math.PI * 2);
-            ctx.fillStyle = e.verso > 0 ? 'rgba(52, 211, 153, 0.55)' : 'rgba(244, 63, 94, 0.55)';
+            if (e.tipo === 'abs') {
+              ctx.arc(x, y, r, 0, Math.PI * 2);
+              ctx.fillStyle = e.verso > 0 ? 'rgba(52, 211, 153, 0.55)' : 'rgba(244, 63, 94, 0.55)';
+            } else if (e.tipo === 'ice') {
+              ctx.moveTo(x, y - r);
+              ctx.lineTo(x + r, y);
+              ctx.lineTo(x, y + r);
+              ctx.lineTo(x - r, y);
+              ctx.closePath();
+              ctx.fillStyle = e.verso > 0 ? 'rgba(52, 211, 153, 0.7)' : 'rgba(244, 63, 94, 0.7)';
+            } else {
+              const s = e.verso > 0 ? -1 : 1;
+              ctx.moveTo(x, y + s * r);
+              ctx.lineTo(x + r, y - s * r * 0.7);
+              ctx.lineTo(x - r, y - s * r * 0.7);
+              ctx.closePath();
+              ctx.fillStyle = e.verso > 0 ? 'rgba(96, 165, 250, 0.75)' : 'rgba(251, 146, 60, 0.75)';
+            }
             ctx.fill();
             ctx.lineWidth = 1;
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
             ctx.stroke();
             if (m && mx != null && Math.hypot(mx - x, m.y - y) <= r + 2) {
-              sotto = {
-                testo: `Assorbimento: ${e.contratti} ct a ${e.prezzo.toFixed(2)}, ${
-                  e.verso > 0 ? 'compratori assorbono le vendite' : 'venditori assorbono gli acquisti'
-                } · ${orario(e.x)}`,
-                x,
-                y: y - r,
-              };
+              const testo =
+                e.tipo === 'abs'
+                  ? `Assorbimento: ${e.contratti} ct a ${e.prezzo.toFixed(2)}, ${
+                      e.verso > 0 ? 'compratori assorbono le vendite' : 'venditori assorbono gli acquisti'
+                    }`
+                  : e.tipo === 'ice'
+                    ? `Iceberg: ${e.contratti} ct nascosti eseguiti a ${e.prezzo.toFixed(2)}, ${e.verso > 0 ? 'compratore sul bid' : "venditore sull'ask"}`
+                    : `Stop ${e.verso > 0 ? 'in acquisto' : 'in vendita'} (in prova): ${e.contratti} ct, ${e.ordini ?? '?'} ordini, fino a ${e.prezzo.toFixed(2)}`;
+              sotto = { testo: `${testo} · ${orario(e.x)}`, x, y: y - r };
             }
           }
           ctx.restore();
@@ -1572,13 +1703,27 @@ export default function BookmapPage() {
               // L'SPX dello stesso livello, con la base di quell'istante.
               if (scala.id === 'yPrezzo') {
                 const b = baseAl(baseRef.current, m.sec);
+                let xl = a.left + 2;
                 if (b != null) {
                   const t = `SPX ${(v - b).toFixed(2)}`;
                   const w = ctx.measureText(t).width + 10;
                   ctx.fillStyle = '#14532d';
-                  ctx.fillRect(a.left + 2, m.y - 10, w, 20);
+                  ctx.fillRect(xl, m.y - 10, w, 20);
                   ctx.fillStyle = '#dcfce7';
-                  ctx.fillText(t, a.left + 2 + w / 2, m.y);
+                  ctx.fillText(t, xl + w / 2, m.y);
+                  xl += w + 4;
+                }
+                // Il livello del book sotto il puntatore in quel secondo; con l'MBO anche quanti ordini.
+                const lv = livelloBookAl(pointsRef.current, m.sec, Math.round(v / TICK) * TICK);
+                if (lv) {
+                  const t = `${Math.round(lv.contratti)} ct${
+                    lv.ordini != null && lv.ordini > 0 ? ` · ${lv.ordini} ordini · media ${Math.round(lv.contratti / lv.ordini)}` : ''
+                  }`;
+                  const w = ctx.measureText(t).width + 10;
+                  ctx.fillStyle = lv.bid ? '#064e3b' : '#7f1d1d';
+                  ctx.fillRect(xl, m.y - 10, w, 20);
+                  ctx.fillStyle = '#f1f5f9';
+                  ctx.fillText(t, xl + w / 2, m.y);
                 }
               }
             }
@@ -2230,6 +2375,25 @@ export default function BookmapPage() {
         minAssRef.current = ma;
         setMinAss(ma);
       }
+      const mboValido = (v: string | null): v is MinMbo => v === '10' || v === '30' || v === '60' || v === '100';
+      if (localStorage.getItem('bookmap_ice') === 'off') {
+        mostraIceRef.current = false;
+        setMostraIce(false);
+      }
+      if (localStorage.getItem('bookmap_stop') === 'off') {
+        mostraStopRef.current = false;
+        setMostraStop(false);
+      }
+      const mi = localStorage.getItem('bookmap_min_ice');
+      if (mboValido(mi)) {
+        minIceRef.current = mi;
+        setMinIce(mi);
+      }
+      const ms = localStorage.getItem('bookmap_min_stop');
+      if (mboValido(ms)) {
+        minStopRef.current = ms;
+        setMinStop(ms);
+      }
     } catch {
       // niente preferenza salvata
     }
@@ -2246,6 +2410,34 @@ export default function BookmapPage() {
     minAssRef.current = v;
     setMinAss(v);
     salva('bookmap_min_ass', v);
+    applica();
+  };
+
+  const cambiaMostraIce = () => {
+    mostraIceRef.current = !mostraIceRef.current;
+    setMostraIce(mostraIceRef.current);
+    salva('bookmap_ice', mostraIceRef.current ? 'on' : 'off');
+    applica();
+  };
+
+  const cambiaMinIce = (v: MinMbo) => {
+    minIceRef.current = v;
+    setMinIce(v);
+    salva('bookmap_min_ice', v);
+    applica();
+  };
+
+  const cambiaMostraStop = () => {
+    mostraStopRef.current = !mostraStopRef.current;
+    setMostraStop(mostraStopRef.current);
+    salva('bookmap_stop', mostraStopRef.current ? 'on' : 'off');
+    applica();
+  };
+
+  const cambiaMinStop = (v: MinMbo) => {
+    minStopRef.current = v;
+    setMinStop(v);
+    salva('bookmap_min_stop', v);
     applica();
   };
 
@@ -2322,6 +2514,9 @@ export default function BookmapPage() {
   const conOfi = corrente?.ofi != null;
   const conEventi = corrente?.abs != null;
   const contaOggi = (minimo: number) => points.reduce((n, p) => n + (p.abs ?? []).filter((e) => e[1] >= minimo).length, 0);
+  const conMbo = corrente?.canc != null;
+  const contaIce = (minimo: number) => points.reduce((n, p) => n + (p.ice ?? []).filter((e) => e[1] >= minimo).length, 0);
+  const contaStop = (minimo: number) => points.reduce((n, p) => n + (p.stop ?? []).filter((e) => e[1] >= minimo).length, 0);
   const nLivelli = Number(livelliOfi);
   const letto = lettura(coda, finestraLettura, nLivelli, qmMediana, forzaOra);
 
@@ -2330,15 +2525,8 @@ export default function BookmapPage() {
   return (
     <div className="min-h-screen bg-[#0c0d10] text-slate-300 p-3 md:p-5 font-sans">
       <div className="w-full max-w-[1600px] mx-auto">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-          <div>
-            <h1 className="text-2xl font-bold text-white">Bookmap · ES</h1>
-            <p className="text-xs text-slate-500">
-              CVD e liquidita&apos; del book da Bookmap (add-on <code>execution/bookmap_addon.py</code>) · solo locale, a titolo di studio
-            </p>
-          </div>
-        </div>
-
+        {/* Niente titolo ne' spiegazione in alto (26/11/2026, su richiesta): i tre grafici stanno nello
+            schermo sotto la barra; i comandi del mouse e la nota sull'add-on sono in fondo, scorrendo. */}
         <div className="rounded-xl border border-slate-800 bg-[#111216] p-3 md:p-4">
           <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-sm font-semibold mb-2 tabular-nums">
             <span className="flex items-center gap-1.5">
@@ -2404,7 +2592,7 @@ export default function BookmapPage() {
                   onDoubleClick={() => cambiaContrasto(1)}
                   className="w-24 accent-sky-500"
                 />
-                <span className="inline-block w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteCss('termico', 'pos') }} />
+                <span className="inline-block w-24 h-2.5 rounded-sm border border-slate-700" style={{ background: gradienteBookmap() }} />
                 {fondoHeatmap > 0 && <span className="text-slate-500 tabular-nums" title="Contratti a cui la scala arriva al colore pieno">pieno ≈ {Math.round(fondoHeatmap)}</span>}
               </label>
             )}
@@ -2431,6 +2619,40 @@ export default function BookmapPage() {
               </button>
               <div className={mostraAss ? '' : 'opacity-40 pointer-events-none'}>
                 <Selettore titolo="≥" valore={minAss} opzioni={[['30', '30'], ['60', '60'], ['100', '100'], ['200', '200']]} onChange={cambiaMinAss} />
+              </div>
+            </div>
+            <div
+              className="flex items-center gap-2"
+              title="Iceberg (dal book ordine per ordine): un ordine passivo eseguito per piu' di quanto ne mostrava. Rombo verde = compratore nascosto sul bid, rosso = venditore nascosto sull'ask; grandezza = contratti nascosti eseguiti"
+            >
+              <button
+                onClick={cambiaMostraIce}
+                className={`px-2 py-0.5 rounded-lg font-bold border flex items-center gap-1.5 ${
+                  mostraIce ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+              >
+                <span className="inline-block w-2.5 h-2.5 rotate-45 border border-white/80" style={{ backgroundColor: mostraIce ? VERDE : '#475569' }} />
+                Iceberg {mostraIce ? 'ON' : 'OFF'}
+              </button>
+              <div className={mostraIce ? '' : 'opacity-40 pointer-events-none'}>
+                <Selettore titolo="≥" valore={minIce} opzioni={OPZIONI_MIN_MBO} onChange={cambiaMinIce} />
+              </div>
+            </div>
+            <div
+              className="flex items-center gap-2"
+              title="Stop (in prova, dal book ordine per ordine): raffica di almeno 3 ordini aggressori diversi nello stesso verso, a pochi millisecondi l'uno dall'altro. Triangolo azzurro in su = stop in acquisto, arancio in giu' = in vendita; grandezza = contratti. Da confrontare con Stops & Icebergs di Bookmap"
+            >
+              <button
+                onClick={cambiaMostraStop}
+                className={`px-2 py-0.5 rounded-lg font-bold border flex items-center gap-1.5 ${
+                  mostraStop ? 'bg-slate-800 border-slate-600 text-white' : 'bg-slate-900 border-slate-700 text-slate-500'
+                }`}
+              >
+                <span className="inline-block" style={{ width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderBottom: `9px solid ${mostraStop ? BLU : '#475569'}` }} />
+                Stop {mostraStop ? 'ON' : 'OFF'}
+              </button>
+              <div className={mostraStop ? '' : 'opacity-40 pointer-events-none'}>
+                <Selettore titolo="≥" valore={minStop} opzioni={OPZIONI_MIN_MBO} onChange={cambiaMinStop} />
               </div>
             </div>
             <label className={`flex items-center gap-2 ${mostraOrdini && stileOrdini === 'linee' ? '' : 'opacity-40'}`}>
@@ -2493,9 +2715,6 @@ export default function BookmapPage() {
                 </>
               )}
             </button>
-            <span className="text-slate-500">
-              Rotella sul grafico = zoom sul tempo · rotella su un asse Y = zoom su quell&apos;asse · trascina il grafico = sposta tutto · trascina una scala (o Maiusc + tasto destro) = sposta solo quell&apos;indicatore · doppio clic = torna live
-            </span>
           </div>
 
           {caricato && (errore || points.length === 0 || fermo) && (
@@ -2523,12 +2742,24 @@ export default function BookmapPage() {
                 ) : (
                   <>
                     Oggi: <span style={{ color: VERDE }}>{contaOggi(Number(minAss))} assorbimenti</span>
+                    {conMbo ? (
+                      <>
+                        {' · '}
+                        <span style={{ color: VERDE }}>{contaIce(Number(minIce))} iceberg</span>
+                        {' · '}
+                        <span style={{ color: BLU }}>{contaStop(Number(minStop))} stop</span>
+                      </>
+                    ) : (
+                      <span className="text-amber-200/80">
+                        {' · '}Iceberg, stop e cancellati veri: serve l&apos;add-on del 26/11 (MBO), da ricostruire in Bookmap
+                      </span>
+                    )}
                   </>
                 )}
               </div>
             )}
           </div>
-          <PannelloAltezza chiave="prezzo" base="h-[340px] md:h-[400px]">
+          <PannelloAltezza chiave="prezzo" base="h-[max(260px,calc((100vh-var(--barra-h)-420px)*0.56))]">
             <canvas ref={prezzoRef} className="cursor-crosshair" />
           </PannelloAltezza>
 
@@ -2597,7 +2828,7 @@ export default function BookmapPage() {
               Nessun dato: l&apos;add-on in Bookmap non calcola ancora OFI e asimmetria. Copia execution/bookmap_addon.py in C:\Bookmap\Python\, ricostruiscilo dal code editor e riattivalo.
             </div>
           )}
-          <PannelloAltezza chiave="book" base="h-[220px] md:h-[260px]">
+          <PannelloAltezza chiave="book" base="h-[max(140px,calc((100vh-var(--barra-h)-420px)*0.23))]">
             <canvas ref={liquiditaRef} className="cursor-crosshair" />
           </PannelloAltezza>
 
@@ -2676,9 +2907,17 @@ export default function BookmapPage() {
               Oltre 5 livelli servono i dati dell&apos;add-on nuovo: ricostruiscilo dal code editor di Bookmap e riattivalo. I secondi di prima restano vuoti.
             </div>
           )}
-          <PannelloAltezza chiave="flusso" base="h-[200px] md:h-[240px]">
+          <PannelloAltezza chiave="flusso" base="h-[max(130px,calc((100vh-var(--barra-h)-420px)*0.21))]">
             <canvas ref={flussoRef} className="cursor-crosshair" />
           </PannelloAltezza>
+        </div>
+        <div className="mt-4 space-y-1 text-xs text-slate-500">
+          <p>
+            Rotella sul grafico = zoom sul tempo · rotella su un asse Y = zoom su quell&apos;asse · trascina il grafico = sposta tutto · trascina una scala (o Maiusc + tasto destro) = sposta solo quell&apos;indicatore · doppio clic = torna live · la barretta sotto ogni grafico ne cambia l&apos;altezza (doppio clic = altezza adattata allo schermo)
+          </p>
+          <p>
+            CVD e liquidita&apos; del book ES da Bookmap (add-on <code>execution/bookmap_addon.py</code>) · solo locale, a titolo di studio
+          </p>
         </div>
       </div>
     </div>
@@ -2859,8 +3098,8 @@ function LetturaBook({ letto, livelli }: { letto: Lettura | null; livelli: numbe
           titolo={livelli === 1 ? 'Pressione (OFI)' : `Pressione (MLOFI ${livelli})`}
           verdetto={pressione.verdetto}
           colore={pressione.colore}
-          dettaglio={`${uno(l.mlofi, true)} code · forza ${l.forza == null ? '—' : `${l.forza > 0 ? '+' : ''}${Math.round(l.forza)}`} · persistenza ${pct(l.persistenza)} · fugaci ${pct(l.fugaci)}${fugace ? ' !' : ''}`}
-          spiegazione={`MLOFI: come cambia il book (inserimenti, cancellazioni, eseguiti), non quanto ce n'e'. Forza = OFI %, il MLOFI rispetto alla sessione (sotto ±50 la pressione e' debole). Persistenza = |somma| / somma dei moduli dell'OFI secondo per secondo: bassa vuol dire che la pressione va avanti e indietro (100, 60, 300, 70...), ordini che vengono aggiunti e tolti. Fugaci = ordini aggiunti nei primi 5 livelli poi cancellati invece che eseguiti${fugace ? ': oltre il 90%, liquidita\' che non va presa per un muro' : ''}.`}
+          dettaglio={`${uno(l.mlofi, true)} code · forza ${l.forza == null ? '—' : `${l.forza > 0 ? '+' : ''}${Math.round(l.forza)}`} · persistenza ${pct(l.persistenza)} · fugaci ${pct(l.fugaci)}${l.fugaciRapidi != null ? ` (<1 s ${pct(l.fugaciRapidi)})` : ''}${fugace ? ' !' : ''}`}
+          spiegazione={`MLOFI: come cambia il book (inserimenti, cancellazioni, eseguiti), non quanto ce n'e'. Forza = OFI %, il MLOFI rispetto alla sessione (sotto ±50 la pressione e' debole). Persistenza = |somma| / somma dei moduli dell'OFI secondo per secondo: bassa vuol dire che la pressione va avanti e indietro (100, 60, 300, 70...), ordini che vengono aggiunti e tolti. Fugaci = ordini aggiunti nei primi 5 livelli poi cancellati invece che eseguiti${l.fugaciMbo ? " (cancellati veri, dal book ordine per ordine; tra parentesi quelli tolti entro 1 secondo da quando erano stati messi)" : ' (stimati come tolti meno eseguiti)'}${fugace ? ': oltre il 90%, liquidita\' che non va presa per un muro' : ''}.`}
         />
         <div
           className="rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 col-span-2 md:col-span-1"

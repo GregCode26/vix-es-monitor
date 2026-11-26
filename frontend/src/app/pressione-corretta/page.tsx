@@ -79,7 +79,7 @@ function PressioneCorretta() {
         const tempi = dati.minuti.map((m) => m.t);
         return {
             backgroundColor: '#020617', animation: false,
-            tooltip: { trigger: 'axis', valueFormatter: (v: number) => (v == null ? '—' : fmt(v, 1)) },
+            tooltip: { trigger: 'axis', showContent: false, axisPointer: { type: 'cross', label: { backgroundColor: '#1e293b' } }, valueFormatter: (v: number) => (v == null ? '—' : fmt(v, 1)) },
             legend: { type: 'scroll', top: 0, textStyle: { color: '#cbd5e1', fontSize: 10 } },
             grid: { left: 70, right: 70, top: 40, bottom: 60 },
             xAxis: { type: 'category', data: tempi, axisLabel: { color: '#94a3b8' } },
@@ -109,7 +109,7 @@ function PressioneCorretta() {
         if (!dati) return null;
         return {
             backgroundColor: '#020617', animation: false,
-            tooltip: { trigger: 'axis', valueFormatter: (v: number) => (v == null ? '—' : fmt(v, 0)) },
+            tooltip: { trigger: 'axis', showContent: false, axisPointer: { type: 'cross', label: { backgroundColor: '#1e293b' } }, valueFormatter: (v: number) => (v == null ? '—' : fmt(v, 0)) },
             legend: { top: 0, textStyle: { color: '#cbd5e1', fontSize: 11 } },
             grid: { left: 70, right: 70, top: 36, bottom: 60 },
             xAxis: { type: 'category', data: dati.minuti.map((m) => m.t), axisLabel: { color: '#94a3b8' } },

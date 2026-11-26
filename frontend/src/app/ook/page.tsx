@@ -331,6 +331,8 @@ export default function OokPage() {
     const option = {
         backgroundColor: '#0c0d10',
         tooltip: {
+            // Niente riquadro dei valori sul puntatore: resta solo il mirino.
+            showContent: false,
             trigger: 'axis',
             axisPointer: { type: 'cross' },
             backgroundColor: 'rgba(12, 13, 16, 0.95)',

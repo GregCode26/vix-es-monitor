@@ -22,7 +22,8 @@
 }
 
 body {
-  background: var(--background);
+  /* sfondo scuro come le pagine: niente bianco sotto le pagine piu' corte dello schermo */
+  background: #0c0d10;
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
